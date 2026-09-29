@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu2ods"
+dynamic = ["version"]
+description = "飞书多维表格（Base）→ MaxCompute ODS 同步工具（json + pt 分区，临时分区 + 原子替换）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "feishu2ods contributors" }]
+keywords = ["maxcompute", "odps", "feishu", "bitable", "base", "etl", "data-ingestion", "data-warehouse"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+  "requests>=2.25",
+  "pyodps>=0.11",
+]
+
+[project.scripts]
+feishu2ods = "feishu2ods:main"
+
+[project.urls]
+Homepage = "https://github.com/sandy-wangzining/feishu2ods"
+Source = "https://github.com/sandy-wangzining/feishu2ods"
+Issues = "https://github.com/sandy-wangzining/feishu2ods/issues"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.5"]
+
+[tool.setuptools]
+py-modules = ["feishu2ods"]
+
+[tool.setuptools.dynamic]
+version = { attr = "feishu2ods.VERSION" }

@@ -1,0 +1,43 @@
+{
+  "job": "feishu_ai_cost",
+  "description": "飞书多维表格「每日推理成本汇总表」→ my_project.ods_trade_ai_cost_json_df（json + pt 分区，临时分区 + 原子替换）",
+
+  "feishu": {
+    "app_id": "cli_xxxxxxxxxxxxxxxx",
+    "app_secret": "<App Secret>",
+    "base_token": "IC4xxxxxxxxxxxxxxxxxxxxxxxxx",
+    "table_id": "tblexxxxxxxxxxxxxxxx",
+    "base_url": "https://xxx.feishu.cn/base/IC4xxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+
+  "maxcompute": {
+    "project": "my_project",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "fields": {
+    "date（美国时间）": "cost_date",
+    "每日LLM推理成本 折前": "llm_cost_before_discount",
+    "每日LLM推理成本 折后": "llm_cost_after_discount",
+    "AI素材推理成本 折前": "ai_asset_cost_before_discount",
+    "AI素材推理成本 折后": "ai_asset_cost_after_discount",
+    "员工coding推理成本 折前": "coding_cost_before_discount",
+    "员工coding推理成本 折后": "coding_cost_after_discount"
+  },
+
+  "target": {
+    "project": "my_project",
+    "table": "ods_trade_ai_cost_json_df",
+    "column": "json",
+    "comment": "每日推理成本汇总（飞书多维表格同步，JSON 原样，写临时分区后原子替换 pt=业务日）",
+    "allow_empty": false
+  },
+
+  "freshness": {
+    "date_field": "cost_date",
+    "lag_days": 0,
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+  }
+}
