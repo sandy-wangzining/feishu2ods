@@ -1,0 +1,27 @@
+# 凭证/密钥：绝不提交
+config.json
+signers.py
+
+# 作业实例配置（只提交 .example.json 模板）
+jobs/*.json
+!jobs/*.example.json
+
+# 运行时产物
+.run-locks/
+__pycache__/
+*.pyc
+*.log
+
+# 编辑器 / 构建产物
+.idea/
+.vscode/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 系统文件（macOS）
+.DS_Store
