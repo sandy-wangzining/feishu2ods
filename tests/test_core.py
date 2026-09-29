@@ -130,10 +130,11 @@ class _FakeTable:
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
         self.status_code = status_code
         self._payload = {} if payload is None else payload
         self.text = text
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -385,6 +386,22 @@ class TestRequestJson(OfflineTestCase):
         with mock.patch.object(f2o.requests, "request", return_value=_FakeResponse(403, text="no")):
             with self.assertRaises(f2o.ApiHttpError):
                 f2o.request_json("GET", "https://x", "t")
+
+    def test_redirect_raises_api_error_without_retry(self):
+        # 301/302/303 会把 POST 降级成不带 body 的 GET（请求参数全丢），
+        # 鉴权头也可能被转发到别的地址——直接失败，不重试
+        resp = _FakeResponse(302, text="", headers={"Location": "https://other.example.com/new"})
+        with mock.patch.object(f2o.requests, "request", return_value=resp) as call:
+            with self.assertRaises(f2o.ApiHttpError) as ctx:
+                f2o.request_json("POST", "https://x", "t", body={"app_id": "a", "app_secret": "s"})
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertEqual(call.call_count, 1)  # 确定性错误不重试
+
+    def test_request_disables_redirects(self):
+        with mock.patch.object(f2o.requests, "request", return_value=_FakeResponse(200, {"code": 0})) as call:
+            f2o.request_json("GET", "https://x", "t")
+        kwargs = call.call_args.kwargs
+        self.assertIs(kwargs.get("allow_redirects"), False)
 
 
 @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")

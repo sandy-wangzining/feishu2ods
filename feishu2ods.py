@@ -109,7 +109,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.1.2"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.1.3"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -395,10 +395,25 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
     last: Exception | None = None
     for attempt in range(1, tries + 1):
         try:
-            resp = requests.request(method, url, params=params, json=body, headers=headers, timeout=(10, 30))
+            # allow_redirects=False：requests 默认跟随重定向，而 301/302/303 会把 POST 降级成
+            # 不带 body 的 GET（请求参数全丢），且自定义鉴权头（Authorization）会被转发到重定向
+            # 目标。这两种后果都比"直接失败"危险得多（与 api2ods 2.1.8 的修复同款）
+            resp = requests.request(
+                method, url, params=params, json=body, headers=headers, timeout=(10, 30), allow_redirects=False
+            )
         except requests.RequestException as exc:
             last = exc
         else:
+            if 300 <= resp.status_code < 400:
+                # 不跟随重定向：把 Location 报出来让用户直接改成最终地址。
+                # 抛 ApiHttpError（确定性错误、不重试），别让它掉进重试的退避里
+                location = redact(str(resp.headers.get("Location") or ""))
+                raise ApiHttpError(
+                    resp.status_code,
+                    f"接口返回重定向 HTTP {resp.status_code}（Location: {location}）：本工具不跟随重定向"
+                    f"——301/302/303 会把 POST 降级成不带 body 的 GET（请求参数全丢），"
+                    f"鉴权头也可能被转发到别的地址。请把地址改成最终地址",
+                )
             if resp.status_code >= 500 or resp.status_code == 429:
                 last = requests.RequestException(f"HTTP {resp.status_code}：{resp.text[:200]}")
             elif 400 <= resp.status_code < 500:
