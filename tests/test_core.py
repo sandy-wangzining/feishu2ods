@@ -600,6 +600,23 @@ class TestMc(OfflineTestCase):
             with self.assertRaises(SystemExit) as ctx:
                 f2o.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
         self.assertIn("正式分区可能已被删掉", str(ctx.exception))
+        # 失败后尽力清掉临时分区（最后一步是 delete tmp）
+        self.assertEqual(table.calls[-1], ("delete", "pt=20260928__tmp"))
+
+    def test_write_partition_cleanup_failure_keeps_error(self):
+        table = mock.Mock()
+
+        def delete(spec, if_exists=False):
+            if spec.endswith("__tmp"):
+                raise RuntimeError("delete boom")
+
+        table.delete_partition.side_effect = delete
+        table.open_writer.side_effect = RuntimeError("never")
+        odps = _FakeOdps([self._verify_row(1, mn="r1")])
+        with self.assertRaises(SystemExit) as ctx:
+            f2o.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        self.assertIn("正式分区未动", str(ctx.exception))
+        self.assertIn("残留", str(ctx.exception))
 
     def test_purge_stale_tmp_partitions(self):
         table = _FakeTable()
