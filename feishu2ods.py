@@ -109,7 +109,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.1.1"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.1.2"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -732,7 +732,7 @@ def write_partition(o, table, project: str, table_name: str, column: str, pt: st
     - 可见窗口只剩两条 DDL 之间：写入期间旧快照完整可读；
     - 写前先通读检查单行大小（不保存）：超长记录永远写不进去，必须在动分区之前报错；
     - 写后核对：行数 + record_id 去重数 + 最小/最大 id（不一致就不替换，重试同上）；
-    - 重试会从「清临时分区」重新开始；临时分区有残留时下次运行先清掉，不会污染正式分区；
+    - 重试会从「清临时分区」重新开始；失败后尽力清掉临时分区，残留（如进程被强杀）下次运行也会先清；
     - 空快照（target.allow_empty=true）走同样的替换流程（清空正式分区）；否则上游已拦下空表。
     """
     ids = [str(record.get("record_id") or "") for record in records]
@@ -790,14 +790,23 @@ def write_partition(o, table, project: str, table_name: str, column: str, pt: st
             if attempt < WRITE_ATTEMPTS:
                 log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
                 time.sleep(WRITE_RETRY_DELAY)
+    # 尽力清掉临时分区：留在表里的 tmp 值（如 20260928__tmp）字符串序大于正式分区，下游
+    # 用 max_pt() 取最新分区时可能读到半成品；清理失败只多打一条告警，不改变失败结论
+    tmp_cleaned = True
+    try:
+        table.delete_partition(tmp_spec, if_exists=True)
+    except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
+        tmp_cleaned = False
+        log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
+    leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
     if final_deleted:
         raise SystemExit(
-            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉、"
-            f"临时分区 {tmp_spec} 可能残留，重跑本作业即可恢复）：{redact(last)}"
+            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
+            f"{leftover}重跑本作业即可恢复）：{redact(last)}"
         )
     raise SystemExit(
         f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
-        f"临时分区 {tmp_spec} 可能残留，重跑本作业即可修复）：{redact(last)}"
+        f"{leftover}重跑本作业即可修复）：{redact(last)}"
     )
 
 
