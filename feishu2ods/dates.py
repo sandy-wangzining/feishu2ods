@@ -15,6 +15,7 @@ _DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 DATE_RE = re.compile(r"\A(\d{4})-(\d{2})-(\d{2})")
 SLASH_DATE_RE = re.compile(r"\A(\d{4})/(\d{1,2})/(\d{1,2})")
 
+
 # =============================================================================
 # 业务日（pt）解析
 # =============================================================================
@@ -64,7 +65,6 @@ def resolve_bizdate(args) -> date:
     return from_env if from_env is not None else datetime.now(CN_TZ).date() - timedelta(days=1)
 
 
-
 # =============================================================================
 # 新鲜度校验 / 飞书告警
 # =============================================================================
@@ -105,5 +105,3 @@ def freshness_problem(records, date_field: str, expected: str) -> tuple[str, str
     if expected in seen:
         return None
     return expected, (max(seen) if seen else None)
-
-

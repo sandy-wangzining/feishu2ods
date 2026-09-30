@@ -13,8 +13,9 @@ MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
 TARGET_KEYS = {"project", "table", "column", "comment", "allow_empty"}
 FRESHNESS_KEYS = {"date_field", "lag_days", "webhook"}
 DEFAULT_COLUMN = "json"
-DEFAULT_FRESHNESS_LAG_DAYS = 0                  # 预期日期 = bizdate - N 天（0 = 必须有 bizdate 当天数据）
+DEFAULT_FRESHNESS_LAG_DAYS = 0  # 预期日期 = bizdate - N 天（0 = 必须有 bizdate 当天数据）
 IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
 
 # =============================================================================
 # job 配置：读取 / 校验
@@ -144,5 +145,3 @@ def validate_job(job: dict) -> list[str]:
                 raise SystemExit(f"freshness.webhook 必须是 http(s) 开头的地址：{webhook!r}")
             freshness["webhook"] = webhook
     return warnings
-
-

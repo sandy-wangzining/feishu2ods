@@ -9,13 +9,14 @@ from .auth import FEISHU_HOST, ApiHttpError, get_tenant_token, request_json
 from .spool import FetchStats, SpoolWriter
 from .utils import _api_err, log, redact
 
-PAGE_SIZE = 500                                 # 单页行数（接口上限 2000，超了报 800004006；500 兼顾请求数与单页体积）
-MAX_PAGES = 10000                               # 防死循环的翻页上限（10000 页 × 500 行 = 500 万行，够用）
+PAGE_SIZE = 500  # 单页行数（接口上限 2000，超了报 800004006；500 兼顾请求数与单页体积）
+MAX_PAGES = 10000  # 防死循环的翻页上限（10000 页 × 500 行 = 500 万行，够用）
 # access token 失效的错误码：命中后重新取一次 token 再重试当前页（正常 2 小时有效期足够，兜底用）
 TOKEN_ERROR_CODES = {99991661, 99991663, 99991668}
-RATE_LIMIT_CODES = {99991400}                   # 接口限流（HTTP 200 + 该 code）：等待后重试同一页
-RATE_LIMIT_ATTEMPTS = 5                         # 同一页限流最多重试次数
-RATE_LIMIT_WAIT = 5                             # 限流重试间隔秒数
+RATE_LIMIT_CODES = {99991400}  # 接口限流（HTTP 200 + 该 code）：等待后重试同一页
+RATE_LIMIT_ATTEMPTS = 5  # 同一页限流最多重试次数
+RATE_LIMIT_WAIT = 5  # 限流重试间隔秒数
+
 
 def _records_url(feishu: dict) -> str:
     return f"{FEISHU_HOST}/open-apis/base/v3/bases/{feishu['base_token']}/tables/{feishu['table_id']}/records"
@@ -107,7 +108,9 @@ def fetch_records(
                 index = {name: i for i, name in enumerate(fields)}
                 missing = [source for source in mapping if source not in index]
                 if missing:
-                    raise SystemExit("Base 里找不到 fields 映射的列：" + "、".join(missing) + "（列名可能被改名/删除，请核对）")
+                    raise SystemExit(
+                        "Base 里找不到 fields 映射的列：" + "、".join(missing) + "（列名可能被改名/删除，请核对）"
+                    )
                 extra = [name for name in fields if name and name not in mapping]
                 if extra:
                     log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
@@ -232,5 +235,3 @@ def fetch_field_sample(feishu: dict) -> tuple[list[str], dict]:
             if i < len(first) and first[i] is not None:
                 samples[name] = str(first[i])[:60]
     return fields, samples
-
-

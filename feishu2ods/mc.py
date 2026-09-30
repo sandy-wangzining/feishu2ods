@@ -13,12 +13,13 @@ try:
 except ImportError:  # pragma: no cover - 离线测试环境可以不带 pyodps
     ODPS = None
 
-PARTITION_COLUMN = "pt"                         # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
-WRITE_ATTEMPTS = 3                              # 写分区的最大尝试次数（重试会清掉临时分区重写）
-WRITE_RETRY_DELAY = 10                          # 写入重试间隔秒数
-TMP_PARTITION_SUFFIX = "__tmp"                  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
-MAX_ROW_BYTES = 7_000_000                       # 单行 JSON 上限（MaxCompute string 8MB，留余量）
+PARTITION_COLUMN = "pt"  # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
+WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分区重写）
+WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
+TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
+MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+
 
 # =============================================================================
 # MaxCompute：建表 / 结构校验 / 写分区（临时分区 + 原子替换）/ 写后校验
@@ -89,7 +90,9 @@ def rename_partition(o, project: str, table_name: str, old_spec: str, new_spec: 
     )
 
 
-def write_partition(o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None) -> None:
+def write_partition(
+    o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None
+) -> None:
     """写一个分区：先写 <pt>__tmp 临时分区并核对内容，再删旧分区 + rename 原子替换。
 
     - 可见窗口只剩两条 DDL 之间：写入期间旧快照完整可读；
@@ -101,6 +104,7 @@ def write_partition(o, table, project: str, table_name: str, column: str, pt: st
     - 空快照（target.allow_empty=true）走同样的替换流程（清空正式分区）；否则上游已拦下空表。
     - 兼容旧调用方：第 7 参传记录列表、stats 不给时，就地装进临时 spool + stats。
     """
+    _temp_spool = None
     if stats is None:
         if not isinstance(spool, (list, tuple)):
             raise TypeError("write_partition 需要同时传 spool 与 stats（新签名）或记录列表（旧签名）")
@@ -109,75 +113,80 @@ def write_partition(o, table, project: str, table_name: str, column: str, pt: st
         stats = FetchStats()
         spool.write_records(records)
         stats.update(records)
-    if stats.count and not stats.min_id:
-        raise SystemExit("有记录缺少 record_id，无法做写后核对（检查 Base 接口返回）")
-    final_spec = f"{PARTITION_COLUMN}={pt}"
-    tmp_spec = f"{PARTITION_COLUMN}={pt}{TMP_PARTITION_SUFFIX}"
-    for index, line in enumerate(spool.iter_rows(), 1):
-        size = len(line.encode("utf-8"))
-        if size > MAX_ROW_BYTES:
-            raise SystemExit(
-                f"第 {index} 条记录 JSON {size:,} 字节，超过单列上限（约 {MAX_ROW_BYTES:,} 字节）；"
-                f"检查 Base 里是否有超大单元格（如附件/长文本）"
-            )
-
-    final_deleted = False
-
-    def once() -> None:
-        nonlocal final_deleted
-        table.delete_partition(tmp_spec, if_exists=True)  # 清掉上次失败留下的临时分区
-        table.create_partition(tmp_spec, if_not_exists=True)
-        with table.open_writer(partition=tmp_spec, reopen=True) as writer:
-            for batch in spool.iter_batches(BATCH_SIZE):
-                writer.write([[row] for row in batch])
-        actual, distinct, smallest, largest = verify_partition(
-            o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}"
-        )
-        if actual != stats.count:
-            raise RuntimeError(f"临时分区行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
-        if stats.count:
-            # 空快照没有 id 可核：只校验行数，去重/范围检查跳过
-            if distinct != stats.distinct_ids():
-                raise RuntimeError(f"临时分区 record_id 重复：{actual:,} 行里去重后只剩 {distinct:,} 个")
-            if (smallest, largest) != (stats.min_id, stats.max_id):
-                raise RuntimeError(
-                    f"临时分区 record_id 范围不一致：实际 [{smallest}, {largest}]，"
-                    f"预期 [{stats.min_id}, {stats.max_id}]"
-                )
-        # 原子替换：旧分区先让位，临时分区立刻改名顶上（中间空窗只有一条 DDL 的执行时间）。
-        # 置位放在删之前：删除请求可能已经发到服务端才报错，宁可把后果描述得保守一点
-        final_deleted = True
-        table.delete_partition(final_spec, if_exists=True)
-        rename_partition(o, project, table_name, tmp_spec, final_spec)
-
-    last: Exception | None = None
-    for attempt in range(1, WRITE_ATTEMPTS + 1):
-        try:
-            once()
-            return
-        except Exception as exc:  # noqa: BLE001 - 统一重试并给出「重跑可修复」的结论
-            last = exc
-            if attempt < WRITE_ATTEMPTS:
-                log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
-                time.sleep(WRITE_RETRY_DELAY)
-    # 尽力清掉临时分区：留在表里的 tmp 值（如 20260928__tmp）字符串序大于正式分区，下游
-    # 用 max_pt() 取最新分区时可能读到半成品；清理失败只多打一条告警，不改变失败结论
-    tmp_cleaned = True
+        _temp_spool = spool  # 兼容分支的临时 spool 归本函数管：结束时统一清理
     try:
-        table.delete_partition(tmp_spec, if_exists=True)
-    except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
-        tmp_cleaned = False
-        log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
-    leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
-    if final_deleted:
+        if stats.count and not stats.min_id:
+            raise SystemExit("有记录缺少 record_id，无法做写后核对（检查 Base 接口返回）")
+        final_spec = f"{PARTITION_COLUMN}={pt}"
+        tmp_spec = f"{PARTITION_COLUMN}={pt}{TMP_PARTITION_SUFFIX}"
+        for index, line in enumerate(spool.iter_rows(), 1):
+            size = len(line.encode("utf-8"))
+            if size > MAX_ROW_BYTES:
+                raise SystemExit(
+                    f"第 {index} 条记录 JSON {size:,} 字节，超过单列上限（约 {MAX_ROW_BYTES:,} 字节）；"
+                    f"检查 Base 里是否有超大单元格（如附件/长文本）"
+                )
+
+        final_deleted = False
+
+        def once() -> None:
+            nonlocal final_deleted
+            table.delete_partition(tmp_spec, if_exists=True)  # 清掉上次失败留下的临时分区
+            table.create_partition(tmp_spec, if_not_exists=True)
+            with table.open_writer(partition=tmp_spec, reopen=True) as writer:
+                for batch in spool.iter_batches(BATCH_SIZE):
+                    writer.write([[row] for row in batch])
+            actual, distinct, smallest, largest = verify_partition(
+                o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}"
+            )
+            if actual != stats.count:
+                raise RuntimeError(f"临时分区行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
+            if stats.count:
+                # 空快照没有 id 可核：只校验行数，去重/范围检查跳过
+                if distinct != stats.distinct_ids():
+                    raise RuntimeError(f"临时分区 record_id 重复：{actual:,} 行里去重后只剩 {distinct:,} 个")
+                if (smallest, largest) != (stats.min_id, stats.max_id):
+                    raise RuntimeError(
+                        f"临时分区 record_id 范围不一致：实际 [{smallest}, {largest}]，"
+                        f"预期 [{stats.min_id}, {stats.max_id}]"
+                    )
+            # 原子替换：旧分区先让位，临时分区立刻改名顶上（中间空窗只有一条 DDL 的执行时间）。
+            # 置位放在删之前：删除请求可能已经发到服务端才报错，宁可把后果描述得保守一点
+            final_deleted = True
+            table.delete_partition(final_spec, if_exists=True)
+            rename_partition(o, project, table_name, tmp_spec, final_spec)
+
+        last: Exception | None = None
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            try:
+                once()
+                return
+            except Exception as exc:  # noqa: BLE001 - 统一重试并给出「重跑可修复」的结论
+                last = exc
+                if attempt < WRITE_ATTEMPTS:
+                    log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
+                    time.sleep(WRITE_RETRY_DELAY)
+        # 尽力清掉临时分区：留在表里的 tmp 值（如 20260928__tmp）字符串序大于正式分区，下游
+        # 用 max_pt() 取最新分区时可能读到半成品；清理失败只多打一条告警，不改变失败结论
+        tmp_cleaned = True
+        try:
+            table.delete_partition(tmp_spec, if_exists=True)
+        except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
+            tmp_cleaned = False
+            log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
+        leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
+        if final_deleted:
+            raise SystemExit(
+                f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
+                f"{leftover}重跑本作业即可恢复）：{redact(last)}"
+            )
         raise SystemExit(
-            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
-            f"{leftover}重跑本作业即可恢复）：{redact(last)}"
+            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
+            f"{leftover}重跑本作业即可修复）：{redact(last)}"
         )
-    raise SystemExit(
-        f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
-        f"{leftover}重跑本作业即可修复）：{redact(last)}"
-    )
+    finally:
+        if _temp_spool is not None:
+            _temp_spool.close()
 
 
 def count_partition(o, project: str, table_name: str, pt: str) -> int:
@@ -222,5 +231,3 @@ def verify_partition(o, project: str, table_name: str, column: str, pt: str) -> 
                 "" if row["mx"] is None else str(row["mx"]),
             )
     return (0, 0, "", "")
-
-
