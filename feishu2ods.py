@@ -112,7 +112,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.3.0"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.4.0"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -203,6 +203,98 @@ def _api_err(data) -> str:
 def dump_record(record: dict) -> str:
     """一条记录 → 单行 JSON（与 api2ods 同款序列化参数：不转义中文、紧凑、拒绝 NaN）。"""
     return json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+class SpoolWriter:
+    """流式落盘：记录边拉边写本地临时 JSONL，写库时逐批读回。
+
+    为什么要它：表格可能很大（十几万行 × 大单元格），全量记录放内存既慢又危险。
+    拉取阶段边拉边写盘（顺序写很便宜），写 MaxCompute 时再逐批读回送进 Tunnel——
+    峰值内存只与"单页 + 一个批次"的数据量有关，与总行数无关。
+    """
+
+    def __init__(self, path: pathlib.Path | None = None):
+        if path is None:
+            handle, name = tempfile.mkstemp(prefix="feishu2ods-", suffix=".jsonl")
+            os.close(handle)
+            path = pathlib.Path(name)
+        self.path = pathlib.Path(path)
+        self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+        self.count = 0
+
+    def write_records(self, records: list[dict]) -> int:
+        """把一批记录序列化后写入文件（返回本批条数）。"""
+        for record in records:
+            self._handle.write(dump_record(record) + "\n")
+            self.count += 1
+        return len(records)
+
+    def iter_rows(self):
+        """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。"""
+        self._handle.flush()
+        with open(self.path, "r", encoding="utf-8", newline="") as handle:
+            for line in handle:
+                line = line.rstrip("\n")
+                if line:
+                    yield line
+
+    def iter_batches(self, batch_size: int = BATCH_SIZE):
+        """按批读回（写 MaxCompute 用）。"""
+        batch: list[str] = []
+        for row in self.iter_rows():
+            batch.append(row)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def close(self, keep: bool = False) -> None:
+        """关闭并（默认）删除临时文件；keep=True 时保留（排障用）。"""
+        try:
+            self._handle.close()
+        finally:
+            if not keep:
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+
+
+class FetchStats:
+    """一次流式拉取的统计（内存只与字段数/去重 id 数有关，与总行数无关）。"""
+
+    def __init__(self, date_field: str = ""):
+        self.count = 0
+        self.empty_rows = 0
+        self.ids: set[str] = set()
+        self.min_id = ""
+        self.max_id = ""
+        self.date_values: set[str] = set()
+        self.date_counter: Counter = Counter()
+        self.date_field = date_field
+
+    def update(self, records: list[dict]) -> None:
+        """拿一页记录更新统计。"""
+        for record in records:
+            self.count += 1
+            record_id = str(record.get("record_id") or "")
+            if record_id:
+                self.ids.add(record_id)
+                if not self.min_id or record_id < self.min_id:
+                    self.min_id = record_id
+                if not self.max_id or record_id > self.max_id:
+                    self.max_id = record_id
+            if all(value is None for key, value in record.items() if key != "record_id"):
+                self.empty_rows += 1
+            if self.date_field:
+                day = normalize_date_value(record.get(self.date_field))
+                if day:
+                    self.date_values.add(day)
+                    self.date_counter[day] += 1
+
+    def distinct_ids(self) -> int:
+        return len(self.ids)
 
 
 # =============================================================================
@@ -455,8 +547,13 @@ def _records_url(feishu: dict) -> str:
 
 
 def fetch_records(
-    feishu: dict, mapping: dict, max_pages: int | None = None, extra_out: list[str] | None = None
-) -> list[dict]:
+    feishu: dict,
+    mapping: dict,
+    max_pages: int | None = None,
+    extra_out: list[str] | None = None,
+    sink: SpoolWriter | None = None,
+    stats: FetchStats | None = None,
+) -> list[dict] | FetchStats:
     """全量拉取数据表记录 → 每行一个 dict（record_id + 英文键）。
 
     v3 records 接口：limit=PAGE_SIZE + offset 翻页，has_more=false 结束；翻页中途 token 失效
@@ -464,6 +561,10 @@ def fetch_records(
     （表格结构刚被改动）按异常中止；接口给的表格版本号（rev）在翻页间变化也中止——
     offset 翻页期间表格被编辑会静默漏行，宁可中止重跑。max_pages 只拉前 N 页（--check 体检用）；
     extra_out 传入时收集未映射的新增列名（由 run_sync 发一次飞书提醒用）。
+
+    流式模式（sink 与 stats 都给）：每页记录立即写进 sink 落盘、stats 逐页累积，
+    返回 stats——峰值内存只与单页数据量有关，大表不再全量驻留内存（run_sync 用）。
+    两者都不给：保持旧行为，全量累积后返回记录列表（--check / 小表调用方用）。
     """
     url = _records_url(feishu)
     token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
@@ -477,6 +578,7 @@ def fetch_records(
     page = 1
     token_refreshed = False
     rate_tries = 0
+    stream = sink is not None and stats is not None
     while True:
         try:
             data = request_json(
@@ -524,6 +626,18 @@ def fetch_records(
         page_fields = [str(item) for item in (payload.get("fields") or [])]
         if fields is None:
             fields = page_fields
+            # 首轮就校验映射与收集新增列（与 build_records 同口径，但只跑一次，
+            # 流式模式下不能靠 build_records 的逐页检查——警告会每页重复打）
+            if fields:
+                index = {name: i for i, name in enumerate(fields)}
+                missing = [source for source in mapping if source not in index]
+                if missing:
+                    raise SystemExit("Base 里找不到 fields 映射的列：" + "、".join(missing) + "（列名可能被改名/删除，请核对）")
+                extra = [name for name in fields if name and name not in mapping]
+                if extra:
+                    log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
+                    if extra_out is not None:
+                        extra_out.extend(extra)
         elif page_fields != fields:
             raise SystemExit("翻页期间字段列表发生变化（表格结构可能刚被改动），已中止，请重跑")
         page_rows = [list(row) for row in (payload.get("data") or [])]
@@ -536,11 +650,18 @@ def fetch_records(
         if overlap:
             raise SystemExit(f"第 {page} 页出现已拉取过的记录（如 {sorted(overlap)[0]}），接口返回异常，已中止")
         seen_ids.update(page_ids)
-        raw_rows += page_rows
-        record_ids += page_ids
+        accumulated = len(raw_rows) + len(page_rows)
+        if stream:
+            page_records = _page_records(fields or [], page_ids, page_rows, mapping)
+            sink.write_records(page_records)
+            stats.update(page_records)
+            del page_records
+        else:
+            raw_rows += page_rows
+            record_ids += page_ids
         # 翻页日志节流：小表每页都打，大表每 20 页打一次（末页必打），调度日志不刷屏
         if page <= 10 or page % 20 == 0 or not payload.get("has_more"):
-            log(f"  第 {page} 页：{len(page_rows)} 行（累计 {len(raw_rows)}）")
+            log(f"  第 {page} 页：{len(page_rows)} 行（累计 {accumulated}）")
 
         if max_pages is not None and page >= max_pages:
             break
@@ -554,7 +675,23 @@ def fetch_records(
         if page > MAX_PAGES:
             raise SystemExit(f"翻页超过 {MAX_PAGES} 页，已中止")
 
+    if stream:
+        # 空表且接口没给字段列表：映射校验已无从谈起（与 build_records 的空表口径一致）
+        return stats
     return build_records(fields or [], record_ids, raw_rows, mapping, extra_out=extra_out)
+
+
+def _page_records(fields: list[str], page_ids: list[str], page_rows: list[list], mapping: dict) -> list[dict]:
+    """一页的列式行 + 记录 ID → 记录 dict 列表（流式模式用；映射校验已在首轮做过）。"""
+    index = {name: i for i, name in enumerate(fields)}
+    records: list[dict] = []
+    for record_id, row in zip(page_ids, page_rows):
+        record: dict = {"record_id": record_id}
+        for source, target in mapping.items():
+            i = index[source]
+            record[target] = row[i] if i < len(row) else None
+        records.append(record)
+    return records
 
 
 def build_records(
@@ -647,9 +784,17 @@ def normalize_date_value(value) -> str | None:
     return None
 
 
-def freshness_problem(records: list[dict], date_field: str, expected: str) -> tuple[str, str | None] | None:
-    """新鲜度校验：预期日期（业务日 - lag_days）没出现时返回 (预期, 当前最新)，否则 None。"""
-    seen = {normalize_date_value(record.get(date_field)) for record in records}
+def freshness_problem(records, date_field: str, expected: str) -> tuple[str, str | None] | None:
+    """新鲜度校验：预期日期（业务日 - lag_days）没出现时返回 (预期, 当前最新)，否则 None。
+
+    records 两种形态都认：记录列表（旧调用方，内部按 date_field 提取日期）或
+    已 normalize 过的日期集合（流式路径传 FetchStats.date_values，元素是 str）。
+    """
+    first = next(iter(records), None) if records is not None else None
+    if isinstance(first, dict):
+        seen = {normalize_date_value(record.get(date_field)) for record in records}
+    else:
+        seen = set(records or ())
     seen.discard(None)
     if expected in seen:
         return None
@@ -756,25 +901,31 @@ def rename_partition(o, project: str, table_name: str, old_spec: str, new_spec: 
     )
 
 
-def write_partition(o, table, project: str, table_name: str, column: str, pt: str, records: list[dict]) -> None:
+def write_partition(o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None) -> None:
     """写一个分区：先写 <pt>__tmp 临时分区并核对内容，再删旧分区 + rename 原子替换。
 
     - 可见窗口只剩两条 DDL 之间：写入期间旧快照完整可读；
+    - 数据从 spool（流式落盘的临时 JSONL）逐批读回，不要求全量记录驻留内存；
     - 写前先通读检查单行大小（不保存）：超长记录永远写不进去，必须在动分区之前报错；
-    - 写后核对：行数 + record_id 去重数 + 最小/最大 id（不一致就不替换，重试同上）；
+    - 写后核对：行数 + record_id 去重数 + 最小/最大 id（与拉取阶段的 stats 对比，
+      不一致就不替换，重试同上）；
     - 重试会从「清临时分区」重新开始；失败后尽力清掉临时分区，残留（如进程被强杀）下次运行也会先清；
     - 空快照（target.allow_empty=true）走同样的替换流程（清空正式分区）；否则上游已拦下空表。
+    - 兼容旧调用方：第 7 参传记录列表、stats 不给时，就地装进临时 spool + stats。
     """
-    ids = [str(record.get("record_id") or "") for record in records]
-    if records and not all(ids):
+    if stats is None:
+        if not isinstance(spool, (list, tuple)):
+            raise TypeError("write_partition 需要同时传 spool 与 stats（新签名）或记录列表（旧签名）")
+        records = list(spool)
+        spool = SpoolWriter()
+        stats = FetchStats()
+        spool.write_records(records)
+        stats.update(records)
+    if stats.count and not stats.min_id:
         raise SystemExit("有记录缺少 record_id，无法做写后核对（检查 Base 接口返回）")
     final_spec = f"{PARTITION_COLUMN}={pt}"
     tmp_spec = f"{PARTITION_COLUMN}={pt}{TMP_PARTITION_SUFFIX}"
-    for index, record in enumerate(records, 1):
-        try:
-            line = dump_record(record)
-        except ValueError as exc:
-            raise SystemExit(f"第 {index} 条记录无法序列化为 JSON：{exc}（值里可能含 NaN/Infinity）") from None
+    for index, line in enumerate(spool.iter_rows(), 1):
         size = len(line.encode("utf-8"))
         if size > MAX_ROW_BYTES:
             raise SystemExit(
@@ -789,20 +940,21 @@ def write_partition(o, table, project: str, table_name: str, column: str, pt: st
         table.delete_partition(tmp_spec, if_exists=True)  # 清掉上次失败留下的临时分区
         table.create_partition(tmp_spec, if_not_exists=True)
         with table.open_writer(partition=tmp_spec, reopen=True) as writer:
-            for start in range(0, len(records), BATCH_SIZE):
-                writer.write([[dump_record(record)] for record in records[start : start + BATCH_SIZE]])
+            for batch in spool.iter_batches(BATCH_SIZE):
+                writer.write([[row] for row in batch])
         actual, distinct, smallest, largest = verify_partition(
             o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}"
         )
-        if actual != len(records):
-            raise RuntimeError(f"临时分区行数不一致：计划 {len(records):,} 行，实际 {actual:,} 行")
-        if records:
+        if actual != stats.count:
+            raise RuntimeError(f"临时分区行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
+        if stats.count:
             # 空快照没有 id 可核：只校验行数，去重/范围检查跳过
-            if distinct != actual:
+            if distinct != stats.distinct_ids():
                 raise RuntimeError(f"临时分区 record_id 重复：{actual:,} 行里去重后只剩 {distinct:,} 个")
-            if (smallest, largest) != (min(ids), max(ids)):
+            if (smallest, largest) != (stats.min_id, stats.max_id):
                 raise RuntimeError(
-                    f"临时分区 record_id 范围不一致：实际 [{smallest}, {largest}]，预期 [{min(ids)}, {max(ids)}]"
+                    f"临时分区 record_id 范围不一致：实际 [{smallest}, {largest}]，"
+                    f"预期 [{stats.min_id}, {stats.max_id}]"
                 )
         # 原子替换：旧分区先让位，临时分区立刻改名顶上（中间空窗只有一条 DDL 的执行时间）。
         # 置位放在删之前：删除请求可能已经发到服务端才报错，宁可把后果描述得保守一点
@@ -1316,17 +1468,25 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
 
 
 def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: str, bizdate: date, started: float) -> int:
-    """正式流程：拉数 → 空表/新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对。"""
+    """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对。"""
     feishu = job["feishu"]
     maxcompute = job["maxcompute"]
     target_cfg = job["target"]
 
-    # ---- ① 拉数 ----
+    # ---- ① 拉数（流式：记录边拉边落盘，全量不驻留内存）----
     webhook = str((job.get("freshness") or {}).get("webhook") or "")
     base_url = str(feishu.get("base_url") or "")
     new_fields: list[str] = []
-    records = fetch_records(feishu, job["fields"], extra_out=new_fields)
-    log(f"拉取完成：{len(records):,} 条记录，映射 {len(job['fields'])} 个字段")
+    date_field = str((job.get("freshness") or {}).get("date_field") or "")
+    spool = SpoolWriter()
+    stats = FetchStats(date_field=date_field)
+    try:
+        fetch_records(feishu, job["fields"], extra_out=new_fields, sink=spool, stats=stats)
+    except Exception:
+        spool.close(keep=True)  # 失败保留临时文件供排查（系统 temp 会自行清理）
+        raise
+    count = stats.count
+    log(f"拉取完成：{count:,} 条记录，映射 {len(job['fields'])} 个字段")
     if new_fields:
         uniq = sorted(set(new_fields))
         # 日志无条件打：--no-notify 只关飞书提醒，不关日志——新增列完全不可见会让
@@ -1345,27 +1505,26 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
                 "② 重跑本节点（写入幂等）。",
             ]
             notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
-    empty_rows = sum(
-        1 for record in records if all(value is None for key, value in record.items() if key != "record_id")
-    )
+    empty_rows = stats.empty_rows
     if empty_rows:
         log(f"  警告：{empty_rows:,} 条记录除 record_id 外全为空（Base 里的空白行），已原样同步；下游按日期字段过滤")
 
     # ---- ② 空表 / 新鲜度校验（缺失 → 告警 + 非 0 退出，不写库）----
     allow_empty = bool(target_cfg.get("allow_empty", False))
-    if not records and not allow_empty:
+    if count == 0 and not allow_empty:
         log("❌ 拉取到 0 条记录，已中止（target.allow_empty=false，拒绝写入空分区）")
         if not args.no_notify:
             lines = [f"**作业**：{job.get('job')}", "**情况**：拉取到 0 条记录，未写入 MaxCompute"]
             if base_url:
                 lines.append(f"**数据表**：{base_url}")
             notify(webhook, "飞书多维表格同步：0 条记录", lines, footer=f"目标表 {project}.{table_name}")
+        spool.close()
         return 1
     freshness = job.get("freshness")
     if freshness and not args.skip_freshness:
         lag_days = freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS)
         expected = (bizdate - timedelta(days=lag_days)).isoformat()
-        problem = freshness_problem(records, freshness["date_field"], expected)
+        problem = freshness_problem(stats.date_values, freshness["date_field"], expected)
         if problem is not None:
             # 缺数据只告警、不失败：很多表是人填的（节假日/休假没人填是常态），
             # 缺一天不等于任务失败——快照照常写入（DWD 按源数据日期字段重新分区，
@@ -1383,7 +1542,7 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
                     f"**作业**：{job.get('job')}",
                     f"**预期已有**：{expected}（{freshness['date_field']}）",
                     f"**当前最新**：{latest or '无'}",
-                    f"**当前条数**：{len(records):,}",
+                    f"**当前条数**：{count:,}",
                     "本次已照常写入快照（缺的那天只是没有数据行），下游任务不受影响；",
                     "请人工确认表格是否还需要更新，更新后重跑即可。",
                 ]
@@ -1396,28 +1555,29 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
                     footer=f"目标表 {project}.{table_name}",
                 )
         else:
-            dup_dates = [day for day, count in Counter(
-                normalize_date_value(record.get(freshness["date_field"])) for record in records
-            ).items() if day and count > 1]
+            dup_dates = [day for day, dup_count in stats.date_counter.items() if day and dup_count > 1]
             if dup_dates:
                 log(f"  警告：以下日期在 Base 里出现多行：{'、'.join(sorted(dup_dates)[:10])}（DWD 同一天会落多行）")
             log(f"新鲜度校验通过：{freshness['date_field']} 已包含业务日 {expected}")
 
     # ---- ③ 写库（dry-run 跳过）----
     if args.dry_run:
-        log(f"--dry-run：不写库；将把 {len(records):,} 行写进 {project}.{table_name} pt={pt}（写临时分区后原子替换）")
+        spool.close()
+        log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（写临时分区后原子替换）")
         return 0
 
     o = connect_odps(maxcompute, project)
     table = ensure_table(o, project, table_name, column, str(target_cfg.get("comment") or ""))
     verify_schema(table, table_name, column)
     purge_stale_tmp_partitions(table, table_name)
-    log(f"写入 {project}.{table_name} pt={pt}（{len(records):,} 行：先写临时分区，核对后原子替换）...")
-    write_partition(o, table, project, table_name, column, pt, records)
+    log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后原子替换）...")
+    write_partition(o, table, project, table_name, column, pt, spool, stats)
     actual = count_partition(o, project, table_name, pt)
-    if actual != len(records):
-        log(f"❌ 写后校验不一致：计划 {len(records):,} 行，实际 {actual:,} 行（重跑即可，写入幂等）")
+    if actual != count:
+        spool.close()
+        log(f"❌ 写后校验不一致：计划 {count:,} 行，实际 {actual:,} 行（重跑即可，写入幂等）")
         return 1
+    spool.close()
     log(f"完成：{project}.{table_name} pt={pt} 共 {actual:,} 行，耗时 {(time.time() - started) / 60:.1f} 分钟")
     return 0
 

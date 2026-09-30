@@ -530,6 +530,27 @@ class TestFetchRecords(OfflineTestCase):
 # ---------------------------------------------------------------------------
 # MaxCompute：DDL / 结构校验 / 写入 / 计数
 # ---------------------------------------------------------------------------
+def make_spool_stats(records):
+    """把记录列表装进 Spool + FetchStats（write_partition 新签名的测试辅助）。"""
+    spool = f2o.SpoolWriter()
+    stats = f2o.FetchStats()
+    spool.write_records(records)
+    stats.update(records)
+    return spool, stats
+
+
+def fetch_stub(records):
+    """fetch_records 的流式替身：像真实实现一样写 sink、累积 stats、返回 stats。"""
+    def _stub(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+        if sink is not None and stats is not None:
+            for record in records:
+                sink.write_records([record])
+                stats.update([record])
+            return stats
+        return list(records)
+    return _stub
+
+
 class TestMc(OfflineTestCase):
     def test_build_ddl(self):
         ddl = f2o.build_ddl("test_project", "t", "json", "a'b")
@@ -866,7 +887,7 @@ class TestWiring(OfflineTestCase):
     def test_run_sync_dry_run_pass(self):
         args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-28", "amount": "$1"}]
-        with mock.patch.object(f2o, "fetch_records", return_value=records):
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
 
@@ -874,7 +895,7 @@ class TestWiring(OfflineTestCase):
         # 缺数据只告警不失败（人填的表，节假日没人填是常态）：rc=0、照常写、飞书告警一次
         args = argparse.Namespace(skip_freshness=False, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)), \
                 mock.patch.object(f2o, "notify") as notifier:
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
@@ -885,7 +906,7 @@ class TestWiring(OfflineTestCase):
         # --no-notify 只关飞书提醒：rc 仍是 0（缺数据不阻塞）
         args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)), \
                 mock.patch.object(f2o, "notify") as notifier:
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
@@ -894,7 +915,7 @@ class TestWiring(OfflineTestCase):
     def test_run_sync_zero_records_still_fails(self):
         # 真异常（表被清空 = 0 行）仍然失败：缺数放行不等于放行空表
         args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
-        with mock.patch.object(f2o, "fetch_records", return_value=[]), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub([])), \
                 mock.patch.object(f2o, "notify") as notifier:
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)
@@ -904,10 +925,10 @@ class TestWiring(OfflineTestCase):
         args = argparse.Namespace(skip_freshness=True, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
 
-        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
             if extra_out is not None:
                 extra_out.extend(["新列A", "新列A", "新列B"])
-            return records
+            return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
 
         with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
                 mock.patch.object(f2o, "notify") as notifier:
@@ -923,10 +944,10 @@ class TestWiring(OfflineTestCase):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
 
-        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
             if extra_out is not None:
                 extra_out.append("新列A")
-            return records
+            return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
 
         with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
                 mock.patch.object(f2o, "notify") as notifier:
@@ -937,7 +958,7 @@ class TestWiring(OfflineTestCase):
     def test_run_sync_skip_freshness(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(f2o, "fetch_records", return_value=records):
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
 
@@ -945,7 +966,7 @@ class TestWiring(OfflineTestCase):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": None, "amount": None}]
         messages: list[str] = []
-        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)), \
                 mock.patch.object(f2o, "log", side_effect=lambda msg: messages.append(str(msg))):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
@@ -956,7 +977,7 @@ class TestWiring(OfflineTestCase):
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         table = mock.Mock()
         odps = mock.Mock()
-        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)), \
                 mock.patch.object(f2o, "connect_odps", return_value=odps), \
                 mock.patch.object(f2o, "ensure_table", return_value=table), \
                 mock.patch.object(f2o, "verify_schema"), \
@@ -965,12 +986,14 @@ class TestWiring(OfflineTestCase):
                 mock.patch.object(f2o, "count_partition", return_value=1):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
-        writer.assert_called_once_with(odps, table, "p", "t", "json", "20260928", records)
+        writer.assert_called_once()
+        self.assertEqual(writer.call_args.args[0], odps)
+        self.assertEqual(writer.call_args.args[7].count, 1)  # stats 带 1 条记录
 
     def test_run_sync_count_mismatch(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+        with mock.patch.object(f2o, "fetch_records", side_effect=fetch_stub(records)), \
                 mock.patch.object(f2o, "connect_odps", return_value=mock.Mock()), \
                 mock.patch.object(f2o, "ensure_table", return_value=mock.Mock()), \
                 mock.patch.object(f2o, "verify_schema"), \
@@ -987,6 +1010,739 @@ class TestWiring(OfflineTestCase):
     def test_main_unexpected_error(self):
         with mock.patch.object(f2o, "_run", side_effect=RuntimeError("boom")):
             self.assertEqual(f2o.main(["--job", "x"]), 1)
+
+
+# ===========================================================================
+# 流式改造（v1.4）与边界补充：FetchStats / SpoolWriter / 流式拉取 / 双形态新鲜度
+# ===========================================================================
+class TestFetchStats(OfflineTestCase):
+    def test_empty_stats(self):
+        stats = f2o.FetchStats()
+        self.assertEqual(stats.count, 0)
+        self.assertEqual(stats.distinct_ids(), 0)
+        self.assertEqual((stats.min_id, stats.max_id), ("", ""))
+        self.assertEqual(stats.empty_rows, 0)
+
+    def test_count_and_ids(self):
+        stats = f2o.FetchStats()
+        stats.update([{"record_id": "r1", "a": 1}, {"record_id": "r2", "a": 2}])
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(stats.distinct_ids(), 2)
+        self.assertEqual((stats.min_id, stats.max_id), ("r1", "r2"))
+
+    def test_min_max_tracks_order_independently(self):
+        stats = f2o.FetchStats()
+        stats.update([{"record_id": "r5"}, {"record_id": "r1"}, {"record_id": "r9"}])
+        self.assertEqual((stats.min_id, stats.max_id), ("r1", "r9"))
+
+    def test_duplicate_ids_distinct(self):
+        stats = f2o.FetchStats()
+        stats.update([{"record_id": "r1"}, {"record_id": "r1"}])
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(stats.distinct_ids(), 1)
+
+    def test_missing_record_id_not_in_ids(self):
+        stats = f2o.FetchStats()
+        stats.update([{"record_id": "", "a": 1}, {"record_id": "r1"}])
+        self.assertEqual(stats.distinct_ids(), 1)
+        self.assertEqual(stats.min_id, "r1")
+
+    def test_empty_rows_detection(self):
+        stats = f2o.FetchStats()
+        stats.update([
+            {"record_id": "r1", "a": None, "b": None},  # 全空
+            {"record_id": "r2", "a": 1},                 # 有值
+            {"record_id": "r3"},                         # 只有 record_id（也全空）
+        ])
+        self.assertEqual(stats.empty_rows, 2)
+
+    def test_date_values_and_counter(self):
+        stats = f2o.FetchStats(date_field="biz_date")
+        stats.update([
+            {"biz_date": "2026-09-27T00:00:00+08:00"},
+            {"biz_date": "2026-09-27"},
+            {"biz_date": "2026/9/26"},
+            {"biz_date": "垃圾值"},
+        ])
+        self.assertEqual(stats.date_values, {"2026-09-27", "2026-09-26"})
+        self.assertEqual(stats.date_counter["2026-09-27"], 2)
+        self.assertEqual(stats.date_counter["2026-09-26"], 1)
+
+    def test_no_date_field_collects_nothing(self):
+        stats = f2o.FetchStats()
+        stats.update([{"biz_date": "2026-09-27"}])
+        self.assertEqual(stats.date_values, set())
+        self.assertEqual(stats.date_counter, f2o.Counter())
+
+    def test_none_date_ignored(self):
+        stats = f2o.FetchStats(date_field="d")
+        stats.update([{"d": None}])
+        self.assertEqual(stats.date_values, set())
+
+
+class TestSpoolWriter(OfflineTestCase):
+    def test_roundtrip_rows(self):
+        spool = f2o.SpoolWriter()
+        spool.write_records([{"a": 1}, {"b": "中文"}])
+        rows = list(spool.iter_rows())
+        self.assertEqual(rows, ['{"a":1}', '{"b":"中文"}'])
+        self.assertEqual(spool.count, 2)
+        spool.close()
+
+    def test_write_returns_count(self):
+        spool = f2o.SpoolWriter()
+        self.assertEqual(spool.write_records([{"a": 1}, {"a": 2}]), 2)
+        spool.close()
+
+    def test_batches(self):
+        spool = f2o.SpoolWriter()
+        spool.write_records([{"i": i} for i in range(5)])
+        batches = list(spool.iter_batches(batch_size=2))
+        self.assertEqual([len(b) for b in batches], [2, 2, 1])
+        spool.close()
+
+    def test_iter_rows_rerunnable(self):
+        spool = f2o.SpoolWriter()
+        spool.write_records([{"a": 1}])
+        self.assertEqual(len(list(spool.iter_rows())), 1)
+        self.assertEqual(len(list(spool.iter_rows())), 1)  # 重试场景：重新读一遍
+        spool.close()
+
+    def test_empty_spool(self):
+        spool = f2o.SpoolWriter()
+        self.assertEqual(list(spool.iter_rows()), [])
+        self.assertEqual(list(spool.iter_batches()), [])
+        spool.close()
+
+    def test_close_deletes_file(self):
+        spool = f2o.SpoolWriter()
+        path = spool.path
+        spool.write_records([{"a": 1}])
+        spool.close()
+        self.assertFalse(path.exists())
+
+    def test_close_keep(self):
+        spool = f2o.SpoolWriter()
+        path = spool.path
+        spool.write_records([{"a": 1}])
+        spool.close(keep=True)
+        self.assertTrue(path.exists())
+        path.unlink()
+
+    def test_iter_rows_strips_newline(self):
+        spool = f2o.SpoolWriter()
+        spool.write_records([{"a": "x\ny"}])  # 值里含换行会被 JSON 转义
+        rows = list(spool.iter_rows())
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith('{"a":"x\\ny"}'))
+        spool.close()
+
+    def test_custom_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "spool.jsonl"
+            spool = f2o.SpoolWriter(path)
+            spool.write_records([{"a": 1}])
+            spool.close(keep=True)
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"a":1}\n')
+
+
+class TestFetchRecordsStreaming(OfflineTestCase):
+    """流式模式：每页落盘 + stats 累积；映射校验只打一次告警。"""
+
+    def setUp(self):
+        super().setUp()
+        self.mapping = {"日期": "biz_date", "金额": "amount"}
+        self.job_feishu = {"app_id": "cli_x", "app_secret": "s" * 8, "base_token": "ICx", "table_id": "tblx"}
+
+    @staticmethod
+    def _page(rows, ids, has_more):
+        return {"code": 0, "data": {"fields": ["日期", "金额"], "data": rows, "record_id_list": ids, "has_more": has_more}}
+
+    def test_stream_writes_and_stats(self):
+        pages = [
+            self._page([["2026-09-27", "$1"]], ["r1"], True),
+            self._page([["2026-09-26", "$2"]], ["r2"], False),
+        ]
+        spool = f2o.SpoolWriter()
+        stats = f2o.FetchStats(date_field="biz_date")
+        with mock.patch.object(f2o, "get_tenant_token", return_value="tok"), \
+                mock.patch.object(f2o, "request_json", side_effect=pages):
+            result = f2o.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertIs(result, stats)
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(spool.count, 2)
+        self.assertEqual(
+            list(spool.iter_rows()),
+            ['{"record_id":"r1","biz_date":"2026-09-27","amount":"$1"}',
+             '{"record_id":"r2","biz_date":"2026-09-26","amount":"$2"}'],
+        )
+        spool.close()
+
+    def test_stream_empty_table(self):
+        pages = [self._page([], [], False)]
+        spool = f2o.SpoolWriter()
+        stats = f2o.FetchStats()
+        with mock.patch.object(f2o, "get_tenant_token", return_value="tok"), \
+                mock.patch.object(f2o, "request_json", side_effect=pages):
+            f2o.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertEqual(stats.count, 0)
+        self.assertEqual(list(spool.iter_rows()), [])
+        spool.close()
+
+    def test_stream_mapping_missing_aborts(self):
+        pages = [{"code": 0, "data": {"fields": ["别的列"], "data": [["x"]], "record_id_list": ["r1"], "has_more": False}}]
+        spool = f2o.SpoolWriter()
+        stats = f2o.FetchStats()
+        with mock.patch.object(f2o, "get_tenant_token", return_value="tok"), \
+                mock.patch.object(f2o, "request_json", side_effect=pages):
+            with self.assertRaises(SystemExit) as ctx:
+                f2o.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertIn("找不到", str(ctx.exception))
+        spool.close()
+
+    def test_stream_extra_column_warns_once_and_collects(self):
+        pages = [
+            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["a", "b", "c"]], "record_id_list": ["r1"], "has_more": True}},
+            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["d", "e", "f"]], "record_id_list": ["r2"], "has_more": False}},
+        ]
+        extra: list[str] = []
+        spool = f2o.SpoolWriter()
+        stats = f2o.FetchStats()
+        warnings: list[str] = []
+        with mock.patch.object(f2o, "get_tenant_token", return_value="tok"), \
+                mock.patch.object(f2o, "request_json", side_effect=pages), \
+                mock.patch.object(f2o, "log", side_effect=lambda msg: warnings.append(str(msg))):
+            f2o.fetch_records(self.job_feishu, self.mapping, extra_out=extra, sink=spool, stats=stats)
+        self.assertEqual(extra, ["新列"])
+        # 两页只打一次"未映射"警告（旧实现逐页重复）
+        self.assertEqual(sum(1 for w in warnings if "未映射" in w), 1)
+        self.assertEqual(stats.count, 2)
+        spool.close()
+
+    def test_stream_extra_out_none_ok(self):
+        pages = [
+            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["a", "b", "c"]], "record_id_list": ["r1"], "has_more": False}},
+        ]
+        spool = f2o.SpoolWriter()
+        stats = f2o.FetchStats()
+        with mock.patch.object(f2o, "get_tenant_token", return_value="tok"), \
+                mock.patch.object(f2o, "request_json", side_effect=pages):
+            f2o.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertEqual(stats.count, 1)
+        spool.close()
+
+
+class TestFreshnessDualMode(OfflineTestCase):
+    """freshness_problem 两种输入形态：记录列表（旧）与日期集合（流式）。"""
+
+    def test_records_form(self):
+        records = [{"biz_date": "2026-09-26T00:00:00+08:00"}]
+        self.assertEqual(f2o.freshness_problem(records, "biz_date", "2026-09-27"), ("2026-09-27", "2026-09-26"))
+
+    def test_set_form(self):
+        self.assertEqual(f2o.freshness_problem({"2026-09-26"}, "x", "2026-09-27"), ("2026-09-27", "2026-09-26"))
+
+    def test_set_form_found(self):
+        self.assertIsNone(f2o.freshness_problem({"2026-09-27"}, "x", "2026-09-27"))
+
+    def test_set_form_empty(self):
+        self.assertEqual(f2o.freshness_problem(set(), "x", "2026-09-27"), ("2026-09-27", None))
+
+    def test_none_input(self):
+        self.assertEqual(f2o.freshness_problem(None, "x", "2026-09-27"), ("2026-09-27", None))
+
+
+class TestWritePartitionStreaming(OfflineTestCase):
+    """write_partition 的流式签名与旧签名兼容分支。"""
+
+    def test_new_signature_writes_from_spool(self):
+        table = _FakeTable()
+        rows = [{"record_id": "r1", "a": 1}, {"record_id": "r2", "a": 2}]
+        spool, stats = make_spool_stats(rows)
+        odps = _FakeOdps([{"cnt": 2, "ucnt": 2, "mn": "r1", "mx": "r2"}])
+        f2o.write_partition(odps, table, "p", "t", "json", "20260928", spool, stats)
+        self.assertEqual(table.rows, [['{"record_id":"r1","a":1}'], ['{"record_id":"r2","a":2}']])
+        self.assertEqual([c[0] for c in table.calls], ["delete", "create", "write", "delete"])
+        spool.close()
+
+    def test_new_signature_row_too_big_checked_before_delete(self):
+        table = _FakeTable()
+        spool, stats = make_spool_stats([{"record_id": "r1", "big": "x" * 100}])
+        odps = _FakeOdps([{"cnt": 1, "ucnt": 1, "mn": "r1", "mx": "r1"}])
+        with mock.patch.object(f2o, "MAX_ROW_BYTES", 10):
+            with self.assertRaises(SystemExit):
+                f2o.write_partition(odps, table, "p", "t", "json", "20260928", spool, stats)
+        self.assertEqual(table.calls, [])
+        spool.close()
+
+    def test_new_signature_missing_record_id_aborts(self):
+        table = _FakeTable()
+        spool, stats = make_spool_stats([{"a": 1}])  # 无 record_id
+        odps = _FakeOdps([{"cnt": 1, "ucnt": 1, "mn": "", "mx": ""}])
+        with self.assertRaises(SystemExit) as ctx:
+            f2o.write_partition(odps, table, "p", "t", "json", "20260928", spool, stats)
+        self.assertIn("record_id", str(ctx.exception))
+        spool.close()
+
+    def test_new_signature_empty_stats_replaces(self):
+        table = _FakeTable()
+        spool, stats = make_spool_stats([])
+        odps = _FakeOdps([{"cnt": 0, "ucnt": 0, "mn": None, "mx": None}])
+        f2o.write_partition(odps, table, "p", "t", "json", "20260928", spool, stats)
+        self.assertEqual(table.rows, [])
+        self.assertIn("rename to partition", odps.sql)
+        spool.close()
+
+    def test_wrong_signature_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            f2o.write_partition(mock.Mock(), _FakeTable(), "p", "t", "json", "20260928", "not-a-spool")
+
+    def test_old_signature_still_works_with_list(self):
+        # 旧调用方（传记录列表、不给 stats）自动装进临时 spool
+        table = _FakeTable()
+        odps = _FakeOdps([{"cnt": 1, "ucnt": 1, "mn": "r1", "mx": "r1"}])
+        f2o.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        self.assertEqual(table.rows, [['{"record_id":"r1","a":1}']])
+
+
+class TestRunSyncSpoolLifecycle(OfflineTestCase):
+    """run_sync 流式路径的 spool 生命周期。"""
+
+    def test_dry_run_cleans_spool(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+        spool_holder = {}
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+            spool_holder["spool"] = sink
+            return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch):
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        self.assertFalse(spool_holder["spool"].path.exists())
+
+    def test_zero_rows_cleans_spool(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        spool_holder = {}
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+            spool_holder["spool"] = sink
+            return stats
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch):
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 1)  # 0 行保护
+        self.assertFalse(spool_holder["spool"].path.exists())
+
+
+class TestBizdateMore(OfflineTestCase):
+    def test_compact_edge_dates(self):
+        self.assertEqual(f2o.parse_day_arg("20260930"), date(2026, 9, 30))
+        self.assertEqual(f2o.parse_day_arg("20260101"), date(2026, 1, 1))
+        self.assertEqual(f2o.parse_day_arg("20261231"), date(2026, 12, 31))
+
+    def test_iso_edge_dates(self):
+        self.assertEqual(f2o.parse_day_arg("2026-01-01"), date(2026, 1, 1))
+        self.assertEqual(f2o.parse_day_arg("2026-12-31"), date(2026, 12, 31))
+
+    def test_leap_year(self):
+        self.assertEqual(f2o.parse_day_arg("20240229"), date(2024, 2, 29))
+        with self.assertRaises(SystemExit):
+            f2o.parse_day_arg("20230229")
+
+    def test_month_day_bounds(self):
+        with self.assertRaises(SystemExit):
+            f2o.parse_day_arg("20260931")
+        with self.assertRaises(SystemExit):
+            f2o.parse_day_arg("20261301")
+        with self.assertRaises(SystemExit):
+            f2o.parse_day_arg("20260001")
+
+    def test_whitespace_tolerated(self):
+        self.assertEqual(f2o.parse_day_arg("  20260928  "), date(2026, 9, 28))
+
+    def test_garbage_rejected(self):
+        for bad in ("", "2026", "2026-9-28", "2026/09/28", "202609280", "abcdefgh", "2026-09-28T00:00:00"):
+            with self.assertRaises(SystemExit):
+                f2o.parse_day_arg(bad)
+
+    def test_env_bizdate_whitespace(self):
+        with mock.patch.dict(os.environ, {"bizdate": " 20260928 "}, clear=True):
+            self.assertEqual(f2o.env_bizdate(), date(2026, 9, 28))
+
+    def test_env_bizdate_empty_string(self):
+        with mock.patch.dict(os.environ, {"bizdate": ""}, clear=True):
+            self.assertIsNone(f2o.env_bizdate())
+
+    def test_env_skynet_fallback(self):
+        with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "20260928"}, clear=True):
+            self.assertEqual(f2o.env_bizdate(), date(2026, 9, 28))
+
+    def test_env_bizdate_priority_over_skynet(self):
+        with mock.patch.dict(os.environ, {"bizdate": "20260927", "SKYNET_BIZDATE": "20260928"}, clear=True):
+            self.assertEqual(f2o.env_bizdate(), date(2026, 9, 27))
+
+    def test_resolve_bizdate_bad_env_fails(self):
+        args = argparse.Namespace(bizdate="")
+        with mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True):
+            with self.assertRaises(SystemExit):
+                f2o.resolve_bizdate(args)
+
+
+class TestValidateJobMore(OfflineTestCase):
+    def test_job_missing_feishu_block(self):
+        job = make_job()
+        del job["feishu"]
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_feishu_blank_fields(self):
+        job = make_job()
+        job["feishu"]["app_id"] = "   "
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_missing_maxcompute_block(self):
+        job = make_job()
+        del job["maxcompute"]
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_maxcompute_blank_ak(self):
+        job = make_job()
+        job["maxcompute"]["access_key_id"] = ""
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_missing_target_block(self):
+        job = make_job()
+        del job["target"]
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_target_missing_table(self):
+        job = make_job()
+        job["target"]["table"] = ""
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_target_bad_table_name(self):
+        job = make_job()
+        job["target"]["table"] = "ods_t;drop table x"
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_target_bad_project_name(self):
+        job = make_job()
+        job["target"]["project"] = "my project"
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_target_column_whitespace(self):
+        job = make_job()
+        job["target"]["column"] = " json "
+        f2o.validate_job(job)
+        self.assertEqual(job["target"]["column"], "json")  # 校验通过的值写回去
+
+    def test_job_allow_empty_bad_type(self):
+        job = make_job()
+        job["target"]["allow_empty"] = "yes"
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_empty_fields(self):
+        job = make_job()
+        job["fields"] = {}
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_fields_record_id_reserved(self):
+        job = make_job()
+        job["fields"] = {"日期": "record_id"}
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_fields_duplicate_target(self):
+        job = make_job()
+        job["fields"] = {"日期": "biz_date", "日期2": "biz_date"}
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_fields_bad_target(self):
+        job = make_job()
+        job["fields"] = {"日期": "not valid!"}
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_freshness_bad_lag(self):
+        job = make_job()
+        job["freshness"]["lag_days"] = -1
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_freshness_bool_lag(self):
+        job = make_job()
+        job["freshness"]["lag_days"] = True
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_freshness_unknown_date_field(self):
+        job = make_job()
+        job["freshness"]["date_field"] = "not_there"
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_freshness_bad_webhook(self):
+        job = make_job()
+        job["freshness"]["webhook"] = "not-a-url"
+        with self.assertRaises(SystemExit):
+            f2o.validate_job(job)
+
+    def test_job_unknown_top_key_warns(self):
+        job = make_job()
+        job["extra_top"] = 1
+        warnings = f2o.validate_job(job)
+        self.assertTrue(any("extra_top" in w for w in warnings))
+
+    def test_job_normalized_values_written_back(self):
+        job = make_job()
+        job["feishu"]["app_id"] = " cli_x "
+        f2o.validate_job(job)
+        self.assertEqual(job["feishu"]["app_id"], "cli_x")
+
+
+class TestNormalizeDateMore(OfflineTestCase):
+    def test_iso_with_millis_and_tz(self):
+        self.assertEqual(f2o.normalize_date_value("2026-09-27T15:30:00.123+08:00"), "2026-09-27")
+
+    def test_iso_date_only(self):
+        self.assertEqual(f2o.normalize_date_value("2026-09-27"), "2026-09-27")
+
+    def test_slash_single_digit_month(self):
+        self.assertEqual(f2o.normalize_date_value("2026/9/7"), "2026-09-07")
+
+    def test_epoch_zero(self):
+        self.assertEqual(f2o.normalize_date_value(0), "1970-01-01")
+
+    def test_float_value(self):
+        self.assertEqual(f2o.normalize_date_value(0.0), "1970-01-01")
+
+    def test_bool_rejected(self):
+        self.assertIsNone(f2o.normalize_date_value(True))
+        self.assertIsNone(f2o.normalize_date_value(False))
+
+    def test_huge_number_rejected(self):
+        self.assertIsNone(f2o.normalize_date_value(10**30))
+
+    def test_garbage_text(self):
+        for bad in ("", "abc", "2026年9月27日", "27/09/2026", "2026-9-27"):
+            self.assertIsNone(f2o.normalize_date_value(bad))
+
+    def test_whitespace_trimmed(self):
+        self.assertEqual(f2o.normalize_date_value(" 2026-09-27 "), "2026-09-27")
+
+
+class TestBuildRecordsMore(OfflineTestCase):
+    def test_missing_mapping_source_aborts(self):
+        with self.assertRaises(SystemExit):
+            f2o.build_records(["别的列"], ["r1"], [["x"]], {"日期": "biz_date"})
+
+    def test_empty_table_skips_checks(self):
+        records = f2o.build_records([], [], [], {"日期": "biz_date"})
+        self.assertEqual(records, [])
+
+    def test_empty_table_with_fields_validates_mapping(self):
+        with self.assertRaises(SystemExit):
+            f2o.build_records(["日期"], [], [], {"别的列": "biz_date"})
+
+    def test_extra_columns_ignored_and_collected(self):
+        extra: list[str] = []
+        records = f2o.build_records(["日期", "新列"], ["r1"], [["2026-09-27", "x"]], {"日期": "biz_date"}, extra_out=extra)
+        self.assertEqual(extra, ["新列"])
+        self.assertNotIn("新列", records[0])
+
+    def test_row_shorter_than_fields_fills_none(self):
+        records = f2o.build_records(["日期", "金额"], ["r1"], [["2026-09-27"]], {"日期": "biz_date", "金额": "amount"})
+        self.assertIsNone(records[0]["amount"])
+
+    def test_extra_out_none_ok(self):
+        records = f2o.build_records(["日期", "新列"], ["r1"], [["a", "b"]], {"日期": "biz_date"})
+        self.assertEqual(records[0]["biz_date"], "a")
+
+    def test_record_id_always_first(self):
+        records = f2o.build_records(["日期"], ["r1"], [["a"]], {"日期": "biz_date"})
+        self.assertEqual(list(records[0].keys()), ["record_id", "biz_date"])
+
+
+class TestNotifyMore(OfflineTestCase):
+    def test_missing_webhook_skips(self):
+        with mock.patch.object(f2o, "log") as logger:
+            f2o.notify("", "t", ["l"])
+        self.assertTrue(any("未配置" in str(c) for c in logger.call_args_list))
+
+    def test_requests_missing_skips(self):
+        with mock.patch.object(f2o, "requests", None), \
+                mock.patch.object(f2o, "log") as logger:
+            f2o.notify("https://x/hook/1", "t", ["l"])
+        self.assertTrue(any("requests" in str(c) for c in logger.call_args_list))
+
+    @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
+    def test_post_exception_swallowed(self):
+        with mock.patch.object(f2o.requests, "post", side_effect=RuntimeError("down")), \
+                mock.patch.object(f2o, "log") as logger:
+            f2o.notify("https://x/hook/1", "t", ["l"])
+        self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
+
+    @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
+    def test_bad_status_swallowed(self):
+        resp = mock.Mock(status_code=500)
+        resp.json.return_value = {"code": 1, "msg": "bad"}
+        with mock.patch.object(f2o.requests, "post", return_value=resp), \
+                mock.patch.object(f2o, "log") as logger:
+            f2o.notify("https://x/hook/1", "t", ["l"])
+        self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
+
+    @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
+    def test_success_status_code_field(self):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"StatusCode": 0}
+        with mock.patch.object(f2o.requests, "post", return_value=resp), \
+                mock.patch.object(f2o, "log") as logger:
+            f2o.notify("https://x/hook/1", "t", ["l"])
+        self.assertTrue(any("已发送" in str(c) for c in logger.call_args_list))
+
+
+class TestRunCheckMore(OfflineTestCase):
+    def test_table_exists_and_schema_ok(self):
+        o = mock.Mock()
+        o.exist_table.return_value = True
+        table = _Table([_Col("json", "string"), _Col("pt", "string")], [_Col("pt", "string")])
+        o.get_table.return_value = table
+        with mock.patch.object(f2o, "fetch_records", return_value=[{"a": 1}]), \
+                mock.patch.object(f2o, "connect_odps", return_value=o):
+            self.assertEqual(f2o.run_check(make_job(), "p", "t", "json", "20260928"), 0)
+
+    def test_table_schema_mismatch_fails(self):
+        o = mock.Mock()
+        o.exist_table.return_value = True
+        table = _Table([_Col("wrong", "string")], [_Col("pt", "string")])
+        o.get_table.return_value = table
+        with mock.patch.object(f2o, "fetch_records", return_value=[{"a": 1}]), \
+                mock.patch.object(f2o, "connect_odps", return_value=o):
+            self.assertEqual(f2o.run_check(make_job(), "p", "t", "json", "20260928"), 1)
+
+    def test_connect_error_fails(self):
+        o = mock.Mock()
+        o.exist_table.side_effect = RuntimeError("network down")
+        with mock.patch.object(f2o, "fetch_records", return_value=[{"a": 1}]), \
+                mock.patch.object(f2o, "connect_odps", return_value=o):
+            self.assertEqual(f2o.run_check(make_job(), "p", "t", "json", "20260928"), 1)
+
+    def test_api_failure_fails_before_mc(self):
+        with mock.patch.object(f2o, "fetch_records", side_effect=SystemExit("boom")), \
+                mock.patch.object(f2o, "connect_odps") as conn:
+            self.assertEqual(f2o.run_check(make_job(), "p", "t", "json", "20260928"), 1)
+        conn.assert_not_called()
+
+
+class TestRunLockMore(OfflineTestCase):
+    def test_lock_blocks_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            first = f2o.RunLock(path)
+            first.__enter__()
+            try:
+                second = f2o.RunLock(path)
+                with self.assertRaises(SystemExit) as ctx:
+                    second.__enter__()
+                self.assertIn("已有任务", str(ctx.exception))
+            finally:
+                first.__exit__(None, None, None)
+
+    def test_lock_released_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            with f2o.RunLock(path):
+                pass
+            with f2o.RunLock(path):  # 释放后可再次拿锁
+                pass
+
+    def test_lock_file_records_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            with f2o.RunLock(path):
+                content = path.read_text(encoding="utf-8").strip()
+            self.assertIn(str(os.getpid()), content)
+
+    def test_lock_path_hash_distinguishes_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = pathlib.Path(tmp) / "jobs" / "a" / "demo.json"
+            b = pathlib.Path(tmp) / "jobs" / "b" / "demo.json"
+            self.assertNotEqual(f2o.lock_path(a), f2o.lock_path(b))
+
+    def test_lock_path_same_job_same_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = pathlib.Path(tmp) / "jobs" / "a" / "demo.json"
+            self.assertEqual(f2o.lock_path(a), f2o.lock_path(a))
+
+    def test_lock_path_custom_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "locks"
+            path = f2o.lock_path(pathlib.Path("/jobs/demo.json"), root=root)
+            self.assertTrue(str(path).startswith(str(root)))
+
+
+class TestMainMore(OfflineTestCase):
+    def test_no_job_returns_2(self):
+        self.assertEqual(f2o.main(["--bizdate", "20260928"]), 2)
+
+    def test_missing_job_file_returns_1(self):
+        self.assertEqual(f2o.main(["--job", "/nonexistent/x.json"]), 1)
+
+    def test_bad_bizdate_returns_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = pathlib.Path(tmp) / "demo.json"
+            job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+            self.assertEqual(f2o.main(["--job", str(job_path), "--bizdate", "bad-date"]), 1)
+
+    def test_check_flow_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = pathlib.Path(tmp) / "demo.json"
+            job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+            with mock.patch.object(f2o, "run_check", return_value=0) as check:
+                self.assertEqual(f2o.main(["--job", str(job_path), "--check"]), 0)
+            self.assertTrue(check.called)
+
+    def test_version_output(self):
+        with self.assertRaises(SystemExit) as ctx:
+            f2o.main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_sync_flow_with_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = pathlib.Path(tmp) / "demo.json"
+            job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+            with mock.patch.object(f2o, "run_sync", return_value=0) as sync, \
+                    mock.patch.object(f2o, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+                self.assertEqual(f2o.main(["--job", str(job_path)]), 0)
+            self.assertTrue(sync.called)
+
+    def test_keyboard_interrupt_before_run_returns_130(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = pathlib.Path(tmp) / "demo.json"
+            job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+            with mock.patch.object(f2o, "run_sync", side_effect=KeyboardInterrupt), \
+                    mock.patch.object(f2o, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+                self.assertEqual(f2o.main(["--job", str(job_path)]), 130)
+
+    def test_unexpected_error_returns_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = pathlib.Path(tmp) / "demo.json"
+            job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+            with mock.patch.object(f2o, "run_sync", side_effect=ValueError("意外")), \
+                    mock.patch.object(f2o, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+                self.assertEqual(f2o.main(["--job", str(job_path)]), 1)
 
 
 if __name__ == "__main__":
