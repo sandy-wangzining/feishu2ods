@@ -870,14 +870,35 @@ class TestWiring(OfflineTestCase):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
 
-    def test_run_sync_freshness_blocks_and_notifies(self):
+    def test_run_sync_freshness_warns_but_continues(self):
+        # 缺数据只告警不失败（人填的表，节假日没人填是常态）：rc=0、照常写、飞书告警一次
         args = argparse.Namespace(skip_freshness=False, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with mock.patch.object(f2o, "fetch_records", return_value=records), \
                 mock.patch.object(f2o, "notify") as notifier:
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         notifier.assert_called_once()
+        self.assertIn("已照常写入", notifier.call_args.args[1])
+
+    def test_run_sync_freshness_warns_but_no_notify_flag_silences_webhook(self):
+        # --no-notify 只关飞书提醒：rc 仍是 0（缺数据不阻塞）
+        args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+        with mock.patch.object(f2o, "fetch_records", return_value=records), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        notifier.assert_not_called()
+
+    def test_run_sync_zero_records_still_fails(self):
+        # 真异常（表被清空 = 0 行）仍然失败：缺数放行不等于放行空表
+        args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
+        with mock.patch.object(f2o, "fetch_records", return_value=[]), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 1)
+        notifier.assert_not_called()
 
     def test_run_sync_new_fields_notifies_once(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=False, dry_run=True)

@@ -12,7 +12,8 @@
     - 同一作业有运行锁（flock/msvcrt，进程退出自动释放）：同一台机器上调度与手动重跑重叠时
       有一边会退出；锁只在单机内生效，本地与服务器同时跑同一作业没有保护（正式跑请固定在一台机器）；
     - 可选新鲜度校验：业务日（bizdate - lag_days，默认 lag_days=0 即 bizdate 当天）必须出现在
-      指定字段里，缺失 / 表为空时发飞书告警并以非 0 退出、不写库；
+      指定字段里。缺数据只告警不失败（人填的表，节假日没人填是常态）——快照照常写入、
+      发飞书提醒；表为空（0 行）仍按失败处理（那才是真异常，拒绝清空分区）；
     - 未映射的新增列（Base 里新加的列）不报错：忽略其值、其余字段照常同步，并发一条飞书提醒
       （含列名与处理步骤，人工决定是否加 fields 映射）；映射的列被改名/删除仍直接报错。
 
@@ -111,7 +112,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.2.1"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.3.0"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -1366,8 +1367,12 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
         expected = (bizdate - timedelta(days=lag_days)).isoformat()
         problem = freshness_problem(records, freshness["date_field"], expected)
         if problem is not None:
+            # 缺数据只告警、不失败：很多表是人填的（节假日/休假没人填是常态），
+            # 缺一天不等于任务失败——快照照常写入（DWD 按源数据日期字段重新分区，
+            # 缺的那天只是没有数据行），下游任务照常跑。真异常（表被清空=0 行）
+            # 仍由上面的 0 行保护拦截。
             expected, latest = problem
-            log(f"❌ 缺少 {expected} 的数据（当前最新 {latest or '无'}），本次不写库")
+            log(f"⚠️ 缺少 {expected} 的数据（当前最新 {latest or '无'}），照常写入并告警")
             if freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS):
                 log(f"   预期日期 = 业务日 - {freshness.get('lag_days', DEFAULT_FRESHNESS_LAG_DAYS)} 天；"
                     f"如表格出数节奏不同，请调整 freshness.lag_days")
@@ -1379,22 +1384,24 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
                     f"**预期已有**：{expected}（{freshness['date_field']}）",
                     f"**当前最新**：{latest or '无'}",
                     f"**当前条数**：{len(records):,}",
+                    "本次已照常写入快照（缺的那天只是没有数据行），下游任务不受影响；",
+                    "请人工确认表格是否还需要更新，更新后重跑即可。",
                 ]
                 if base_url:
                     lines.append(f"**数据表**：{base_url}")
                 notify(
                     webhook,
-                    f"飞书表格同步缺少 {expected} 数据",
+                    f"飞书表格同步缺少 {expected} 数据（已照常写入）",
                     lines,
-                    footer=f"目标表 {project}.{table_name} · 请检查飞书表格是否已更新，更新后重跑即可",
+                    footer=f"目标表 {project}.{table_name}",
                 )
-            return 1
-        dup_dates = [day for day, count in Counter(
-            normalize_date_value(record.get(freshness["date_field"])) for record in records
-        ).items() if day and count > 1]
-        if dup_dates:
-            log(f"  警告：以下日期在 Base 里出现多行：{'、'.join(sorted(dup_dates)[:10])}（DWD 同一天会落多行）")
-        log(f"新鲜度校验通过：{freshness['date_field']} 已包含业务日 {expected}")
+        else:
+            dup_dates = [day for day, count in Counter(
+                normalize_date_value(record.get(freshness["date_field"])) for record in records
+            ).items() if day and count > 1]
+            if dup_dates:
+                log(f"  警告：以下日期在 Base 里出现多行：{'、'.join(sorted(dup_dates)[:10])}（DWD 同一天会落多行）")
+            log(f"新鲜度校验通过：{freshness['date_field']} 已包含业务日 {expected}")
 
     # ---- ③ 写库（dry-run 跳过）----
     if args.dry_run:
