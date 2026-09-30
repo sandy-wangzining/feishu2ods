@@ -130,10 +130,11 @@ class _FakeTable:
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
         self.status_code = status_code
         self._payload = {} if payload is None else payload
         self.text = text
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -318,6 +319,18 @@ class TestBuildRecords(OfflineTestCase):
         with self.assertRaises(SystemExit):
             f2o.build_records([], ["r1"], [["1"]], {"a": "aaa"})
 
+    def test_extra_columns_collected(self):
+        extras: list[str] = []
+        records = f2o.build_records(
+            ["日期", "金额", "新列A", "新列B"],
+            ["r1"],
+            [["2026-09-27", "$1", "x", "y"]],
+            {"日期": "biz_date", "金额": "amount"},
+            extra_out=extras,
+        )
+        self.assertEqual(records, [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}])
+        self.assertEqual(extras, ["新列A", "新列B"])
+
 
 # ---------------------------------------------------------------------------
 # 新鲜度
@@ -385,6 +398,22 @@ class TestRequestJson(OfflineTestCase):
         with mock.patch.object(f2o.requests, "request", return_value=_FakeResponse(403, text="no")):
             with self.assertRaises(f2o.ApiHttpError):
                 f2o.request_json("GET", "https://x", "t")
+
+    def test_redirect_raises_api_error_without_retry(self):
+        # 301/302/303 会把 POST 降级成不带 body 的 GET（请求参数全丢），
+        # 鉴权头也可能被转发到别的地址——直接失败，不重试
+        resp = _FakeResponse(302, text="", headers={"Location": "https://other.example.com/new"})
+        with mock.patch.object(f2o.requests, "request", return_value=resp) as call:
+            with self.assertRaises(f2o.ApiHttpError) as ctx:
+                f2o.request_json("POST", "https://x", "t", body={"app_id": "a", "app_secret": "s"})
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertEqual(call.call_count, 1)  # 确定性错误不重试
+
+    def test_request_disables_redirects(self):
+        with mock.patch.object(f2o.requests, "request", return_value=_FakeResponse(200, {"code": 0})) as call:
+            f2o.request_json("GET", "https://x", "t")
+        kwargs = call.call_args.kwargs
+        self.assertIs(kwargs.get("allow_redirects"), False)
 
 
 @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
@@ -849,6 +878,40 @@ class TestWiring(OfflineTestCase):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)
         notifier.assert_called_once()
+
+    def test_run_sync_new_fields_notifies_once(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=False, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+            if extra_out is not None:
+                extra_out.extend(["新列A", "新列A", "新列B"])
+            return records
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+        joined = "\n".join(notifier.call_args.args[2])
+        self.assertIn("新增列", notifier.call_args.args[1])
+        self.assertIn("新列A", joined)
+        self.assertIn("新列B", joined)
+
+    def test_run_sync_new_fields_no_notify_flag(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+            if extra_out is not None:
+                extra_out.append("新列A")
+            return records
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        notifier.assert_not_called()
 
     def test_run_sync_skip_freshness(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)

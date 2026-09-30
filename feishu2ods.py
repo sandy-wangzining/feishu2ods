@@ -12,7 +12,9 @@
     - 同一作业有运行锁（flock/msvcrt，进程退出自动释放）：同一台机器上调度与手动重跑重叠时
       有一边会退出；锁只在单机内生效，本地与服务器同时跑同一作业没有保护（正式跑请固定在一台机器）；
     - 可选新鲜度校验：业务日（bizdate - lag_days，默认 lag_days=0 即 bizdate 当天）必须出现在
-      指定字段里，缺失 / 表为空时发飞书告警并以非 0 退出、不写库。
+      指定字段里，缺失 / 表为空时发飞书告警并以非 0 退出、不写库；
+    - 未映射的新增列（Base 里新加的列）不报错：忽略其值、其余字段照常同步，并发一条飞书提醒
+      （含列名与处理步骤，人工决定是否加 fields 映射）；映射的列被改名/删除仍直接报错。
 
     pt（业务日）取值优先级：--bizdate > 环境变量 bizdate / SKYNET_BIZDATE（DataWorks）> 当天-1（CN）。
 
@@ -64,7 +66,7 @@ job 配置（jobs/*.json，密钥直接写在文件里；jobs/ 已 gitignore，�
     python feishu2ods.py --job jobs/feishu_ai_cost.json --bizdate 20260928      # 指定业务日 pt（重跑/补数）
     python feishu2ods.py --job jobs/feishu_ai_cost.json --dry-run       # 只拉数打印统计，不写库
     python feishu2ods.py --job jobs/feishu_ai_cost.json --skip-freshness       # 跳过新鲜度校验（补数/排查）
-    python feishu2ods.py --job jobs/feishu_ai_cost.json --no-notify     # 缺数据只报错，不发飞书
+    python feishu2ods.py --job jobs/feishu_ai_cost.json --no-notify     # 不发飞书通知（缺数据/新增列等）
     python feishu2ods.py --job jobs/feishu_ai_cost.json --project my_project_dev  # 改目标项目（测试用）
 """
 
@@ -109,7 +111,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.1.2"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.2.0"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -395,10 +397,25 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
     last: Exception | None = None
     for attempt in range(1, tries + 1):
         try:
-            resp = requests.request(method, url, params=params, json=body, headers=headers, timeout=(10, 30))
+            # allow_redirects=False：requests 默认跟随重定向，而 301/302/303 会把 POST 降级成
+            # 不带 body 的 GET（请求参数全丢），且自定义鉴权头（Authorization）会被转发到重定向
+            # 目标。这两种后果都比"直接失败"危险得多（与 api2ods 2.1.8 的修复同款）
+            resp = requests.request(
+                method, url, params=params, json=body, headers=headers, timeout=(10, 30), allow_redirects=False
+            )
         except requests.RequestException as exc:
             last = exc
         else:
+            if 300 <= resp.status_code < 400:
+                # 不跟随重定向：把 Location 报出来让用户直接改成最终地址。
+                # 抛 ApiHttpError（确定性错误、不重试），别让它掉进重试的退避里
+                location = redact(str(resp.headers.get("Location") or ""))
+                raise ApiHttpError(
+                    resp.status_code,
+                    f"接口返回重定向 HTTP {resp.status_code}（Location: {location}）：本工具不跟随重定向"
+                    f"——301/302/303 会把 POST 降级成不带 body 的 GET（请求参数全丢），"
+                    f"鉴权头也可能被转发到别的地址。请把地址改成最终地址",
+                )
             if resp.status_code >= 500 or resp.status_code == 429:
                 last = requests.RequestException(f"HTTP {resp.status_code}：{resp.text[:200]}")
             elif 400 <= resp.status_code < 500:
@@ -436,13 +453,16 @@ def _records_url(feishu: dict) -> str:
     return f"{FEISHU_HOST}/open-apis/base/v3/bases/{feishu['base_token']}/tables/{feishu['table_id']}/records"
 
 
-def fetch_records(feishu: dict, mapping: dict, max_pages: int | None = None) -> list[dict]:
+def fetch_records(
+    feishu: dict, mapping: dict, max_pages: int | None = None, extra_out: list[str] | None = None
+) -> list[dict]:
     """全量拉取数据表记录 → 每行一个 dict（record_id + 英文键）。
 
     v3 records 接口：limit=PAGE_SIZE + offset 翻页，has_more=false 结束；翻页中途 token 失效
     自动重取一次并重试当前页，限流（99991400）自动退避重试；字段列表在翻页间变化
     （表格结构刚被改动）按异常中止；接口给的表格版本号（rev）在翻页间变化也中止——
-    offset 翻页期间表格被编辑会静默漏行，宁可中止重跑。max_pages 只拉前 N 页（--check 体检用）。
+    offset 翻页期间表格被编辑会静默漏行，宁可中止重跑。max_pages 只拉前 N 页（--check 体检用）；
+    extra_out 传入时收集未映射的新增列名（由 run_sync 发一次飞书提醒用）。
     """
     url = _records_url(feishu)
     token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
@@ -533,14 +553,21 @@ def fetch_records(feishu: dict, mapping: dict, max_pages: int | None = None) -> 
         if page > MAX_PAGES:
             raise SystemExit(f"翻页超过 {MAX_PAGES} 页，已中止")
 
-    return build_records(fields or [], record_ids, raw_rows, mapping)
+    return build_records(fields or [], record_ids, raw_rows, mapping, extra_out=extra_out)
 
 
-def build_records(fields: list[str], record_ids: list[str], raw_rows: list[list], mapping: dict) -> list[dict]:
+def build_records(
+    fields: list[str],
+    record_ids: list[str],
+    raw_rows: list[list],
+    mapping: dict,
+    extra_out: list[str] | None = None,
+) -> list[dict]:
     """列式行 + 记录 ID → 记录 dict：{record_id, 英文键: 原值, ...}。
 
     - 映射里的 Base 列名找不到（被改名/删除）→ 直接报错（宁可中止也不静默丢列）；
     - 未映射的 Base 列 → 忽略并打一条告警（提示新列，需要就加到 fields 里）；
+      extra_out 传入时同时收集列名，由 run_sync 发一次飞书提醒（人工决定是否加映射）；
     - 值原样保留（含 $ 千分位、日期 ISO 串等），清洗留给下游 DWD。
     """
     index = {name: i for i, name in enumerate(fields)}
@@ -552,6 +579,8 @@ def build_records(fields: list[str], record_ids: list[str], raw_rows: list[list]
         extra = [name for name in fields if name and name not in mapping]
         if extra:
             log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
+            if extra_out is not None:
+                extra_out.extend(extra)
     if not raw_rows and not record_ids:
         return []
     if len(record_ids) != len(raw_rows):
@@ -1251,7 +1280,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="跳过新鲜度校验（补数/排查用；--no-check 是旧写法，兼容保留）",
     )
-    parser.add_argument("--no-notify", action="store_true", help="缺数据/异常时只报错，不发飞书")
+    parser.add_argument("--no-notify", action="store_true", help="不发任何飞书通知（缺数据/新增列等只记日志）")
     parser.add_argument("--project", default="", help="覆盖 target.project（测试用）")
     parser.add_argument("--table", default="", help="覆盖 target.table（测试用）")
     parser.add_argument("--version", action="version", version=f"feishu2ods {VERSION}")
@@ -1292,8 +1321,25 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
     target_cfg = job["target"]
 
     # ---- ① 拉数 ----
-    records = fetch_records(feishu, job["fields"])
+    webhook = str((job.get("freshness") or {}).get("webhook") or "")
+    base_url = str(feishu.get("base_url") or "")
+    new_fields: list[str] = []
+    records = fetch_records(feishu, job["fields"], extra_out=new_fields)
     log(f"拉取完成：{len(records):,} 条记录，映射 {len(job['fields'])} 个字段")
+    if new_fields and not args.no_notify:
+        uniq = sorted(set(new_fields))
+        lines = [
+            f"**作业**：{job.get('job')}",
+            f"**新增列**：{'、'.join(f'`{name}`' for name in uniq)}",
+        ]
+        if base_url:
+            lines.append(f"**数据表**：{base_url}")
+        lines += [
+            "本次已忽略新增列、其余字段照常同步（新增列数据暂未采集）。如需入库，请手动处理：",
+            "① 作业 `fields` 补映射（Base 列名 → 英文键）；",
+            "② 重跑本节点（写入幂等）。",
+        ]
+        notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
     empty_rows = sum(
         1 for record in records if all(value is None for key, value in record.items() if key != "record_id")
     )
@@ -1301,8 +1347,6 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
         log(f"  警告：{empty_rows:,} 条记录除 record_id 外全为空（Base 里的空白行），已原样同步；下游按日期字段过滤")
 
     # ---- ② 空表 / 新鲜度校验（缺失 → 告警 + 非 0 退出，不写库）----
-    webhook = str((job.get("freshness") or {}).get("webhook") or "")
-    base_url = str(feishu.get("base_url") or "")
     allow_empty = bool(target_cfg.get("allow_empty", False))
     if not records and not allow_empty:
         log("❌ 拉取到 0 条记录，已中止（target.allow_empty=false，拒绝写入空分区）")
