@@ -13,7 +13,15 @@
 
 ## 目录
 
-- `feishu2ods.py` 主脚本（单文件）
+- `feishu2ods/` 代码包（v1.5.0 起从单文件拆出，按职责分模块）：
+  - `cli.py` 命令行入口（--check / 正式同步 / --init 分发）
+  - `auth.py` 飞书 HTTP 请求（重试/限流退避）与 tenant_access_token
+  - `fetch.py` 多维表格拉取（offset 翻页 + 一致性保护 + 流式落盘）
+  - `mc.py` MaxCompute：建表 / 结构校验 / 写分区（原子替换）/ 写后核对
+  - `spool.py` 流式落盘（SpoolWriter）与拉取统计（FetchStats）
+  - `config.py` job 配置读取与校验；`dates.py` 业务日与日期规范化
+  - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
+- `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
 - `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_ai_cost.example.json`）
 - `tests/` 离线单测：`python -m unittest discover -s tests -v`（不访问网络、不连 MaxCompute）
 - `requirements.txt` 依赖（requests + pyodps）
