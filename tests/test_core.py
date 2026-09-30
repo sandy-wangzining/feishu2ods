@@ -1681,8 +1681,10 @@ class TestRunLockMore(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "x.lock"
             with utils_mod.RunLock(path):
-                content = path.read_text(encoding="utf-8").strip()
-            self.assertIn(str(os.getpid()), content)
+                pass
+            # 锁释放后再读：Windows 上持锁期间文件被区域锁保护，第二个句柄读不了
+            content = path.read_text(encoding="utf-8").strip()
+        self.assertIn(str(os.getpid()), content)
 
     def test_lock_path_hash_distinguishes_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
