@@ -14,7 +14,8 @@ except ImportError:  # pragma: no cover - 离线测试环境可以不带 request
 
 FEISHU_HOST = "https://open.feishu.cn"
 TOKEN_URL = f"{FEISHU_HOST}/open-apis/auth/v3/tenant_access_token/internal"
-HTTP_ATTEMPTS = 3                               # 单次请求最大尝试次数（429/5xx/网络抖动才重试）
+HTTP_ATTEMPTS = 3  # 单次请求最大尝试次数（429/5xx/网络抖动才重试）
+
 
 class ApiHttpError(Exception):
     """HTTP 4xx（登录/权限/参数类确定性错误）：不再重试，由调用方决定处置。"""
@@ -23,7 +24,6 @@ class ApiHttpError(Exception):
         super().__init__(f"HTTP {status}")
         self.status = status
         self.body = body
-
 
 
 # =============================================================================
@@ -90,5 +90,3 @@ def get_tenant_token(app_id: str, app_secret: str) -> str:
         raise SystemExit("tenant_access_token 为空（接口返回异常）")
     log(f"已获取 tenant_access_token（有效期 {data.get('expire')} 秒）")
     return token
-
-

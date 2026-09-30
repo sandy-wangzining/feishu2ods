@@ -81,7 +81,9 @@ def run_init(
             echo("   不能为空。")
             continue
         if "/wiki/" in raw:
-            echo("   wiki 知识库链接里是 wiki 节点 token、不是 base_token；请在浏览器里打开该表格后复制 /base/ 开头的链接，或直接填 base_token。")
+            echo(
+                "   wiki 知识库链接里是 wiki 节点 token、不是 base_token；请在浏览器里打开该表格后复制 /base/ 开头的链接，或直接填 base_token。"
+            )
             continue
         base_token, table_id = _split_base_ref(raw)
         if not base_token or "/" in base_token or " " in base_token:
@@ -263,5 +265,3 @@ def run_init(
     echo(f"   下一步：python feishu2ods.py --job {out} --check      # 体检（不写库）")
     echo(f"           python feishu2ods.py --job {out} --dry-run    # 试跑（不写库）")
     return 0
-
-

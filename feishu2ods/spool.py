@@ -11,7 +11,8 @@ from collections import Counter
 
 from .dates import normalize_date_value
 
-BATCH_SIZE = 500                                # Tunnel 每批写入行数
+BATCH_SIZE = 500  # Tunnel 每批写入行数
+
 
 def dump_record(record: dict) -> str:
     """一条记录 → 单行 JSON（与 api2ods 同款序列化参数：不转义中文、紧凑、拒绝 NaN）。"""
@@ -108,5 +109,3 @@ class FetchStats:
 
     def distinct_ids(self) -> int:
         return len(self.ids)
-
-

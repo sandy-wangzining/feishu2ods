@@ -39,7 +39,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--job", default="", help="job 配置文件（jobs/*.json）；--init 时可不填")
     parser.add_argument("--init", action="store_true", help="交互式生成作业配置（接新表用；生成后先 --check）")
     parser.add_argument("--init-out", default="", help="--init 的输出路径（默认 jobs/<作业名>.json）")
-    parser.add_argument("--check", action="store_true", help="体检：配置 + API 连通 + 字段映射 + 目标表结构（不写库、不发告警）")
+    parser.add_argument(
+        "--check", action="store_true", help="体检：配置 + API 连通 + 字段映射 + 目标表结构（不写库、不发告警）"
+    )
     parser.add_argument(
         "--bizdate",
         default="",
@@ -87,7 +89,9 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
     return 0
 
 
-def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: str, bizdate: date, started: float) -> int:
+def run_sync(
+    args, job: dict, project: str, table_name: str, column: str, pt: str, bizdate: date, started: float
+) -> int:
     """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对。"""
     feishu = job["feishu"]
     maxcompute = job["maxcompute"]
@@ -111,7 +115,9 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
         uniq = sorted(set(new_fields))
         # 日志无条件打：--no-notify 只关飞书提醒，不关日志——新增列完全不可见会让
         # 用户以为"没出问题"（与 api2ods 的字段漂移提醒口径一致：先 log 再 notify）
-        log(f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{name}`' for name in uniq)}（本次忽略其值、其余字段照常同步）")
+        log(
+            f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{name}`' for name in uniq)}（本次忽略其值、其余字段照常同步）"
+        )
         if not args.no_notify:
             lines = [
                 f"**作业**：{job.get('job')}",
@@ -153,8 +159,10 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
             expected, latest = problem
             log(f"⚠️ 缺少 {expected} 的数据（当前最新 {latest or '无'}），照常写入并告警")
             if freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS):
-                log(f"   预期日期 = 业务日 - {freshness.get('lag_days', DEFAULT_FRESHNESS_LAG_DAYS)} 天；"
-                    f"如表格出数节奏不同，请调整 freshness.lag_days")
+                log(
+                    f"   预期日期 = 业务日 - {freshness.get('lag_days', DEFAULT_FRESHNESS_LAG_DAYS)} 天；"
+                    f"如表格出数节奏不同，请调整 freshness.lag_days"
+                )
             else:
                 log("   若表格本来就晚一天出数，可在 job 里把 freshness.lag_days 调成 1；补数可加 --skip-freshness")
             if not args.no_notify:

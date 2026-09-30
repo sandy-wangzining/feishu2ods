@@ -13,12 +13,13 @@ try:
 except ImportError:  # pragma: no cover - 离线测试环境可以不带 pyodps
     ODPS = None
 
-PARTITION_COLUMN = "pt"                         # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
-WRITE_ATTEMPTS = 3                              # 写分区的最大尝试次数（重试会清掉临时分区重写）
-WRITE_RETRY_DELAY = 10                          # 写入重试间隔秒数
-TMP_PARTITION_SUFFIX = "__tmp"                  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
-MAX_ROW_BYTES = 7_000_000                       # 单行 JSON 上限（MaxCompute string 8MB，留余量）
+PARTITION_COLUMN = "pt"  # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
+WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分区重写）
+WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
+TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
+MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+
 
 # =============================================================================
 # MaxCompute：建表 / 结构校验 / 写分区（临时分区 + 原子替换）/ 写后校验
@@ -89,7 +90,9 @@ def rename_partition(o, project: str, table_name: str, old_spec: str, new_spec: 
     )
 
 
-def write_partition(o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None) -> None:
+def write_partition(
+    o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None
+) -> None:
     """写一个分区：先写 <pt>__tmp 临时分区并核对内容，再删旧分区 + rename 原子替换。
 
     - 可见窗口只剩两条 DDL 之间：写入期间旧快照完整可读；
@@ -228,5 +231,3 @@ def verify_partition(o, project: str, table_name: str, column: str, pt: str) -> 
                 "" if row["mx"] is None else str(row["mx"]),
             )
     return (0, 0, "", "")
-
-

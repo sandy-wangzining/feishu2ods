@@ -431,15 +431,19 @@ class TestNotify(OfflineTestCase):
         resp = mock.Mock(status_code=200)
         resp.json.return_value = {"code": 0}
         messages: list[str] = []
-        with mock.patch.object(notify_mod.requests, "post", return_value=resp), \
-                mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+        with (
+            mock.patch.object(notify_mod.requests, "post", return_value=resp),
+            mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))),
+        ):
             cli_mod.notify("https://x/hook/1", "标题", ["第一行"], footer="尾部")
         self.assertIn("飞书通知已发送", "\n".join(messages))
 
     def test_notify_error_swallowed(self):
         messages: list[str] = []
-        with mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError("网络坏了")), \
-                mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+        with (
+            mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError("网络坏了")),
+            mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))),
+        ):
             cli_mod.notify("https://x/hook/1", "标题", ["第一行"])
         self.assertIn("飞书通知发送失败", "\n".join(messages))
 
@@ -462,30 +466,38 @@ class TestFetchRecords(OfflineTestCase):
             self._page([["2026-09-27", "$1"]], ["r1"], True),
             self._page([["2026-09-26", "$2"]], ["r2"], False),
         ]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             records = cli_mod.fetch_records(self.job_feishu, self.mapping)
         self.assertEqual([r["record_id"] for r in records], ["r1", "r2"])
         self.assertEqual(records[0]["biz_date"], "2026-09-27")
 
     def test_max_pages_one(self):
         pages = [self._page([["2026-09-27", "$1"]], ["r1"], True)]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             records = cli_mod.fetch_records(self.job_feishu, self.mapping, max_pages=1)
         self.assertEqual(len(records), 1)
 
     def test_token_refresh(self):
         pages = [{"code": 99991663}, self._page([["2026-09-27", "$1"]], ["r1"], False)]
-        with mock.patch.object(fetch_mod, "get_tenant_token", side_effect=["tok1", "tok2"]), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", side_effect=["tok1", "tok2"]),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             records = cli_mod.fetch_records(self.job_feishu, self.mapping)
         self.assertEqual(len(records), 1)
 
     def test_rate_limit_retry(self):
         pages = [{"code": 99991400}, self._page([["2026-09-27", "$1"]], ["r1"], False)]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             records = cli_mod.fetch_records(self.job_feishu, self.mapping)
         self.assertEqual(len(records), 1)
 
@@ -494,8 +506,10 @@ class TestFetchRecords(OfflineTestCase):
             self._page([["a", "b"]], ["r1"], True),
             self._page([["a", "b"]], ["r2"], False, fields=("日期", "换列")),
         ]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             with self.assertRaises(SystemExit):
                 cli_mod.fetch_records(self.job_feishu, self.mapping)
 
@@ -504,15 +518,24 @@ class TestFetchRecords(OfflineTestCase):
             self._page([["a", "b"]], ["r1"], True),
             self._page([["a", "b"]], ["r1"], False),
         ]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             with self.assertRaises(SystemExit):
                 cli_mod.fetch_records(self.job_feishu, self.mapping)
 
     def test_row_id_count_mismatch(self):
-        pages = [{"code": 0, "data": {"fields": ["日期"], "data": [["x"]], "record_id_list": ["r1", "r2"], "has_more": False}}]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        pages = [
+            {
+                "code": 0,
+                "data": {"fields": ["日期"], "data": [["x"]], "record_id_list": ["r1", "r2"], "has_more": False},
+            }
+        ]
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             with self.assertRaises(SystemExit):
                 cli_mod.fetch_records(self.job_feishu, self.mapping)
 
@@ -521,8 +544,10 @@ class TestFetchRecords(OfflineTestCase):
             self._page([["2026-09-27", "$1"]], ["r1"], True, rev=12),
             self._page([["2026-09-26", "$2"]], ["r2"], False, rev=13),
         ]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             with self.assertRaises(SystemExit):
                 cli_mod.fetch_records(self.job_feishu, self.mapping)
 
@@ -531,8 +556,10 @@ class TestFetchRecords(OfflineTestCase):
             self._page([["2026-09-27", "$1"]], ["r1"], True, rev=12),
             self._page([["2026-09-26", "$2"]], ["r2"], False, rev=12),
         ]
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             self.assertEqual(len(cli_mod.fetch_records(self.job_feishu, self.mapping)), 2)
 
 
@@ -550,6 +577,7 @@ def make_spool_stats(records):
 
 def fetch_stub(records):
     """fetch_records 的流式替身：像真实实现一样写 sink、累积 stats、返回 stats。"""
+
     def _stub(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
         if sink is not None and stats is not None:
             for record in records:
@@ -557,6 +585,7 @@ def fetch_stub(records):
                 stats.update([record])
             return stats
         return list(records)
+
     return _stub
 
 
@@ -758,21 +787,21 @@ class TestRunInit(OfflineTestCase):
             return fields, {"日期": "2026-09-27", "金额": "$1"}
 
         answers = [
-            "probe_job",                                                       # ① 作业名
-            "https://example.feishu.cn/base/IC4TEST?table=tblTEST&view=v",    # ② 链接
-            "cli_test123",                                                     # ③ app_id
-            "secret-abc-123",                                                  # App Secret
-            "biz_date",                                                        # 日期 → 英文键
-            "amount",                                                          # 金额 → 英文键
-            "",                                                                # 备注 跳过
-            "",                                                                # 项目（默认）
-            "",                                                                # 表名（默认）
-            "",                                                                # 注释（默认）
-            "LTAI_TEST",                                                       # AK
-            "SK_SECRET_XYZ",                                                   # SK
-            "y",                                                               # 新鲜度
-            "biz_date",                                                        # date_field
-            "",                                                                # webhook
+            "probe_job",  # ① 作业名
+            "https://example.feishu.cn/base/IC4TEST?table=tblTEST&view=v",  # ② 链接
+            "cli_test123",  # ③ app_id
+            "secret-abc-123",  # App Secret
+            "biz_date",  # 日期 → 英文键
+            "amount",  # 金额 → 英文键
+            "",  # 备注 跳过
+            "",  # 项目（默认）
+            "",  # 表名（默认）
+            "",  # 注释（默认）
+            "LTAI_TEST",  # AK
+            "SK_SECRET_XYZ",  # SK
+            "y",  # 新鲜度
+            "biz_date",  # date_field
+            "",  # webhook
         ]
         code, echoed = self._run(answers, fake_fetch)
         self.assertEqual(code, 0)
@@ -809,7 +838,7 @@ class TestRunInit(OfflineTestCase):
             "tblTEST",
             "cli_test123",
             "secret-abc-123",
-            "",   # 日期 跳过
+            "",  # 日期 跳过
         ]
         code, _ = self._run(answers, fake_fetch)
         self.assertEqual(code, 1)
@@ -822,14 +851,14 @@ class TestRunInit(OfflineTestCase):
 
         answers = [
             "probe_job",
-            "https://example.feishu.cn/wiki/AbCdEfGh?table=tblTEST",    # wiki 链接 → 提示重问
-            "https://example.feishu.cn/base/IC4TEST?table=tblTEST",    # 第二次给 base 链接
+            "https://example.feishu.cn/wiki/AbCdEfGh?table=tblTEST",  # wiki 链接 → 提示重问
+            "https://example.feishu.cn/base/IC4TEST?table=tblTEST",  # 第二次给 base 链接
             "cli_test123",
             "secret-abc-123",
             "biz_date",
-            "",   # 项目（默认）
-            "",   # 表名（默认）
-            "",   # 注释（默认）
+            "",  # 项目（默认）
+            "",  # 表名（默认）
+            "",  # 注释（默认）
             "LTAI_TEST",
             "SK_SECRET_XYZ",
             "n",  # 不要新鲜度
@@ -845,7 +874,7 @@ class TestRunInit(OfflineTestCase):
             return fields, {"日期": "2026-09-27"}
 
         answers = [
-            "probe-job",   # 作业名带 '-'（文件名可以，表名不行）
+            "probe-job",  # 作业名带 '-'（文件名可以，表名不行）
             "IC4TEST",
             "tblTEST",
             "cli_test123",
@@ -885,8 +914,10 @@ class TestWiring(OfflineTestCase):
     def test_run_check_ok(self):
         o = mock.Mock()
         o.exist_table.return_value = False
-        with mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=o):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]),
+            mock.patch.object(cli_mod, "connect_odps", return_value=o),
+        ):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 0)
 
     def test_run_check_api_failure(self):
@@ -904,8 +935,10 @@ class TestWiring(OfflineTestCase):
         # 缺数据只告警不失败（人填的表，节假日没人填是常态）：rc=0、照常写、飞书告警一次
         args = argparse.Namespace(skip_freshness=False, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)), \
-                mock.patch.object(cli_mod, "notify") as notifier:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "notify") as notifier,
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         notifier.assert_called_once()
@@ -915,8 +948,10 @@ class TestWiring(OfflineTestCase):
         # --no-notify 只关飞书提醒：rc 仍是 0（缺数据不阻塞）
         args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)), \
-                mock.patch.object(cli_mod, "notify") as notifier:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "notify") as notifier,
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         notifier.assert_not_called()
@@ -924,8 +959,10 @@ class TestWiring(OfflineTestCase):
     def test_run_sync_zero_records_still_fails(self):
         # 真异常（表被清空 = 0 行）仍然失败：缺数放行不等于放行空表
         args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub([])), \
-                mock.patch.object(cli_mod, "notify") as notifier:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub([])),
+            mock.patch.object(cli_mod, "notify") as notifier,
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)
         notifier.assert_not_called()
@@ -939,8 +976,10 @@ class TestWiring(OfflineTestCase):
                 extra_out.extend(["新列A", "新列A", "新列B"])
             return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
 
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch), \
-                mock.patch.object(cli_mod, "notify") as notifier:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch),
+            mock.patch.object(cli_mod, "notify") as notifier,
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         notifier.assert_called_once()
@@ -958,8 +997,10 @@ class TestWiring(OfflineTestCase):
                 extra_out.append("新列A")
             return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
 
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch), \
-                mock.patch.object(cli_mod, "notify") as notifier:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch),
+            mock.patch.object(cli_mod, "notify") as notifier,
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         notifier.assert_not_called()
@@ -975,8 +1016,10 @@ class TestWiring(OfflineTestCase):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": None, "amount": None}]
         messages: list[str] = []
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)), \
-                mock.patch.object(cli_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "log", side_effect=lambda msg: messages.append(str(msg))),
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         self.assertTrue(any("全为空" in m for m in messages))
@@ -986,13 +1029,15 @@ class TestWiring(OfflineTestCase):
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         table = mock.Mock()
         odps = mock.Mock()
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=odps), \
-                mock.patch.object(cli_mod, "ensure_table", return_value=table), \
-                mock.patch.object(cli_mod, "verify_schema"), \
-                mock.patch.object(cli_mod, "purge_stale_tmp_partitions"), \
-                mock.patch.object(cli_mod, "write_partition") as writer, \
-                mock.patch.object(cli_mod, "count_partition", return_value=1):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "connect_odps", return_value=odps),
+            mock.patch.object(cli_mod, "ensure_table", return_value=table),
+            mock.patch.object(cli_mod, "verify_schema"),
+            mock.patch.object(cli_mod, "purge_stale_tmp_partitions"),
+            mock.patch.object(cli_mod, "write_partition") as writer,
+            mock.patch.object(cli_mod, "count_partition", return_value=1),
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         writer.assert_called_once()
@@ -1002,13 +1047,15 @@ class TestWiring(OfflineTestCase):
     def test_run_sync_count_mismatch(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=mock.Mock()), \
-                mock.patch.object(cli_mod, "ensure_table", return_value=mock.Mock()), \
-                mock.patch.object(cli_mod, "verify_schema"), \
-                mock.patch.object(cli_mod, "purge_stale_tmp_partitions"), \
-                mock.patch.object(cli_mod, "write_partition"), \
-                mock.patch.object(cli_mod, "count_partition", return_value=0):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "connect_odps", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "ensure_table", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "verify_schema"),
+            mock.patch.object(cli_mod, "purge_stale_tmp_partitions"),
+            mock.patch.object(cli_mod, "write_partition"),
+            mock.patch.object(cli_mod, "count_partition", return_value=0),
+        ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)
 
@@ -1058,21 +1105,25 @@ class TestFetchStats(OfflineTestCase):
 
     def test_empty_rows_detection(self):
         stats = cli_mod.FetchStats()
-        stats.update([
-            {"record_id": "r1", "a": None, "b": None},  # 全空
-            {"record_id": "r2", "a": 1},                 # 有值
-            {"record_id": "r3"},                         # 只有 record_id（也全空）
-        ])
+        stats.update(
+            [
+                {"record_id": "r1", "a": None, "b": None},  # 全空
+                {"record_id": "r2", "a": 1},  # 有值
+                {"record_id": "r3"},  # 只有 record_id（也全空）
+            ]
+        )
         self.assertEqual(stats.empty_rows, 2)
 
     def test_date_values_and_counter(self):
         stats = cli_mod.FetchStats(date_field="biz_date")
-        stats.update([
-            {"biz_date": "2026-09-27T00:00:00+08:00"},
-            {"biz_date": "2026-09-27"},
-            {"biz_date": "2026/9/26"},
-            {"biz_date": "垃圾值"},
-        ])
+        stats.update(
+            [
+                {"biz_date": "2026-09-27T00:00:00+08:00"},
+                {"biz_date": "2026-09-27"},
+                {"biz_date": "2026/9/26"},
+                {"biz_date": "垃圾值"},
+            ]
+        )
         self.assertEqual(stats.date_values, {"2026-09-27", "2026-09-26"})
         self.assertEqual(stats.date_counter["2026-09-27"], 2)
         self.assertEqual(stats.date_counter["2026-09-26"], 1)
@@ -1165,7 +1216,10 @@ class TestFetchRecordsStreaming(OfflineTestCase):
 
     @staticmethod
     def _page(rows, ids, has_more):
-        return {"code": 0, "data": {"fields": ["日期", "金额"], "data": rows, "record_id_list": ids, "has_more": has_more}}
+        return {
+            "code": 0,
+            "data": {"fields": ["日期", "金额"], "data": rows, "record_id_list": ids, "has_more": has_more},
+        }
 
     def test_stream_writes_and_stats(self):
         pages = [
@@ -1174,16 +1228,20 @@ class TestFetchRecordsStreaming(OfflineTestCase):
         ]
         spool = cli_mod.SpoolWriter()
         stats = cli_mod.FetchStats(date_field="biz_date")
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             result = cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
         self.assertIs(result, stats)
         self.assertEqual(stats.count, 2)
         self.assertEqual(spool.count, 2)
         self.assertEqual(
             list(spool.iter_rows()),
-            ['{"record_id":"r1","biz_date":"2026-09-27","amount":"$1"}',
-             '{"record_id":"r2","biz_date":"2026-09-26","amount":"$2"}'],
+            [
+                '{"record_id":"r1","biz_date":"2026-09-27","amount":"$1"}',
+                '{"record_id":"r2","biz_date":"2026-09-26","amount":"$2"}',
+            ],
         )
         spool.close()
 
@@ -1191,19 +1249,25 @@ class TestFetchRecordsStreaming(OfflineTestCase):
         pages = [self._page([], [], False)]
         spool = cli_mod.SpoolWriter()
         stats = cli_mod.FetchStats()
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
         self.assertEqual(stats.count, 0)
         self.assertEqual(list(spool.iter_rows()), [])
         spool.close()
 
     def test_stream_mapping_missing_aborts(self):
-        pages = [{"code": 0, "data": {"fields": ["别的列"], "data": [["x"]], "record_id_list": ["r1"], "has_more": False}}]
+        pages = [
+            {"code": 0, "data": {"fields": ["别的列"], "data": [["x"]], "record_id_list": ["r1"], "has_more": False}}
+        ]
         spool = cli_mod.SpoolWriter()
         stats = cli_mod.FetchStats()
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             with self.assertRaises(SystemExit) as ctx:
                 cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
         self.assertIn("找不到", str(ctx.exception))
@@ -1211,16 +1275,34 @@ class TestFetchRecordsStreaming(OfflineTestCase):
 
     def test_stream_extra_column_warns_once_and_collects(self):
         pages = [
-            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["a", "b", "c"]], "record_id_list": ["r1"], "has_more": True}},
-            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["d", "e", "f"]], "record_id_list": ["r2"], "has_more": False}},
+            {
+                "code": 0,
+                "data": {
+                    "fields": ["日期", "金额", "新列"],
+                    "data": [["a", "b", "c"]],
+                    "record_id_list": ["r1"],
+                    "has_more": True,
+                },
+            },
+            {
+                "code": 0,
+                "data": {
+                    "fields": ["日期", "金额", "新列"],
+                    "data": [["d", "e", "f"]],
+                    "record_id_list": ["r2"],
+                    "has_more": False,
+                },
+            },
         ]
         extra: list[str] = []
         spool = cli_mod.SpoolWriter()
         stats = cli_mod.FetchStats()
         warnings: list[str] = []
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages), \
-                mock.patch.object(fetch_mod, "log", side_effect=lambda msg: warnings.append(str(msg))):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+            mock.patch.object(fetch_mod, "log", side_effect=lambda msg: warnings.append(str(msg))),
+        ):
             cli_mod.fetch_records(self.job_feishu, self.mapping, extra_out=extra, sink=spool, stats=stats)
         self.assertEqual(extra, ["新列"])
         # 两页只打一次"未映射"警告（旧实现逐页重复）
@@ -1230,12 +1312,22 @@ class TestFetchRecordsStreaming(OfflineTestCase):
 
     def test_stream_extra_out_none_ok(self):
         pages = [
-            {"code": 0, "data": {"fields": ["日期", "金额", "新列"], "data": [["a", "b", "c"]], "record_id_list": ["r1"], "has_more": False}},
+            {
+                "code": 0,
+                "data": {
+                    "fields": ["日期", "金额", "新列"],
+                    "data": [["a", "b", "c"]],
+                    "record_id_list": ["r1"],
+                    "has_more": False,
+                },
+            },
         ]
         spool = cli_mod.SpoolWriter()
         stats = cli_mod.FetchStats()
-        with mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"), \
-                mock.patch.object(fetch_mod, "request_json", side_effect=pages):
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
             cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
         self.assertEqual(stats.count, 1)
         spool.close()
@@ -1567,12 +1659,16 @@ class TestBuildRecordsMore(OfflineTestCase):
 
     def test_extra_columns_ignored_and_collected(self):
         extra: list[str] = []
-        records = fetch_mod.build_records(["日期", "新列"], ["r1"], [["2026-09-27", "x"]], {"日期": "biz_date"}, extra_out=extra)
+        records = fetch_mod.build_records(
+            ["日期", "新列"], ["r1"], [["2026-09-27", "x"]], {"日期": "biz_date"}, extra_out=extra
+        )
         self.assertEqual(extra, ["新列"])
         self.assertNotIn("新列", records[0])
 
     def test_row_shorter_than_fields_fills_none(self):
-        records = fetch_mod.build_records(["日期", "金额"], ["r1"], [["2026-09-27"]], {"日期": "biz_date", "金额": "amount"})
+        records = fetch_mod.build_records(
+            ["日期", "金额"], ["r1"], [["2026-09-27"]], {"日期": "biz_date", "金额": "amount"}
+        )
         self.assertIsNone(records[0]["amount"])
 
     def test_extra_out_none_ok(self):
@@ -1591,15 +1687,16 @@ class TestNotifyMore(OfflineTestCase):
         self.assertTrue(any("未配置" in str(c) for c in logger.call_args_list))
 
     def test_requests_missing_skips(self):
-        with mock.patch.object(notify_mod, "requests", None), \
-                mock.patch.object(notify_mod, "log") as logger:
+        with mock.patch.object(notify_mod, "requests", None), mock.patch.object(notify_mod, "log") as logger:
             notify_mod.notify("https://x/hook/1", "t", ["l"])
         self.assertTrue(any("requests" in str(c) for c in logger.call_args_list))
 
     @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
     def test_post_exception_swallowed(self):
-        with mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError("down")), \
-                mock.patch.object(notify_mod, "log") as logger:
+        with (
+            mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError("down")),
+            mock.patch.object(notify_mod, "log") as logger,
+        ):
             cli_mod.notify("https://x/hook/1", "t", ["l"])
         self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
 
@@ -1607,8 +1704,10 @@ class TestNotifyMore(OfflineTestCase):
     def test_bad_status_swallowed(self):
         resp = mock.Mock(status_code=500)
         resp.json.return_value = {"code": 1, "msg": "bad"}
-        with mock.patch.object(notify_mod.requests, "post", return_value=resp), \
-                mock.patch.object(notify_mod, "log") as logger:
+        with (
+            mock.patch.object(notify_mod.requests, "post", return_value=resp),
+            mock.patch.object(notify_mod, "log") as logger,
+        ):
             cli_mod.notify("https://x/hook/1", "t", ["l"])
         self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
 
@@ -1616,8 +1715,10 @@ class TestNotifyMore(OfflineTestCase):
     def test_success_status_code_field(self):
         resp = mock.Mock(status_code=200)
         resp.json.return_value = {"StatusCode": 0}
-        with mock.patch.object(notify_mod.requests, "post", return_value=resp), \
-                mock.patch.object(notify_mod, "log") as logger:
+        with (
+            mock.patch.object(notify_mod.requests, "post", return_value=resp),
+            mock.patch.object(notify_mod, "log") as logger,
+        ):
             cli_mod.notify("https://x/hook/1", "t", ["l"])
         self.assertTrue(any("已发送" in str(c) for c in logger.call_args_list))
 
@@ -1628,8 +1729,10 @@ class TestRunCheckMore(OfflineTestCase):
         o.exist_table.return_value = True
         table = _Table([_Col("json", "string"), _Col("pt", "string")], [_Col("pt", "string")])
         o.get_table.return_value = table
-        with mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=o):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]),
+            mock.patch.object(cli_mod, "connect_odps", return_value=o),
+        ):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 0)
 
     def test_table_schema_mismatch_fails(self):
@@ -1637,20 +1740,26 @@ class TestRunCheckMore(OfflineTestCase):
         o.exist_table.return_value = True
         table = _Table([_Col("wrong", "string")], [_Col("pt", "string")])
         o.get_table.return_value = table
-        with mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=o):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]),
+            mock.patch.object(cli_mod, "connect_odps", return_value=o),
+        ):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 1)
 
     def test_connect_error_fails(self):
         o = mock.Mock()
         o.exist_table.side_effect = RuntimeError("network down")
-        with mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]), \
-                mock.patch.object(cli_mod, "connect_odps", return_value=o):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", return_value=[{"a": 1}]),
+            mock.patch.object(cli_mod, "connect_odps", return_value=o),
+        ):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 1)
 
     def test_api_failure_fails_before_mc(self):
-        with mock.patch.object(cli_mod, "fetch_records", side_effect=SystemExit("boom")), \
-                mock.patch.object(cli_mod, "connect_odps") as conn:
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=SystemExit("boom")),
+            mock.patch.object(cli_mod, "connect_odps") as conn,
+        ):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 1)
         conn.assert_not_called()
 
@@ -1734,8 +1843,10 @@ class TestMainMore(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job_path = pathlib.Path(tmp) / "demo.json"
             job_path.write_text(json.dumps(make_job()), encoding="utf-8")
-            with mock.patch.object(cli_mod, "run_sync", return_value=0) as sync, \
-                    mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+            with (
+                mock.patch.object(cli_mod, "run_sync", return_value=0) as sync,
+                mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),
+            ):
                 self.assertEqual(cli_mod.main(["--job", str(job_path)]), 0)
             self.assertTrue(sync.called)
 
@@ -1743,16 +1854,20 @@ class TestMainMore(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job_path = pathlib.Path(tmp) / "demo.json"
             job_path.write_text(json.dumps(make_job()), encoding="utf-8")
-            with mock.patch.object(cli_mod, "run_sync", side_effect=KeyboardInterrupt), \
-                    mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+            with (
+                mock.patch.object(cli_mod, "run_sync", side_effect=KeyboardInterrupt),
+                mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),
+            ):
                 self.assertEqual(cli_mod.main(["--job", str(job_path)]), 130)
 
     def test_unexpected_error_returns_1(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_path = pathlib.Path(tmp) / "demo.json"
             job_path.write_text(json.dumps(make_job()), encoding="utf-8")
-            with mock.patch.object(cli_mod, "run_sync", side_effect=ValueError("意外")), \
-                    mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"):
+            with (
+                mock.patch.object(cli_mod, "run_sync", side_effect=ValueError("意外")),
+                mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),
+            ):
                 self.assertEqual(cli_mod.main(["--job", str(job_path)]), 1)
 
 

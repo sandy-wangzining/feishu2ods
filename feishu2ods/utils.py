@@ -21,9 +21,10 @@ try:
 except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
     msvcrt = None
 
-CN_TZ = timezone(timedelta(hours=8))            # 运行日历日基准（固定 +08:00，无夏令时）
-_SECRETS: list[str] = []                        # 日志脱敏用（job 里读到的密钥值）
+CN_TZ = timezone(timedelta(hours=8))  # 运行日历日基准（固定 +08:00，无夏令时）
+_SECRETS: list[str] = []  # 日志脱敏用（job 里读到的密钥值）
 _console_patched = False
+
 
 def setup_console() -> None:
     """stdout/stderr 切 UTF-8，避免 Windows 控制台中文乱码/报错（切不了就跳过）。"""
@@ -62,7 +63,6 @@ def _api_err(data) -> str:
     if isinstance(data, dict):
         return f"code={data.get('code')} msg={data.get('msg')}"
     return f"接口返回不是 JSON 对象：{str(data)[:200]}"
-
 
 
 # =============================================================================
@@ -191,5 +191,3 @@ def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathl
         except OSError:
             continue
     return pathlib.Path(tempfile.gettempdir()) / f"feishu2ods-{name}.lock"
-
-

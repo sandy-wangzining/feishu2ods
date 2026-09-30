@@ -10,6 +10,7 @@ try:
 except ImportError:  # pragma: no cover - 未安装时告警降级为一条日志
     requests = None
 
+
 def notify(webhook: str, title: str, lines: list[str], footer: str = "") -> None:
     """发飞书群卡片消息；未配 webhook 或发送失败只记日志（不影响主流程退出码）。"""
     if not webhook:
@@ -39,5 +40,3 @@ def notify(webhook: str, title: str, lines: list[str], footer: str = "") -> None
         log("飞书通知已发送")
     else:
         log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {str(data)[:200]}")
-
-
