@@ -111,7 +111,7 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 # =============================================================================
 # 常量与全局
 # =============================================================================
-VERSION = "1.2.0"                               # --version 输出；服务器部署后可用它对照版本
+VERSION = "1.2.1"                               # --version 输出；服务器部署后可用它对照版本
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
@@ -1326,20 +1326,24 @@ def run_sync(args, job: dict, project: str, table_name: str, column: str, pt: st
     new_fields: list[str] = []
     records = fetch_records(feishu, job["fields"], extra_out=new_fields)
     log(f"拉取完成：{len(records):,} 条记录，映射 {len(job['fields'])} 个字段")
-    if new_fields and not args.no_notify:
+    if new_fields:
         uniq = sorted(set(new_fields))
-        lines = [
-            f"**作业**：{job.get('job')}",
-            f"**新增列**：{'、'.join(f'`{name}`' for name in uniq)}",
-        ]
-        if base_url:
-            lines.append(f"**数据表**：{base_url}")
-        lines += [
-            "本次已忽略新增列、其余字段照常同步（新增列数据暂未采集）。如需入库，请手动处理：",
-            "① 作业 `fields` 补映射（Base 列名 → 英文键）；",
-            "② 重跑本节点（写入幂等）。",
-        ]
-        notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
+        # 日志无条件打：--no-notify 只关飞书提醒，不关日志——新增列完全不可见会让
+        # 用户以为"没出问题"（与 api2ods 的字段漂移提醒口径一致：先 log 再 notify）
+        log(f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{name}`' for name in uniq)}（本次忽略其值、其余字段照常同步）")
+        if not args.no_notify:
+            lines = [
+                f"**作业**：{job.get('job')}",
+                f"**新增列**：{'、'.join(f'`{name}`' for name in uniq)}",
+            ]
+            if base_url:
+                lines.append(f"**数据表**：{base_url}")
+            lines += [
+                "本次已忽略新增列、其余字段照常同步（新增列数据暂未采集）。如需入库，请手动处理：",
+                "① 作业 `fields` 补映射（Base 列名 → 英文键）；",
+                "② 重跑本节点（写入幂等）。",
+            ]
+            notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
     empty_rows = sum(
         1 for record in records if all(value is None for key, value in record.items() if key != "record_id")
     )
