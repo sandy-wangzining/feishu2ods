@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feishu2ods"
-dynamic = ["version"]
+version = "1.5.0"
 description = "飞书多维表格（Base）→ MaxCompute ODS 同步工具（json + pt 分区，临时分区 + 原子替换）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 [project.scripts]
-feishu2ods = "feishu2ods:main"
+feishu2ods = "feishu2ods.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sandy-wangzining/feishu2ods"
@@ -42,7 +42,4 @@ Issues = "https://github.com/sandy-wangzining/feishu2ods/issues"
 dev = ["ruff>=0.5"]
 
 [tool.setuptools]
-py-modules = ["feishu2ods"]
-
-[tool.setuptools.dynamic]
-version = { attr = "feishu2ods.VERSION" }
+packages = ["feishu2ods"]

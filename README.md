@@ -13,7 +13,15 @@
 
 ## 目录
 
-- `feishu2ods.py` 主脚本（单文件）
+- `feishu2ods/` 代码包（v1.5.0 起从单文件拆出，按职责分模块）：
+  - `cli.py` 命令行入口（--check / 正式同步 / --init 分发）
+  - `auth.py` 飞书 HTTP 请求（重试/限流退避）与 tenant_access_token
+  - `fetch.py` 多维表格拉取（offset 翻页 + 一致性保护 + 流式落盘）
+  - `mc.py` MaxCompute：建表 / 结构校验 / 写分区（原子替换）/ 写后核对
+  - `spool.py` 流式落盘（SpoolWriter）与拉取统计（FetchStats）
+  - `config.py` job 配置读取与校验；`dates.py` 业务日与日期规范化
+  - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
+- `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
 - `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_ai_cost.example.json`）
 - `tests/` 离线单测：`python -m unittest discover -s tests -v`（不访问网络、不连 MaxCompute）
 - `requirements.txt` 依赖（requests + pyodps）
@@ -75,7 +83,9 @@ cd ~/feishu2ods
 1. 鉴权：`app_secret` 换 `tenant_access_token`（有效期 2 小时，翻页中途失效会自动重取一次）；
 2. 拉取：v3 records 接口 `limit=500 + offset` 翻页（接口上限 2000）；接口限流（99991400）自动退避重试；
    翻页中途字段列表变化、或表格版本号（rev）变化都会中止（防 offset 翻页期间被编辑导致静默漏行）；
-   记录 ID 重复会立刻中止（防接口忽略 offset 重复写）；
+   记录 ID 重复会立刻中止（防接口忽略 offset 重复写）；**流式落盘**：记录边拉边写本地临时
+   JSONL，写库时逐批读回——峰值内存只与单页数据量有关，与总行数无关（十几万行的大表
+   也不再全量驻留内存）；新鲜度/空行/去重 ID 等统计在拉取过程中逐页累积；
 3. 映射：映射的 Base 列缺失（被改名/删除）→ 直接报错（空表也校验）；未映射的列 → 忽略、
    照常同步其余字段，并发一条飞书提醒（列名 + 处理步骤：要不要加映射由人工决定；`--no-notify` 可关）；
    Base 里「除 record_id 外全为空」的空白行会**原样同步**（日志会提示条数），下游记得按日期字段过滤；
