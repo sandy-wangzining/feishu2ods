@@ -319,6 +319,18 @@ class TestBuildRecords(OfflineTestCase):
         with self.assertRaises(SystemExit):
             f2o.build_records([], ["r1"], [["1"]], {"a": "aaa"})
 
+    def test_extra_columns_collected(self):
+        extras: list[str] = []
+        records = f2o.build_records(
+            ["日期", "金额", "新列A", "新列B"],
+            ["r1"],
+            [["2026-09-27", "$1", "x", "y"]],
+            {"日期": "biz_date", "金额": "amount"},
+            extra_out=extras,
+        )
+        self.assertEqual(records, [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}])
+        self.assertEqual(extras, ["新列A", "新列B"])
+
 
 # ---------------------------------------------------------------------------
 # 新鲜度
@@ -866,6 +878,40 @@ class TestWiring(OfflineTestCase):
             code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)
         notifier.assert_called_once()
+
+    def test_run_sync_new_fields_notifies_once(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=False, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+            if extra_out is not None:
+                extra_out.extend(["新列A", "新列A", "新列B"])
+            return records
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+        joined = "\n".join(notifier.call_args.args[2])
+        self.assertIn("新增列", notifier.call_args.args[1])
+        self.assertIn("新列A", joined)
+        self.assertIn("新列B", joined)
+
+    def test_run_sync_new_fields_no_notify_flag(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None):
+            if extra_out is not None:
+                extra_out.append("新列A")
+            return records
+
+        with mock.patch.object(f2o, "fetch_records", side_effect=fake_fetch), \
+                mock.patch.object(f2o, "notify") as notifier:
+            code = f2o.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        notifier.assert_not_called()
 
     def test_run_sync_skip_freshness(self):
         args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
