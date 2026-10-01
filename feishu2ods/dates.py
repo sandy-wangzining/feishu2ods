@@ -7,7 +7,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 
-from .utils import CN_TZ
+from .utils import CN_TZ, log
 
 # 业务日参数白名单：只认紧凑与 ISO 两种写法（与 api2ods 同口径，不用 fromisoformat 防版本差异）
 _DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z")
@@ -35,11 +35,15 @@ def parse_day_arg(text: str) -> date:
     raise SystemExit(f"--bizdate 格式应为 YYYYMMDD 或 YYYY-MM-DD：{text!r}")
 
 
-def env_bizdate() -> date | None:
+def env_bizdate(strict: bool = True) -> date | None:
     """DataWorks 环境变量 bizdate / SKYNET_BIZDATE；没设置返回 None。
 
     设置了却解析不出来时必须报错，不能静默回退"昨天"：那会把数据写进错的分区
     （写入会替换掉对的分区），而退出码还是 0，调度侧完全看不出来。
+
+    strict=False 只给"只读体检"（--check）用：它不写库、不发告警，落哪个 pt 只是看一眼，
+    没必要因为调度环境变量脏了就连体检都跑不起来（那时按默认业务日继续并打警告）。
+    正式同步路径必须保持 strict=True（非法业务日要报错，绝不静默回退成"昨天"）。
     """
     raw = os.environ.get("bizdate") or os.environ.get("SKYNET_BIZDATE") or ""
     text = raw.strip()
@@ -48,20 +52,29 @@ def env_bizdate() -> date | None:
     try:
         return parse_day_arg(text)
     except SystemExit as exc:
+        if not strict:
+            log(
+                f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；"
+                f"只读体检（--check）不写库，按默认业务日继续"
+            )
+            return None
         raise SystemExit(
             f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}（应为 YYYYMMDD 或 YYYY-MM-DD）；"
             f"不打算用它请先 unset，或用 --bizdate 显式指定业务日"
         ) from exc
 
 
-def resolve_bizdate(args) -> date:
+def resolve_bizdate(args, strict: bool = True) -> date:
     """业务日：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > 当天-1（CN）。
 
     pt（写入分区）与新鲜度校验都以这个业务日为准：调度传什么 bizdate，就校验数据里有没有这一天。
+
+    strict=False 只给只读体检（--check）用：环境变量里的 bizdate 格式不对时按"未设置"处理、
+    退回当天-1，而不是直接报错退出（正式同步路径仍为 strict=True）。
     """
     if args.bizdate:
         return parse_day_arg(args.bizdate)
-    from_env = env_bizdate()
+    from_env = env_bizdate(strict=strict)
     return from_env if from_env is not None else datetime.now(CN_TZ).date() - timedelta(days=1)
 
 

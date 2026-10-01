@@ -28,12 +28,18 @@ class SpoolWriter:
     """
 
     def __init__(self, path: pathlib.Path | None = None):
-        if path is None:
-            handle, name = tempfile.mkstemp(prefix="feishu2ods-", suffix=".jsonl")
-            os.close(handle)
-            path = pathlib.Path(name)
-        self.path = pathlib.Path(path)
-        self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+        try:
+            if path is None:
+                handle, name = tempfile.mkstemp(prefix="feishu2ods-", suffix=".jsonl")
+                os.close(handle)
+                path = pathlib.Path(name)
+            self.path = pathlib.Path(path)
+            self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+        except OSError as exc:
+            # 临时目录不可写/磁盘满/路径不存在：转成"带原因的人话"再抛出，由调用方（cli）
+            # 记日志并按运行失败（退出码 1）结束——不让裸 OSError/FileNotFoundError 糊在用户脸上
+            target = path if path is not None else "系统临时目录"
+            raise OSError(f"建不了落盘临时文件（{target}）：{exc}") from exc
         self.count = 0
 
     def write_records(self, records: list[dict]) -> int:
