@@ -15,6 +15,7 @@ from .config import DEFAULT_COLUMN, DEFAULT_FRESHNESS_LAG_DAYS, _require_identif
 from .dates import freshness_problem, resolve_bizdate
 from .fetch import fetch_records
 from .mc import (
+    SQL_TIMEOUT_SECONDS,
     connect_odps,
     count_partition,
     ensure_table,
@@ -24,13 +25,40 @@ from .mc import (
 )
 from .notify import notify
 from .spool import FetchStats, SpoolWriter
-from .utils import _SECRETS, RunLock, lock_path, log, redact, setup_console
+from .utils import (
+    _SECRETS,
+    RunLock,
+    add_log_sink,
+    collect_secret_values,
+    lock_path,
+    log,
+    redact,
+    redact_secrets,
+    remove_log_sink,
+    setup_console,
+)
 from .wizard import run_init
 
 
 # =============================================================================
 # 主流程：拉数 → 新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对
 # =============================================================================
+def _sql_timeout_arg(value: str) -> int:
+    """--sql-timeout 参数校验：非负整数。
+
+    负数会被 run_sql_with_timeout 当成"0=不限制"，与用户直觉相反（想调小却等成无限）；
+    与 api2ods / sftp2ods 的口径一致：命令行参数问题在 argparse 阶段就报错（退出码 2，
+    不发起任何远端操作）。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"必须是整数（0 表示不限制），实际 {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"不能为负（0 表示不限制），实际 {number}")
+    return number
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="feishu2ods",
@@ -49,6 +77,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="只拉数并打印统计，不写 MaxCompute")
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="0 行且 target.allow_empty=true 时，跳过「先查现有分区行数」的保护，允许把已有分区覆盖成空分区",
+    )
+    parser.add_argument(
         "--skip-freshness",
         "--no-check",
         dest="skip_freshness",
@@ -58,8 +91,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-notify", action="store_true", help="不发任何飞书通知（缺数据/新增列等只记日志）")
     parser.add_argument("--project", default="", help="覆盖 target.project（测试用）")
     parser.add_argument("--table", default="", help="覆盖 target.table（测试用）")
+    parser.add_argument(
+        "--sql-timeout",
+        type=_sql_timeout_arg,
+        default=SQL_TIMEOUT_SECONDS,
+        help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制",
+    )
+    parser.add_argument("--log-file", default="", help="日志同时写一份到该文件（追加，UTF-8）")
     parser.add_argument("--version", action="version", version=f"feishu2ods {VERSION}")
     return parser.parse_args(argv)
+
+
+def _open_log_file(path_text: str):
+    """打开 --log-file 指定的日志文件（追加、UTF-8、父目录自动创建）；没指定返回 None。
+
+    用户给成目录名（--log-file logs）时给一句人话，而不是 IsADirectoryError 的裸 traceback。
+    """
+    if not path_text:
+        return None
+    path = pathlib.Path(path_text)
+    if path.is_dir():
+        raise SystemExit(f"--log-file 指向的是目录，需要给文件名：{path}（如 {path / 'run.log'}）")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return open(path, "a", encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"--log-file 打不开：{path}（{exc}）") from exc
+
+
+def _redact_job(job: dict, text) -> str:
+    """作业上下文下的脱敏：先按配置里的密钥值遮（形态规则盖不住的自由文本回显），
+    再走形态兜底。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
+    return redact_secrets(collect_secret_values(job), str(text))
 
 
 def run_check(job: dict, project: str, table_name: str, column: str, pt: str) -> int:
@@ -69,7 +132,7 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
     try:
         records = fetch_records(job["feishu"], job["fields"], max_pages=1)
     except SystemExit as exc:
-        log(f"  ❌ 拉取/映射校验失败：{exc}")
+        log(f"  ❌ 拉取/映射校验失败：{_redact_job(job, exc)}")
         return 1
     log(f"  ✅ API 连通、字段映射通过：第 1 页 {len(records)} 条记录")
     try:
@@ -80,10 +143,10 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
             verify_schema(o.get_table(table_name), table_name, column)
             log(f"  ✅ 目标表结构符合（{column} string + pt 分区）")
     except SystemExit as exc:
-        log(f"  ❌ {exc}")
+        log(f"  ❌ {_redact_job(job, exc)}")
         return 1
     except Exception as exc:  # noqa: BLE001 - 连不上/校验失败都给干净结论
-        log(f"  ❌ 连接/校验失败：{redact(exc)}")
+        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc)}")
         return 1
     log("体检通过。")
     return 0
@@ -102,7 +165,12 @@ def run_sync(
     base_url = str(feishu.get("base_url") or "")
     new_fields: list[str] = []
     date_field = str((job.get("freshness") or {}).get("date_field") or "")
-    spool = SpoolWriter()
+    try:
+        spool = SpoolWriter()
+    except OSError as exc:
+        # 临时目录不可写/磁盘满：给一句人话而不是裸 traceback（否则 --log-file 里一个字都没有）
+        log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{_redact_job(job, exc)}")
+        return 1
     stats = FetchStats(date_field=date_field)
     try:
         fetch_records(feishu, job["fields"], extra_out=new_fields, sink=spool, stats=stats)
@@ -194,20 +262,44 @@ def run_sync(
         log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（写临时分区后原子替换）")
         return 0
 
-    o = connect_odps(maxcompute, project)
-    table = ensure_table(o, project, table_name, column, str(target_cfg.get("comment") or ""))
-    verify_schema(table, table_name, column)
-    purge_stale_tmp_partitions(table, table_name)
-    log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后原子替换）...")
-    write_partition(o, table, project, table_name, column, pt, spool, stats)
-    actual = count_partition(o, project, table_name, pt)
-    if actual != count:
-        spool.close()
-        log(f"❌ 写后校验不一致：计划 {count:,} 行，实际 {actual:,} 行（重跑即可，写入幂等）")
-        return 1
-    spool.close()
-    log(f"完成：{project}.{table_name} pt={pt} 共 {actual:,} 行，耗时 {(time.time() - started) / 60:.1f} 分钟")
-    return 0
+    # 写库段统一收口临时 JSONL：connect_odps / ensure_table 抛 SystemExit（缺 pyodps、缺凭证）
+    # 时异常会直接冒泡到 main，若这里不兜住，临时文件既没关句柄也没删，会在系统 temp 里泄漏。
+    # 约定：任何失败路径 keep=True 保留文件供排查；只有走完并核对成功才置 False 删除。
+    keep_spool = True
+    try:
+        o = connect_odps(maxcompute, project)
+        table = ensure_table(
+            o, project, table_name, column, str(target_cfg.get("comment") or ""), timeout=args.sql_timeout
+        )
+        verify_schema(table, table_name, column)
+        purge_stale_tmp_partitions(o, table, project, table_name, timeout=args.sql_timeout)
+
+        # 0 行 + allow_empty=true（否则上面已拦截）→ 写空分区会清空已有分区：「删旧分区 + rename」
+        # 不可逆，而"源端被截断成 0 行"几乎总是异常。写前先查现有分区行数，非 0 则拒绝写库，
+        # 只有显式 --force 才放行（与 sftp2ods 同款保护）。
+        if count == 0 and not args.force:
+            existing = count_partition(o, project, table_name, pt, timeout=args.sql_timeout)
+            if existing:
+                log(
+                    f"❌ {project}.{table_name} pt={pt} 本次拉到 0 行，但该分区现有 {existing:,} 行；"
+                    f"为避免清空已有数据，本次未写库（若确认就是要写空分区，请加 --force）。"
+                    f"源端被截断/清空时请先排查，数据无误后重跑即可"
+                )
+                return 1
+
+        log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后原子替换）...")
+        write_partition(o, table, project, table_name, column, pt, spool, stats, timeout=args.sql_timeout)
+        actual = count_partition(o, project, table_name, pt, timeout=args.sql_timeout)
+        if actual != count:
+            log(f"❌ 写后校验不一致：计划 {count:,} 行，实际 {actual:,} 行（重跑即可，写入幂等）")
+            return 1
+        keep_spool = False
+        log(f"完成：{project}.{table_name} pt={pt} 共 {actual:,} 行，耗时 {(time.time() - started) / 60:.1f} 分钟")
+        return 0
+    finally:
+        if keep_spool:
+            log(f"已保留本次落盘的数据文件（排查用）：{spool.path}")
+        spool.close(keep=keep_spool)
 
 
 def _wizard_ask(prompt: str = "") -> str:
@@ -224,6 +316,11 @@ def main(argv: list[str] | None = None) -> int:
     setup_console()
     args = parse_args(argv)
     started = time.time()
+    # 日志文件先挂上：--init 的问答、--check 的概要都值得留痕（Linux 上跑 cron/调度时
+    # stdout 会被截断，落盘是唯一能事后翻查的途径）。挂载点要在 _run 之前。
+    log_handle = _open_log_file(args.log_file)
+    if log_handle is not None:
+        add_log_sink(log_handle)
     try:
         return _run(args, started)
     except SystemExit as exc:
@@ -239,6 +336,9 @@ def main(argv: list[str] | None = None) -> int:
         log(f"❌ 运行失败（未预期错误）：{type(exc).__name__}: {redact(exc)}")
         log(redact(traceback.format_exc()))
         return 1
+    finally:
+        # 摘掉日志 sink 并关句柄：同一进程里多次调用 main 时，残留句柄会继续写已关闭的文件
+        remove_log_sink(log_handle)
 
 
 def _run(args, started: float) -> int:
@@ -251,18 +351,13 @@ def _run(args, started: float) -> int:
         return 2
 
     job = load_job(args.job)
+    # 脱敏表是模块级状态：每次运行前先清空再登记，避免同一进程里多次调用 main() 时
+    # 上一轮的密钥值残留（值级替换会一直带着它，且下一轮日志脱敏口径被污染）。
+    _SECRETS.clear()
     # 先把 job 里疑似密钥的值登记进脱敏表，再校验/打日志：
     # 校验报错会回显非法值，密钥写错形态时也不该出现在日志里
-    raw_feishu = job.get("feishu") if isinstance(job.get("feishu"), dict) else {}
-    raw_maxcompute = job.get("maxcompute") if isinstance(job.get("maxcompute"), dict) else {}
-    raw_freshness = job.get("freshness") if isinstance(job.get("freshness"), dict) else {}
-    for secret in (
-        raw_feishu.get("app_secret"),
-        raw_maxcompute.get("access_key_secret"),
-        raw_freshness.get("webhook"),
-    ):
-        if isinstance(secret, str) and len(secret) >= 6:
-            _SECRETS.append(secret)
+    for secret in collect_secret_values(job):
+        _SECRETS.append(secret)
 
     for warning in validate_job(job):
         log(f"⚠️ {warning}")
@@ -276,7 +371,9 @@ def _run(args, started: float) -> int:
     project = args.project or target_cfg.get("project") or maxcompute.get("project")
     table_name = args.table or target_cfg["table"]
     column = target_cfg.get("column") or DEFAULT_COLUMN
-    bizdate = resolve_bizdate(args)
+    # --check 是只读体检：环境变量 bizdate 格式不对时不该把体检也拖垮（按默认业务日继续）；
+    # 正式同步路径保持严格（非法业务日必须报错，绝不静默回退成"昨天"写错分区）
+    bizdate = resolve_bizdate(args, strict=not args.check)
     pt = bizdate.strftime("%Y%m%d")
 
     log(

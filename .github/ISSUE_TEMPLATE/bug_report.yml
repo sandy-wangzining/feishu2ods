@@ -1,0 +1,105 @@
+name: 问题反馈
+description: 报一个 bug（跑不通、报错、数据不对）
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。这个工具的核心承诺是"宁可失败也不静默写坏数据"，
+        所以**数据对不对**和**报什么错**这两类信息最关键，麻烦尽量填全。
+
+        > ⚠️ 贴配置和日志前请先脱敏：把 `app_secret` / `access_key_secret` / `ak` / `sk` /
+        > webhook 换成 `***`。仓库维护者不会向你索要真实密钥。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: "`feishu2ods --version` 的输出"
+      placeholder: "feishu2ods 1.5.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: 运行环境
+      description: 操作系统 + Python 版本
+      placeholder: "Windows 10 / Python 3.12.3，或 Linux (CentOS 7) / Python 3.10.13"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: 出问题的环节
+      options:
+        - 体检 --check
+        - 试跑 --dry-run（拉取/映射）
+        - 正式同步（写入 MaxCompute）
+        - 配置校验 / --init
+        - 其它 / 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: 执行的命令
+      description: 完整命令，`--bizdate` 之类的参数请保留
+      render: shell
+      placeholder: "python feishu2ods.py --job jobs/feishu_ai_cost.json --bizdate 20260928 --dry-run"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果 vs 实际结果
+      placeholder: |
+        期望：拉取 1200 条，写进 pt=20260928
+        实际：报错退出码 1，日志显示……
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志（请脱敏）
+      description: 报错那次的完整输出，至少要包含最后 30 行
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: job
+    attributes:
+      label: 作业配置（请脱敏，密钥换成 ***）
+      description: |
+        整份 JSON 最好贴全（`feishu` / `maxcompute` / `fields` / `target` / `freshness` 都要），
+        只把密钥值替换成 `***` 即可——很多问题就出在配置组合或字段映射上，缺字段看不出问题。
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: response
+    attributes:
+      label: 接口返回样例（可选，请脱敏）
+      description: |
+        `--check` 会打印拉取到的记录数与字段映射情况；如果问题跟翻页或字段映射有关，
+        贴一段接口返回结构（可截断记录数、删掉无关字段/值）会很有帮助
+      render: json
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 已把配置和日志里的密钥/token/webhook 替换成 `***`
+          required: true
+        - label: 已试过 `--check`（配置/连通类问题它通常能直接定位）
+          required: false

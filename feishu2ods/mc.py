@@ -18,7 +18,41 @@ WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分�
 WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
 TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
 MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
+SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表/校验/rename）最长等待秒数，0 = 不限制
+SQL_HEARTBEAT_SECONDS = 30  # 长 SQL 的"还在执行"心跳日志间隔
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+
+
+# =============================================================================
+# SQL 执行（带超时：pyodps 默认不限时，云端卡住会一直干等、占着运行锁不放）
+# =============================================================================
+def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
+    """提交 SQL 并等待完成：成功返回 instance / 失败抛错 / 超时主动 stop() 取消并抛 TimeoutError。
+
+    用 o.run_sql（异步提交）而不是 o.execute_sql（阻塞到底）：只有异步实例才能被轮询、
+    超时后 stop() 取消。MaxCompute 侧卡住时，run_sql_with_timeout 会按 timeout 主动取消，
+    避免调度任务无限挂起、一直占着运行锁把后续调度全挡掉。
+    """
+    instance = o.run_sql(sql)
+    started = time.time()
+    last_log = started
+    while True:
+        if instance.is_successful():
+            return instance
+        if instance.is_terminated():
+            instance.wait_for_success(timeout=1)  # 触发一次，抛出带错误信息的异常
+            return instance
+        now = time.time()
+        if timeout and timeout > 0 and now - started > timeout:
+            try:
+                instance.stop()
+            except Exception:  # noqa: BLE001 - 取消失败不影响报错
+                pass
+            raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
+        if timeout and timeout > 0 and now - last_log >= SQL_HEARTBEAT_SECONDS:
+            log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
+            last_log = now
+        time.sleep(1)
 
 
 # =============================================================================
@@ -44,9 +78,9 @@ def connect_odps(maxcompute: dict, project: str):
     return ODPS(maxcompute["access_key_id"], maxcompute["access_key_secret"], project, endpoint=endpoint)
 
 
-def ensure_table(o, project: str, table: str, column: str, comment: str):
+def ensure_table(o, project: str, table: str, column: str, comment: str, timeout: int = SQL_TIMEOUT_SECONDS):
     """不存在则建表；存在返回表对象（结构校验由 verify_schema 负责）。"""
-    o.execute_sql(build_ddl(project, table, column, comment))
+    run_sql_with_timeout(o, build_ddl(project, table, column, comment), timeout=timeout, desc=f"建表 {table}")
     return o.get_table(table)
 
 
@@ -73,25 +107,73 @@ def verify_schema(table, table_name: str, column: str) -> None:
 
 
 def _sql_spec(spec: str) -> str:
-    """把 pyodps 风格分区串（pt=20260928）转成 DDL 里的带引号写法（pt='20260928'）。"""
-    key, _, value = spec.partition("=")
+    """把 pyodps 风格分区串（pt=20260928）转成 DDL 里的带引号写法（pt='20260928'）。
+
+    pyodps 的 partition.name 可能已带引号（pt='20260928'），统一先去掉再补引号，
+    避免生成 pt=''20260928'' 这种非法写法。
+    """
+    key, _, value = str(spec).partition("=")
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
     return f"{key}='{value}'" if key and value else spec
 
 
-def rename_partition(o, project: str, table_name: str, old_spec: str, new_spec: str) -> None:
+def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+    """删除分区（DDL，走超时保护）。
+
+    走 DDL 而不是 pyodps 的 `table.delete_partition`（同步、不限时）：云端分区元数据操作
+    卡住时同样会无限挂起、一直占着运行锁。`IF EXISTS` 提供与 `delete_partition(if_exists=True)`
+    一致的幂等语义（分区不存在也不报错）。
+    """
+    run_sql_with_timeout(
+        o,
+        f"alter table {project}.{table_name} drop if exists partition ({_sql_spec(spec)})",
+        timeout=timeout,
+        desc=f"删分区 {table_name}",
+    )
+
+
+def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+    """新增分区（DDL，走超时保护）。
+
+    `IF NOT EXISTS` 提供与 `create_partition(if_not_exists=True)` 一致的幂等语义（分区已存在不报错）。
+    """
+    run_sql_with_timeout(
+        o,
+        f"alter table {project}.{table_name} add if not exists partition ({_sql_spec(spec)})",
+        timeout=timeout,
+        desc=f"建分区 {table_name}",
+    )
+
+
+def rename_partition(
+    o, project: str, table_name: str, old_spec: str, new_spec: str, timeout: int = SQL_TIMEOUT_SECONDS
+) -> None:
     """把临时分区改名为正式分区（MaxCompute DDL 元数据操作；目标分区必须不存在）。
 
     「删旧分区 + rename」之间只有两条 DDL 的空窗，远比「先删再填」整段写入短；
     写入期间旧快照一直可读，下游不会读到空/半截分区。
     """
-    o.execute_sql(
+    run_sql_with_timeout(
+        o,
         f"alter table {project}.{table_name} "
-        f"partition ({_sql_spec(old_spec)}) rename to partition ({_sql_spec(new_spec)})"
+        f"partition ({_sql_spec(old_spec)}) rename to partition ({_sql_spec(new_spec)})",
+        timeout=timeout,
+        desc=f"替换分区 {table_name}",
     )
 
 
 def write_partition(
-    o, table, project: str, table_name: str, column: str, pt: str, spool: SpoolWriter, stats: FetchStats | None = None
+    o,
+    table,
+    project: str,
+    table_name: str,
+    column: str,
+    pt: str,
+    spool: SpoolWriter,
+    stats: FetchStats | None = None,
+    timeout: int = SQL_TIMEOUT_SECONDS,
 ) -> None:
     """写一个分区：先写 <pt>__tmp 临时分区并核对内容，再删旧分区 + rename 原子替换。
 
@@ -131,13 +213,15 @@ def write_partition(
 
         def once() -> None:
             nonlocal final_deleted
-            table.delete_partition(tmp_spec, if_exists=True)  # 清掉上次失败留下的临时分区
-            table.create_partition(tmp_spec, if_not_exists=True)
+            # 分区增删都走 run_sql_with_timeout（DDL）：pyodps 的 table.delete_partition /
+            # create_partition 是同步不限时的，云端卡住会把整轮任务连同运行锁一起挂死
+            drop_partition(o, project, table_name, tmp_spec, timeout=timeout)  # 清掉上次失败留下的临时分区
+            add_partition(o, project, table_name, tmp_spec, timeout=timeout)
             with table.open_writer(partition=tmp_spec, reopen=True) as writer:
                 for batch in spool.iter_batches(BATCH_SIZE):
                     writer.write([[row] for row in batch])
             actual, distinct, smallest, largest = verify_partition(
-                o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}"
+                o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}", timeout=timeout
             )
             if actual != stats.count:
                 raise RuntimeError(f"临时分区行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
@@ -153,8 +237,8 @@ def write_partition(
             # 原子替换：旧分区先让位，临时分区立刻改名顶上（中间空窗只有一条 DDL 的执行时间）。
             # 置位放在删之前：删除请求可能已经发到服务端才报错，宁可把后果描述得保守一点
             final_deleted = True
-            table.delete_partition(final_spec, if_exists=True)
-            rename_partition(o, project, table_name, tmp_spec, final_spec)
+            drop_partition(o, project, table_name, final_spec, timeout=timeout)
+            rename_partition(o, project, table_name, tmp_spec, final_spec, timeout=timeout)
 
         last: Exception | None = None
         for attempt in range(1, WRITE_ATTEMPTS + 1):
@@ -170,7 +254,7 @@ def write_partition(
         # 用 max_pt() 取最新分区时可能读到半成品；清理失败只多打一条告警，不改变失败结论
         tmp_cleaned = True
         try:
-            table.delete_partition(tmp_spec, if_exists=True)
+            drop_partition(o, project, table_name, tmp_spec, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
             tmp_cleaned = False
             log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
@@ -189,29 +273,33 @@ def write_partition(
             _temp_spool.close()
 
 
-def count_partition(o, project: str, table_name: str, pt: str) -> int:
+def count_partition(o, project: str, table_name: str, pt: str, timeout: int = SQL_TIMEOUT_SECONDS) -> int:
     """写后行数核对：select count(*)（与拉取条数不一致按失败处理）。"""
     sql = f"select count(*) as cnt from {project}.{table_name} where {PARTITION_COLUMN} = '{pt}'"
-    with o.execute_sql(sql).open_reader() as reader:
+    instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
+    with instance.open_reader() as reader:
         for row in reader:
             return int(row["cnt"])
     return 0
 
 
-def purge_stale_tmp_partitions(table, table_name: str) -> None:
+def purge_stale_tmp_partitions(o, table, project: str, table_name: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
     """清掉历史失败残留的 __tmp 临时分区（正式写入之前调用）。
 
     残留的 tmp 分区值（如 20260927__tmp）在字符串序上大于同日期正式分区，会让下游
     用 max_pt() 时读到半成品；每次正式运行前统一清一遍，避免一次中断长时间污染下游。
+    删除同样走带超时的 DDL（pyodps 的 table.delete_partition 不限时，卡住会挂死整个任务）。
     """
     for part in list(table.partitions):
         spec = str(part.name)
         if TMP_PARTITION_SUFFIX in spec:
             log(f"  清理残留临时分区：{table_name} {spec}")
-            table.delete_partition(spec, if_exists=True)
+            drop_partition(o, project, table_name, spec, timeout=timeout)
 
 
-def verify_partition(o, project: str, table_name: str, column: str, pt: str) -> tuple[int, int, str, str]:
+def verify_partition(
+    o, project: str, table_name: str, column: str, pt: str, timeout: int = SQL_TIMEOUT_SECONDS
+) -> tuple[int, int, str, str]:
     """核对分区内容（汇总级，不逐条比对）：行数、record_id 去重数、record_id 最小/最大值。
 
     三件套能覆盖漏行、重复、整段错写（Tunnel 是分批原子提交，配合足够）；逐条比对内容对大表成本太高，不做。
@@ -222,7 +310,8 @@ def verify_partition(o, project: str, table_name: str, column: str, pt: str) -> 
         f"select get_json_object({column}, '$.record_id') as rid "
         f"from {project}.{table_name} where {PARTITION_COLUMN} = '{pt}')"
     )
-    with o.execute_sql(sql).open_reader() as reader:
+    instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"核对 {table_name} 分区 {pt}")
+    with instance.open_reader() as reader:
         for row in reader:
             return (
                 int(row["cnt"]),

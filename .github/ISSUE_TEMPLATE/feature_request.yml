@@ -1,0 +1,56 @@
+name: 功能建议
+description: 提一个需求或改进想法（新表格形态、新配置项、易用性）
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提需求前先看一眼 README 的「job 配置说明」——**很多需求不加代码，写配置就能表达**
+        （字段映射、目标表、新鲜度告警、空表策略都有对应字段）。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 描述你遇到的场景，而不是直接给方案——这样更容易找到更通用的做法
+      placeholder: |
+        例：某张多维表格是"每行一个附件"，希望在 JSON 里保留附件的下载链接
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: 现在怎么绕过的（可选）
+      description: "比如用下游 DWD 的 get_json_object 再解析，或跑之前的独立脚本"
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法（可选）
+      placeholder: |
+        例：加一个 target.xxx 配置项，或在 mc.py 增加一种落库形态
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 只影响我自己的一个作业
+        - 一类多维表格形态（其他人也可能遇到）
+        - 工具通用能力（配置/命令行/写入流程）
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认现有配置项无法表达这个需求（必要时贴出试过的配置）
+          required: false

@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import time
@@ -48,6 +50,14 @@ class OfflineTestCase(unittest.TestCase):
         secrets_patcher = mock.patch.object(utils_mod, "_SECRETS", [])
         secrets_patcher.start()
         self.addCleanup(secrets_patcher.stop)
+        # 运行锁落到临时目录：lock_path 默认把锁写到工具目录的 .run-locks/，而单测用的是临时
+        # 作业路径（锁名哈希每次不同），不重定向会在仓库里无限累积锁文件、污染工作区。
+        # 只改测试侧的锁根路径，生产行为不变。
+        lock_dir = tempfile.mkdtemp(prefix="feishu2ods-test-locks-")
+        self.addCleanup(shutil.rmtree, lock_dir, ignore_errors=True)
+        file_patcher = mock.patch.object(utils_mod, "__file__", str(pathlib.Path(lock_dir) / "utils.py"))
+        file_patcher.start()
+        self.addCleanup(file_patcher.stop)
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +173,43 @@ class _FakeReader:
 
 
 class _FakeInstance:
-    def __init__(self, rows):
+    """假 SQL 实例：默认立即成功；never_success=True 时用于测试超时保护。"""
+
+    def __init__(self, rows, never_success=False):
         self._rows = rows
+        self._never_success = never_success
+        self.stopped = False
+
+    def is_successful(self):
+        return not self._never_success
+
+    def is_terminated(self):
+        return False
+
+    def wait_for_success(self, timeout=None):
+        return self
+
+    def stop(self):
+        self.stopped = True
 
     def open_reader(self):
         return _FakeReader(self._rows)
 
 
 class _FakeOdps:
+    """记录 SQL 的假 ODPS。
+
+    run_sql 才是生产的真实入口（带超时需要异步实例才能轮询/取消）；execute_sql 保留一份，
+    以防有调用方仍走阻塞式接口。
+    """
+
     def __init__(self, rows):
         self._rows = rows
         self.sqls = []
+
+    def run_sql(self, sql):
+        self.sqls.append(sql)
+        return _FakeInstance(self._rows)
 
     def execute_sql(self, sql):
         self.sqls.append(sql)
@@ -619,12 +655,16 @@ class TestMc(OfflineTestCase):
         odps = _FakeOdps([self._verify_row(2, mn="r1", mx="r2")])
         records = [{"record_id": "r1", "a": 1}, {"record_id": "r2", "a": 2}]
         cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", records)
-        # 先写临时分区，再删正式分区、rename 顶上
-        self.assertEqual([c[0] for c in table.calls], ["delete", "create", "write", "delete"])
+        # 先写临时分区（删残留 tmp + 建 tmp），再删正式分区、rename 顶上；
+        # 分区增删走带超时的 DDL（run_sql），表对象只负责 Tunnel 写入
+        self.assertEqual([c[0] for c in table.calls], ["write"])
         self.assertEqual(table.calls[0][1], "pt=20260928__tmp")
-        self.assertEqual(table.calls[3][1], "pt=20260928")
         self.assertEqual(table.rows, [['{"record_id":"r1","a":1}'], ['{"record_id":"r2","a":2}']])
-        self.assertIn("rename to partition (pt='20260928')", odps.sql)
+        sqls = "\n".join(odps.sqls)
+        self.assertIn("drop if exists partition (pt='20260928__tmp')", sqls)
+        self.assertIn("add if not exists partition (pt='20260928__tmp')", sqls)
+        self.assertIn("drop if exists partition (pt='20260928')", sqls)
+        self.assertIn("rename to partition (pt='20260928')", sqls)
         self.assertIn("pt='20260928__tmp'", odps.sql)
 
     def test_write_partition_retry(self):
@@ -677,7 +717,7 @@ class TestMc(OfflineTestCase):
         table = _FakeTable()
         odps = _FakeOdps([{"cnt": 0, "ucnt": 0, "mn": None, "mx": None}])
         cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [])
-        self.assertEqual([c[0] for c in table.calls], ["delete", "create", "write", "delete"])
+        self.assertEqual([c[0] for c in table.calls], ["write"])
         self.assertEqual(table.rows, [])
         self.assertIn("rename to partition (pt='20260928')", odps.sql)
 
@@ -688,29 +728,37 @@ class TestMc(OfflineTestCase):
             with self.assertRaises(SystemExit) as ctx:
                 cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
         self.assertIn("正式分区可能已被删掉", str(ctx.exception))
-        # 失败后尽力清掉临时分区（最后一步是 delete tmp）
-        self.assertEqual(table.calls[-1], ("delete", "pt=20260928__tmp"))
+        # 失败后尽力清掉临时分区（最后一步是 drop tmp 的分区 DDL）
+        self.assertIn("drop if exists partition (pt='20260928__tmp')", odps.sqls[-1])
 
     def test_write_partition_cleanup_failure_keeps_error(self):
         table = mock.Mock()
+        odps = _FakeOdps([self._verify_row(1, mn="r1")])
 
-        def delete(spec, if_exists=False):
+        def drop(o, project, table_name, spec, timeout=None):
             if spec.endswith("__tmp"):
                 raise RuntimeError("delete boom")
 
-        table.delete_partition.side_effect = delete
-        table.open_writer.side_effect = RuntimeError("never")
-        odps = _FakeOdps([self._verify_row(1, mn="r1")])
-        with self.assertRaises(SystemExit) as ctx:
-            cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        with mock.patch.object(mc_mod, "drop_partition", side_effect=drop):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
         self.assertIn("正式分区未动", str(ctx.exception))
         self.assertIn("残留", str(ctx.exception))
 
     def test_purge_stale_tmp_partitions(self):
         table = _FakeTable()
         table.partitions = [_Part("pt='20260927__tmp'"), _Part("pt='20260928'"), _Part("pt='20260929__tmp'")]
-        cli_mod.purge_stale_tmp_partitions(table, "t")
-        self.assertEqual(table.calls, [("delete", "pt='20260927__tmp'"), ("delete", "pt='20260929__tmp'")])
+        odps = _FakeOdps([])
+        cli_mod.purge_stale_tmp_partitions(odps, table, "p", "t")
+        sqls = "\n".join(odps.sqls)
+        self.assertIn("drop if exists partition (pt='20260927__tmp')", sqls)
+        self.assertIn("drop if exists partition (pt='20260929__tmp')", sqls)
+        self.assertNotIn("20260928", sqls)  # 正式分区不动
+
+    def test_sql_spec_normalizes_quotes(self):
+        self.assertEqual(mc_mod._sql_spec("pt=20260928"), "pt='20260928'")
+        self.assertEqual(mc_mod._sql_spec("pt='20260928'"), "pt='20260928'")
+        self.assertEqual(mc_mod._sql_spec('pt="20260928"'), "pt='20260928'")
 
     def test_verify_partition(self):
         odps = _FakeOdps([{"cnt": 3, "ucnt": 3, "mn": "a", "mx": "c"}])
@@ -1025,27 +1073,31 @@ class TestWiring(OfflineTestCase):
         self.assertTrue(any("全为空" in m for m in messages))
 
     def test_run_sync_writes_and_counts(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False)
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         table = mock.Mock()
         odps = mock.Mock()
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
             mock.patch.object(cli_mod, "connect_odps", return_value=odps),
-            mock.patch.object(cli_mod, "ensure_table", return_value=table),
+            mock.patch.object(cli_mod, "ensure_table", return_value=table) as ensure,
             mock.patch.object(cli_mod, "verify_schema"),
             mock.patch.object(cli_mod, "purge_stale_tmp_partitions"),
             mock.patch.object(cli_mod, "write_partition") as writer,
-            mock.patch.object(cli_mod, "count_partition", return_value=1),
+            mock.patch.object(cli_mod, "count_partition", return_value=1) as counter,
         ):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
         writer.assert_called_once()
         self.assertEqual(writer.call_args.args[0], odps)
         self.assertEqual(writer.call_args.args[7].count, 1)  # stats 带 1 条记录
+        # 建表 / 写分区 / 写后核对三条 SQL 路径都要带上 --sql-timeout 的口径
+        self.assertEqual(ensure.call_args.kwargs["timeout"], 600)
+        self.assertEqual(writer.call_args.kwargs["timeout"], 600)
+        self.assertEqual(counter.call_args.kwargs["timeout"], 600)
 
     def test_run_sync_count_mismatch(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False)
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
@@ -1363,7 +1415,7 @@ class TestWritePartitionStreaming(OfflineTestCase):
         odps = _FakeOdps([{"cnt": 2, "ucnt": 2, "mn": "r1", "mx": "r2"}])
         cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", spool, stats)
         self.assertEqual(table.rows, [['{"record_id":"r1","a":1}'], ['{"record_id":"r2","a":2}']])
-        self.assertEqual([c[0] for c in table.calls], ["delete", "create", "write", "delete"])
+        self.assertEqual([c[0] for c in table.calls], ["write"])
         spool.close()
 
     def test_new_signature_row_too_big_checked_before_delete(self):
@@ -1397,6 +1449,262 @@ class TestWritePartitionStreaming(OfflineTestCase):
     def test_wrong_signature_raises_type_error(self):
         with self.assertRaises(TypeError):
             cli_mod.write_partition(mock.Mock(), _FakeTable(), "p", "t", "json", "20260928", "not-a-spool")
+
+
+# ===========================================================================
+# 加固修复：脱敏 / 临时目录 / --log-file / SQL 超时
+# ===========================================================================
+class TestRedact(OfflineTestCase):
+    """F1：形态级 + 值级双重脱敏。"""
+
+    def test_value_level_leak(self):
+        """接口把 app_secret 原文写进 msg（自由文本，形态规则认不出）：值级脱敏兜底。"""
+        utils_mod._SECRETS.append("sk-live-abcdef123456")
+        msg = "调用失败：Invalid token: sk-live-abcdef123456"
+        out = utils_mod.redact(msg)
+        self.assertNotIn("sk-live-abcdef123456", out)
+        self.assertIn("***", out)
+
+    def test_value_level_url_encoded_leak(self):
+        """接口把凭证按 URL 编码形态回显（周围无键名，形态规则认不出）：值级编码形态兜底。"""
+        secret = "tok abc/123"  # quote 后 tok%20abc%2F123，quote_plus 后 tok+abc%2F123
+        utils_mod._SECRETS.append(secret)
+        encoded = utils_mod.quote(secret, safe="")
+        self.assertNotEqual(encoded, secret)
+        self.assertNotEqual(utils_mod.quote_plus(secret), encoded)
+        for text in (
+            f"调用失败：raw={secret}",
+            f"调用失败：urlencoded={encoded}",
+            f"调用失败：plus={utils_mod.quote_plus(secret)}",
+        ):
+            out = utils_mod.redact(text)
+            self.assertNotIn(secret, out)
+            self.assertIn("***", out)
+
+    def test_redact_secrets_url_encoded(self):
+        secret = "tok abc/123"
+        for variant in (secret, utils_mod.quote(secret, safe=""), utils_mod.quote_plus(secret)):
+            out = utils_mod.redact_secrets([secret], f"error body {variant} end")
+            self.assertNotIn(variant, out)
+            self.assertIn("***", out)
+
+    def test_redact_secrets_value_first(self):
+        out = utils_mod.redact_secrets(["sk-live-abcdef123456"], "error body sk-live-abcdef123456 end")
+        self.assertNotIn("sk-live-abcdef123456", out)
+        self.assertIn("***", out)
+
+    def test_shape_bearer(self):
+        out = utils_mod.redact("Authorization: Bearer sk-abcdef123456")
+        self.assertNotIn("sk-abcdef123456", out)
+        self.assertIn("***", out)
+
+    def test_shape_json_fragment(self):
+        out = utils_mod.redact('{"app_secret": "abcdef123456", "ok": 1}')
+        self.assertNotIn("abcdef123456", out)
+        self.assertIn('"app_secret": "***"', out)
+
+    def test_shape_query_access_token(self):
+        out = utils_mod.redact("https://x/open?access_token=abcdef123456&page=2")
+        self.assertNotIn("abcdef123456", out)
+        self.assertIn("access_token=***", out)
+
+    def test_shape_feishu_webhook(self):
+        out = utils_mod.redact("https://open.feishu.cn/open-apis/bot/v2/hook/abc-def-123456")
+        self.assertNotIn("abc-def-123456", out)
+        self.assertIn("/hook/***", out)
+
+    def test_order_bearer_before_query(self):
+        """顺序坑：header: 'Authorization=Bearer abc' 的令牌必须被遮住，不能被 query 规则切碎后漏出。
+
+        与 api2ods / sftp2ods 输出逐字对齐：`header: 'Authorization=*** ***'`（令牌已变 ***）。
+        若 query 规则先跑，会先把 `Authorization=Bearer` 切成 `Authorization=`、`Bearer` 被吃掉，
+        Bearer 规则再也匹配不到，`abc123def` 会原样留在日志里。
+        """
+        out = utils_mod.redact("header: 'Authorization=Bearer abc123def'")
+        self.assertNotIn("abc123def", out)
+        self.assertIn("***", out)
+
+    def test_plain_text_untouched(self):
+        self.assertEqual(utils_mod.redact("普通文本 abc"), "普通文本 abc")
+
+    def test_empty_and_none(self):
+        self.assertEqual(utils_mod.redact(""), "")
+        self.assertIsNone(utils_mod.redact(None))
+
+
+class TestCollectSecretValues(OfflineTestCase):
+    """F1：作业密钥收集（app_secret / access_key_secret / webhook）。"""
+
+    def test_collects_feishu_and_mc_and_webhook_id(self):
+        job = {
+            "feishu": {"app_id": "cli_x", "app_secret": "s" * 8, "base_token": "ICx"},
+            "maxcompute": {"access_key_secret": "k" * 8},
+            "freshness": {"webhook": "https://x/hook/abcdef123456"},
+        }
+        values = utils_mod.collect_secret_values(job)
+        self.assertIn("s" * 8, values)
+        self.assertIn("k" * 8, values)
+        self.assertIn("abcdef123456", values)  # 裸 hook id（形态脱敏只认 URL）
+
+    def test_non_dict_job_returns_empty(self):
+        self.assertEqual(utils_mod.collect_secret_values("nope"), [])
+
+
+class TestSpoolFailure(OfflineTestCase):
+    """F2：临时目录不可写/磁盘满 → 人话 + 退出码 1。"""
+
+    def test_spoolwriter_wraps_oserror(self):
+        with mock.patch.object(tempfile, "mkstemp", side_effect=OSError("No space left")):
+            with self.assertRaises(OSError) as ctx:
+                cli_mod.SpoolWriter()
+        self.assertIn("建不了落盘临时文件", str(ctx.exception))
+
+    def test_run_sync_spool_failure_returns_1(self):
+        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True, sql_timeout=600)
+        messages: list[str] = []
+        with (
+            mock.patch.object(cli_mod, "SpoolWriter", side_effect=OSError("No space left")),
+            mock.patch.object(cli_mod, "log", side_effect=lambda m: messages.append(str(m))),
+        ):
+            code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 1)
+        self.assertTrue(any("临时文件" in m for m in messages))
+
+
+class TestLogFile(OfflineTestCase):
+    """F3：--log-file（追加、UTF-8、父目录自建、指向目录人话）。"""
+
+    def test_absent_returns_none(self):
+        self.assertIsNone(cli_mod._open_log_file(""))
+
+    def test_creates_parents_and_appends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "logs" / "run.log"
+            handle = cli_mod._open_log_file(str(path))
+            handle.write("x\n")
+            handle.close()
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), "x\n")
+
+    def test_pointing_at_directory_reports_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod._open_log_file(tmp)
+            self.assertIn("指向的是目录", str(ctx.exception))
+
+    def test_log_writes_to_file_sink(self):
+        handle = io.StringIO()
+        utils_mod.add_log_sink(handle)
+        try:
+            utils_mod.log("写一份到文件")
+        finally:
+            utils_mod._sinks.remove(handle)  # 直接摘，不关句柄（remove_log_sink 会 close）
+        self.assertIn("写一份到文件", handle.getvalue())
+
+    def test_remove_log_sink_detaches_and_closes(self):
+        handle = io.StringIO()
+        utils_mod.add_log_sink(handle)
+        utils_mod.remove_log_sink(handle)
+        self.assertNotIn(handle, utils_mod._sinks)
+        self.assertTrue(handle.closed)
+        utils_mod.remove_log_sink(handle)  # 幂等：第二次不该报错
+        utils_mod.remove_log_sink(None)
+
+    def test_broken_sink_does_not_break_logging(self):
+        class BrokenSink:
+            def write(self, _text):
+                raise OSError("disk full")
+
+            def flush(self):
+                pass
+
+        sink = BrokenSink()
+        utils_mod.add_log_sink(sink)
+        try:
+            utils_mod.log("照常输出")  # 不该抛
+        finally:
+            utils_mod.remove_log_sink(sink)
+
+    def test_main_attaches_and_detaches_sink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "run.log"
+            rc = cli_mod.main(["--log-file", str(log_path)])
+            self.assertEqual(rc, 2)  # 没给 --job
+            self.assertEqual(len(utils_mod._sinks), 0)  # 句柄已摘掉，重复调用不串
+            self.assertTrue(log_path.is_file())
+            self.assertIn("--job", log_path.read_text(encoding="utf-8"))
+
+
+class TestSqlTimeout(OfflineTestCase):
+    """F4：MaxCompute SQL 超时保护 + --sql-timeout。"""
+
+    def test_parse_args_default_and_zero(self):
+        self.assertEqual(cli_mod.parse_args(["--job", "x"]).sql_timeout, mc_mod.SQL_TIMEOUT_SECONDS)
+        self.assertEqual(cli_mod.parse_args(["--job", "x", "--sql-timeout", "0"]).sql_timeout, 0)
+
+    def test_parse_args_negative_is_arg_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            cli_mod.parse_args(["--job", "x", "--sql-timeout", "-5"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_run_sql_with_timeout_success(self):
+        odps = _FakeOdps([{"cnt": 1}])
+        inst = mc_mod.run_sql_with_timeout(odps, "select 1", timeout=600, desc="t")
+        self.assertIsNotNone(inst)
+
+    def test_run_sql_with_timeout_raises_and_stops(self):
+        inst = _FakeInstance([], never_success=True)
+        odps = mock.Mock()
+        odps.run_sql.return_value = inst
+        clock = iter([100.0, 100.0, 1100.0])
+        with mock.patch.object(mc_mod.time, "time", side_effect=lambda: next(clock, 10**9)):
+            with self.assertRaises(TimeoutError):
+                mc_mod.run_sql_with_timeout(odps, "select 1", timeout=5, desc="t")
+        self.assertTrue(inst.stopped)
+
+    def test_count_partition_forwards_timeout(self):
+        odps = _FakeOdps([{"cnt": 3}])
+        with mock.patch.object(mc_mod, "run_sql_with_timeout", wraps=mc_mod.run_sql_with_timeout) as spy:
+            self.assertEqual(cli_mod.count_partition(odps, "p", "t", "20260928", timeout=42), 3)
+        self.assertEqual(spy.call_args.kwargs["timeout"], 42)
+
+    def test_write_partition_uses_run_sql(self):
+        """rename/verify 都走 run_sql（异步实例），不再是阻塞的 execute_sql。"""
+        table = _FakeTable()
+        odps = _FakeOdps([{"cnt": 1, "ucnt": 1, "mn": "r1", "mx": "r1"}])
+        cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        self.assertIn("rename to partition", odps.sql)
+
+    def test_drop_add_partition_forward_timeout(self):
+        """分区增删已改用带超时的 DDL（drop if exists / add if not exists），并透传 timeout。"""
+        odps = _FakeOdps([])
+        with mock.patch.object(mc_mod, "run_sql_with_timeout", wraps=mc_mod.run_sql_with_timeout) as spy:
+            mc_mod.drop_partition(odps, "p", "t", "pt=20260928", timeout=7)
+            mc_mod.add_partition(odps, "p", "t", "pt=20260928", timeout=7)
+        self.assertEqual(spy.call_args.kwargs["timeout"], 7)
+        self.assertIn("drop if exists partition (pt='20260928')", odps.sqls[0])
+        self.assertIn("add if not exists partition (pt='20260928')", odps.sqls[1])
+
+    def test_partition_ddl_timeout_absorbed_by_retry_and_cleanup(self):
+        """分区 DDL 超时按普通失败走既有「重试 + 清临时分区」路径：不 rename、正式分区未动。"""
+        table = _FakeTable()
+        odps = _FakeOdps([{"cnt": 1, "ucnt": 1, "mn": "r1", "mx": "r1"}])
+        real = mc_mod.run_sql_with_timeout
+        drops = {"n": 0}
+
+        def fake(o, sql, timeout=mc_mod.SQL_TIMEOUT_SECONDS, desc="SQL"):
+            if "drop if exists" in sql:
+                drops["n"] += 1
+                raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
+            return real(o, sql, timeout=timeout, desc=desc)
+
+        with mock.patch.object(mc_mod, "run_sql_with_timeout", side_effect=fake):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        self.assertIn("正式分区未动", str(ctx.exception))
+        self.assertNotIn("rename", "\n".join(odps.sqls))
+        # 3 次写入重试 + 1 次收尾清理：超时错误全部被吸收，不无限挂起、不留悬挂线程
+        self.assertEqual(drops["n"], mc_mod.WRITE_ATTEMPTS + 1)
 
     def test_old_signature_still_works_with_list(self):
         # 旧调用方（传记录列表、不给 stats）自动装进临时 spool
@@ -1435,6 +1743,68 @@ class TestRunSyncSpoolLifecycle(OfflineTestCase):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)  # 0 行保护
         self.assertFalse(spool_holder["spool"].path.exists())
+
+    def _sync_args(self):
+        return argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600, force=False)
+
+    def _fetch_capture(self, records, holder):
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+            holder["spool"] = sink
+            return fetch_stub(records)(feishu, mapping, max_pages, extra_out, sink, stats)
+
+        return fake_fetch
+
+    def test_connect_failure_closes_spool(self):
+        """connect_odps 抛 SystemExit（缺 pyodps/缺凭证）时 spool 也要被收口，不留悬挂句柄。"""
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=self._fetch_capture(records, holder)),
+            mock.patch.object(cli_mod, "connect_odps", side_effect=SystemExit("缺少 pyodps：pip install pyodps")),
+        ):
+            with self.assertRaises(SystemExit):
+                cli_mod.run_sync(
+                    self._sync_args(), make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time()
+                )
+        spool = holder["spool"]
+        self.assertTrue(spool._handle.closed)  # 句柄已关闭：不再有裸泄漏的文件句柄
+        self.addCleanup(lambda: spool.path.unlink(missing_ok=True))
+        # 失败路径按既有约定 keep=True 保留文件供排查（已在 run_sync 里统一收口）
+        self.assertTrue(spool.path.exists())
+
+    def test_ensure_table_failure_closes_spool(self):
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=self._fetch_capture(records, holder)),
+            mock.patch.object(cli_mod, "connect_odps", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "ensure_table", side_effect=SystemExit("建表失败")),
+        ):
+            with self.assertRaises(SystemExit):
+                cli_mod.run_sync(
+                    self._sync_args(), make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time()
+                )
+        spool = holder["spool"]
+        self.assertTrue(spool._handle.closed)
+        self.addCleanup(lambda: spool.path.unlink(missing_ok=True))
+
+    def test_success_path_removes_spool(self):
+        records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=self._fetch_capture(records, holder)),
+            mock.patch.object(cli_mod, "connect_odps", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "ensure_table", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "verify_schema"),
+            mock.patch.object(cli_mod, "purge_stale_tmp_partitions"),
+            mock.patch.object(cli_mod, "write_partition"),
+            mock.patch.object(cli_mod, "count_partition", return_value=1),
+        ):
+            code = cli_mod.run_sync(
+                self._sync_args(), make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time()
+            )
+        self.assertEqual(code, 0)
+        self.assertFalse(holder["spool"].path.exists())
 
 
 class TestBizdateMore(OfflineTestCase):
@@ -1489,6 +1859,26 @@ class TestBizdateMore(OfflineTestCase):
         with mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True):
             with self.assertRaises(SystemExit):
                 dates_mod.resolve_bizdate(args)
+
+    def test_env_bizdate_non_strict_tolerates_dirty(self):
+        """--check 用的非严格模式：脏 bizdate 按"未设置"处理，不报错。"""
+        with mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True):
+            self.assertIsNone(dates_mod.env_bizdate(strict=False))
+        with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "2026-9-7"}, clear=True):
+            self.assertIsNone(dates_mod.env_bizdate(strict=False))
+
+    def test_resolve_bizdate_non_strict_falls_back_to_default(self):
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 29, 10, 0, tzinfo=utils_mod.CN_TZ)
+
+        args = argparse.Namespace(bizdate="")
+        with (
+            mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True),
+            mock.patch.object(dates_mod, "datetime", _FixedDatetime),
+        ):
+            self.assertEqual(dates_mod.resolve_bizdate(args, strict=False), date(2026, 9, 28))
 
 
 class TestValidateJobMore(OfflineTestCase):
@@ -1869,6 +2259,124 @@ class TestMainMore(OfflineTestCase):
                 mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),
             ):
                 self.assertEqual(cli_mod.main(["--job", str(job_path)]), 1)
+
+
+class TestSecretsResetAcrossRuns(OfflineTestCase):
+    """R2：_SECRETS 是模块级全局，同进程多次 main() 不能跨轮串值。"""
+
+    def test_second_run_does_not_keep_first_secrets(self):
+        first = "FIRSTSECRET-abcdef"
+        second = "SECONDSECRET-xyzzy"
+        with tempfile.TemporaryDirectory() as tmp:
+            job_a = pathlib.Path(tmp) / "a.json"
+            job_b = pathlib.Path(tmp) / "b.json"
+            raw_a = make_job()
+            raw_a["feishu"]["app_secret"] = first
+            raw_b = make_job()
+            raw_b["feishu"]["app_secret"] = second
+            job_a.write_text(json.dumps(raw_a), encoding="utf-8")
+            job_b.write_text(json.dumps(raw_b), encoding="utf-8")
+            # cli 与 utils 共用同一个 _SECRETS 列表（还原生产里两处是同一对象）
+            shared: list[str] = []
+            with (
+                mock.patch.object(cli_mod, "_SECRETS", shared),
+                mock.patch.object(utils_mod, "_SECRETS", shared),
+                mock.patch.object(cli_mod, "run_sync", return_value=0),
+                mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),
+            ):
+                self.assertEqual(cli_mod.main(["--job", str(job_a), "--bizdate", "20260928"]), 0)
+                self.assertIn(first, shared)  # 本轮密钥已登记（用于日志脱敏）
+                self.assertEqual(cli_mod.main(["--job", str(job_b), "--bizdate", "20260928"]), 0)
+                self.assertIn(second, shared)
+                self.assertNotIn(first, shared)  # 上一轮密钥不残留
+
+
+class TestCheckTolerantBizdate(OfflineTestCase):
+    """R4：只读体检 --check 不该被脏 bizdate 环境变量拖垮；正式同步仍严格。"""
+
+    def _job_file(self, tmp) -> pathlib.Path:
+        job_path = pathlib.Path(tmp) / "demo.json"
+        job_path.write_text(json.dumps(make_job()), encoding="utf-8")
+        return job_path
+
+    def test_check_passes_with_dirty_bizdate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = self._job_file(tmp)
+            with (
+                mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True),
+                mock.patch.object(cli_mod, "run_check", return_value=0) as check,
+            ):
+                self.assertEqual(cli_mod.main(["--job", str(job_path), "--check"]), 0)
+            self.assertTrue(check.called)
+
+    def test_sync_still_fails_with_dirty_bizdate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = self._job_file(tmp)
+            with mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True):
+                self.assertEqual(cli_mod.main(["--job", str(job_path)]), 1)
+
+
+class TestEmptyPartitionGuard(OfflineTestCase):
+    """R6：0 行 + allow_empty=true 写空分区前先查现有分区行数（非 0 需 --force）。"""
+
+    @staticmethod
+    def _args(force=False):
+        return argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600, force=force)
+
+    @staticmethod
+    def _job():
+        return make_job(target={"project": "test_project", "table": "t", "column": "json", "allow_empty": True})
+
+    def _capture_fetch(self, holder):
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+            holder["spool"] = sink
+            return stats
+
+        return fake_fetch
+
+    def _run(self, args, holder):
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=self._capture_fetch(holder)),
+            mock.patch.object(cli_mod, "connect_odps", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "ensure_table", return_value=mock.Mock()),
+            mock.patch.object(cli_mod, "verify_schema"),
+            mock.patch.object(cli_mod, "purge_stale_tmp_partitions"),
+        ):
+            return cli_mod.run_sync(args, self._job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+
+    def test_zero_rows_with_existing_data_refuses_without_force(self):
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "count_partition", return_value=123) as counter,
+            mock.patch.object(cli_mod, "write_partition") as writer,
+        ):
+            code = self._run(self._args(force=False), holder)
+        self.assertEqual(code, 1)
+        counter.assert_called_once()  # 写前先查了现有分区
+        writer.assert_not_called()  # 没有删分区、没有写空分区
+        self.addCleanup(lambda: holder["spool"].path.unlink(missing_ok=True))
+
+    def test_zero_rows_with_existing_data_force_writes(self):
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "count_partition", return_value=0) as counter,
+            mock.patch.object(cli_mod, "write_partition") as writer,
+        ):
+            code = self._run(self._args(force=True), holder)
+        self.assertEqual(code, 0)
+        writer.assert_called_once()  # --force 明确放行，允许覆盖成空分区
+        counter.assert_called_once()  # 只剩写后核对那条（写前保护被跳过）
+
+    def test_zero_rows_with_empty_partition_writes_normally(self):
+        holder = {}
+        with (
+            mock.patch.object(cli_mod, "count_partition", return_value=0) as counter,
+            mock.patch.object(cli_mod, "write_partition") as writer,
+        ):
+            code = self._run(self._args(force=False), holder)
+        self.assertEqual(code, 0)
+        writer.assert_called_once()  # 分区本来就空：正常写空分区，不拦
+        self.assertEqual(counter.call_count, 2)  # 写前保护 + 写后核对各一次
 
 
 if __name__ == "__main__":

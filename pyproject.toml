@@ -39,7 +39,9 @@ Source = "https://github.com/sandy-wangzining/feishu2ods"
 Issues = "https://github.com/sandy-wangzining/feishu2ods/issues"
 
 [project.optional-dependencies]
-dev = ["ruff>=0.5"]
+# ruff 锁版本：格式化判定（ruff format --check）必须本地与 CI 完全一致，避免版本漂移造成意外失败；
+# 升级时改这里并本地跑一次 ruff format .（格式化结果有变化就一并提交）。锁法与 api2ods/sftp2ods 一致。
+dev = ["ruff==0.16.9"]
 
 [tool.setuptools]
 packages = ["feishu2ods"]
