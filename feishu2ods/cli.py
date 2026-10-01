@@ -174,8 +174,12 @@ def run_sync(
     stats = FetchStats(date_field=date_field)
     try:
         fetch_records(feishu, job["fields"], extra_out=new_fields, sink=spool, stats=stats)
-    except Exception:
-        spool.close(keep=True)  # 失败保留临时文件供排查（系统 temp 会自行清理）
+    except BaseException:
+        # 用 BaseException 而不是 Exception：拉取阶段的失败大多是 fetch_records 抛出的 SystemExit
+        # （鉴权/翻页一致性/映射缺失等），而 SystemExit 不是 Exception 的子类——漏掉它就只抛不清理，
+        # 临时 JSONL 句柄一直吊着；KeyboardInterrupt 同理。失败一律 keep=True 保留文件供排查
+        # （系统 temp 会自行清理），正常路径由写库段统一删除。
+        spool.close(keep=True)
         raise
     count = stats.count
     log(f"拉取完成：{count:,} 条记录，映射 {len(job['fields'])} 个字段")
@@ -297,6 +301,8 @@ def run_sync(
         log(f"完成：{project}.{table_name} pt={pt} 共 {actual:,} 行，耗时 {(time.time() - started) / 60:.1f} 分钟")
         return 0
     finally:
+        # 约定：失败路径一律保留落盘文件（哪怕是空的 0 行快照）便于事后排查，只有写库并核对成功
+        # 才置 keep_spool=False 删除——这是本仓库"失败留证"的一贯口径，不是漏了 close()。
         if keep_spool:
             log(f"已保留本次落盘的数据文件（排查用）：{spool.path}")
         spool.close(keep=keep_spool)
@@ -324,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(args, started)
     except SystemExit as exc:
-        # 配置/运行类错误（ConfigError 风格）：走统一日志出口（带时间戳+脱敏）后退出
+        # 配置/运行类错误（统一以 SystemExit 抛出）：走统一日志出口（带时间戳+脱敏）后退出
         if isinstance(exc.code, int):
             return exc.code
         log(f"❌ {redact(exc)}")

@@ -23,5 +23,5 @@ Closes #
 - [ ] 失败路径不会让正式分区停在一半（写前校验仍在动分区之前）
 - [ ] 0 行写空分区仍受"先查现有分区"保护（非 0 时需 `--force`）
 - [ ] MaxCompute 的 SQL 都经 `run_sql_with_timeout`（不会无限挂起占着运行锁）
-- [ ] 改了配置项/命令行参数 → 同步更新了 `README.md` 与 `jobs/feishu_ai_cost.example.json`
+- [ ] 改了配置项/命令行参数 → 同步更新了 `README.md` 与 `jobs/feishu_example.example.json`
 - [ ] 行为变化已写进 `CHANGELOG.md`

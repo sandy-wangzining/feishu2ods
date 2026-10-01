@@ -1384,6 +1384,39 @@ class TestFetchRecordsStreaming(OfflineTestCase):
         self.assertEqual(stats.count, 1)
         spool.close()
 
+    def test_stream_accumulated_log_is_cumulative(self):
+        # 回归：流式模式 raw_rows 不再累积，翻页日志的「累计」必须取 stats.count，否则每页都只显示本页行数
+        pages = [
+            self._page([["2026-09-27", "$1"], ["2026-09-26", "$2"]], ["r1", "r2"], True),
+            self._page([["2026-09-25", "$3"]], ["r3"], False),
+        ]
+        spool = cli_mod.SpoolWriter()
+        stats = cli_mod.FetchStats()
+        logs: list[str] = []
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+            mock.patch.object(fetch_mod, "log", side_effect=lambda msg: logs.append(str(msg))),
+        ):
+            cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertTrue(any("累计 2" in line for line in logs))
+        self.assertTrue(any("累计 3" in line for line in logs))
+        spool.close()
+
+    def test_stream_records_without_fields_aborts_cleanly(self):
+        # 接口返回了记录却没给字段列表：流式路径要给出明确的 SystemExit，而不是裸 KeyError
+        pages = [{"code": 0, "data": {"data": [["x"]], "record_id_list": ["r1"], "has_more": False}}]
+        spool = cli_mod.SpoolWriter()
+        stats = cli_mod.FetchStats()
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.fetch_records(self.job_feishu, self.mapping, sink=spool, stats=stats)
+        self.assertIn("字段列表", str(ctx.exception))
+        spool.close()
+
 
 class TestFreshnessDualMode(OfflineTestCase):
     """freshness_problem 两种输入形态：记录列表（旧）与日期集合（流式）。"""
@@ -1805,6 +1838,24 @@ class TestRunSyncSpoolLifecycle(OfflineTestCase):
             )
         self.assertEqual(code, 0)
         self.assertFalse(holder["spool"].path.exists())
+
+    def test_fetch_failure_closes_spool(self):
+        """回归：fetch_records 抛 SystemExit（不是 Exception 的子类）时 spool 也要收口，不留悬挂句柄。"""
+        holder = {}
+
+        def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
+            holder["spool"] = sink
+            raise SystemExit("拉取记录失败：模拟")
+
+        with mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch):
+            with self.assertRaises(SystemExit):
+                cli_mod.run_sync(
+                    self._sync_args(), make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time()
+                )
+        spool = holder["spool"]
+        self.assertTrue(spool._handle.closed)  # 句柄已关闭
+        self.addCleanup(lambda: spool.path.unlink(missing_ok=True))
+        self.assertTrue(spool.path.exists())  # 失败路径按约定 keep=True 保留文件供排查
 
 
 class TestBizdateMore(OfflineTestCase):

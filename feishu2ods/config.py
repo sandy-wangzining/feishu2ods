@@ -58,7 +58,7 @@ def _require_identifier(value, where: str) -> str:
     """MaxCompute 标识符校验（表名/列名/项目名会拼进 DDL，挡注入与拼错）。"""
     text = _require_text(value, where)
     if not IDENT_RE.match(text):
-        raise SystemExit(f"{where} 不是合法标识符（字母/数字/下划线，字母开头）：{text!r}")
+        raise SystemExit(f"{where} 不是合法标识符（字母/数字/下划线，且不能以数字开头）：{text!r}")
     return text
 
 
@@ -103,7 +103,7 @@ def validate_job(job: dict) -> list[str]:
     for source, target in fields.items():
         _require_text(source, "fields 的列名")
         if not isinstance(target, str) or not IDENT_RE.match(target):
-            raise SystemExit(f"fields[{source!r}] 的英文键不合法（字母/数字/下划线，字母开头）：{target!r}")
+            raise SystemExit(f"fields[{source!r}] 的英文键不合法（字母/数字/下划线，且不能以数字开头）：{target!r}")
         if target == "record_id":
             raise SystemExit("fields 里不能用 record_id 作为英文键（record_id 固定为记录 ID，自动输出）")
         if target in seen:

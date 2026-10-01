@@ -49,7 +49,7 @@ body:
       label: 执行的命令
       description: 完整命令，`--bizdate` 之类的参数请保留
       render: shell
-      placeholder: "python feishu2ods.py --job jobs/feishu_ai_cost.json --bizdate 20260928 --dry-run"
+      placeholder: "python feishu2ods.py --job jobs/my_table.json --bizdate 20260928 --dry-run"
     validations:
       required: true
 

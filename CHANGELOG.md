@@ -6,6 +6,21 @@
 
 ### 修复
 
+- **流式拉取的翻页日志「累计」数不再虚高（显示修复）**：`fetch_records` 流式模式下 `raw_rows`
+  不再累积，原日志用 `len(raw_rows) + len(page_rows)` 算累计数，导致每页都显示「累计 = 本页行数」
+  （如第 2 页明明累计 1000 条仍打印 `累计 500`）。现在流式取 `FetchStats.count`、非流式取
+  `len(raw_rows)`，两种模式都反映真实累计条数。只影响日志显示，不影响数据与退出码。
+
+- **拉取阶段失败不再泄漏临时 JSONL**：`run_sync` 的拉取段原来用 `except Exception` 收口临时
+  spool，但 `fetch_records` 的失败大多抛 `SystemExit`（鉴权失败、翻页一致性中止、映射列缺失等），
+  而 `SystemExit` 不是 `Exception` 的子类——漏掉了它，失败时既不关文件句柄、也打不出「已保留数据
+  文件」的日志。现在改为 `except BaseException`（与写库段 `try/finally` 的收口口径一致），失败
+  路径统一 `keep=True` 保留文件供排查。退出码不变（仍是 1 / 130）。
+
+- **流式路径「有记录却没给字段列表」的报错对齐非流式**：`_page_records` 在字段列表为空但有记录时
+  会裸抛 `KeyError`（`index[source]` 取不到键），用户只看到一条「未预期错误」加堆栈；非流式
+  `build_records` 此时会给出明确的 `SystemExit` 提示。现在流式也对齐成同一明确报错（退出码仍是 1）。
+
 - **脱敏补齐为「形态级 + 值级」双重（安全）**：原来 `utils.redact()` 只做一件事——把 job 配置里
   的已知密钥值做 `str.replace`（且要求长度 ≥6）。接口/鉴权若不回显原值、而是回显**变形形态**
   （`Authorization: Bearer sk-xxxx`、`?access_token=xxxx`、`{"app_secret": "xxxx"}`、飞书
@@ -96,6 +111,28 @@
 - **补齐 CI 格式门禁并锁定 ruff 版本**：工作流原来只跑 `ruff check .`，缺 `ruff format --check .`
   （api2ods / sftp2ods 都有）；dev 依赖是浮动 `ruff>=0.5`，CI 装的版本会随时间变化，"本地干净、
   CI 失败"这类问题很难查。现在补上格式门禁并把 ruff 锁到 `==0.16.9`，与另两个仓库统一。
+
+### 文档
+
+- **README 补齐退出码表并修正过期说明**：README 长期缺「退出码（调度侧判断成败）」章节
+  （api2ods / sftp2ods 都有），现补 0 / 1 / 2 / 130 对照表；并修正 v1.5.0 拆包后过期的部署说明
+  ——原文只写"把 `feishu2ods.py`、`requirements.txt`、作业文件放好即可"，实际还必须带上
+  `feishu2ods/` 包目录，否则入口壳 `feishu2ods.py` 会 ImportError。另补充 `--init-out` 的说明、
+  把两处 `--sql-timeout` 覆盖范围统一为「建表 / 分区增删与清理 / 分区核对 / 写后行数核对 / rename」。
+- **标识符校验提示与实际规则对齐**：`IDENT_RE` 允许以下划线开头，但报错信息与向导文案写成
+  "字母开头"，前后矛盾。现统一为"字母/数字/下划线，且不能以数字开头"，与实际接受的输入一致
+  （只改文案，校验行为不变）。
+- **示例作业泛化为中性命名（信息卫生）**：示例文件改名为 `jobs/feishu_example.example.json`
+  （原文件名与文件内的 `job` 名都带生产业务口径，一并去掉），`"job"` 同步改为 `feishu_example`，
+  README / CONTRIBUTING / MANIFEST / `.github` 的引用一处不留地跟着改。文件内容里，目标表名
+  （原为某张生产业务表）与 `fields` 的 Base 列名（原为一组生产业务指标名）一并换成中性示例
+  （表名 `ods_example_json_df`，列名「日期 / 名称 / 数量 / 金额」），description / comment 同步
+  去掉业务口径；保留"中文列名 → 英文键"的示例价值，凭证仍为占位符。同时把 README 里"用户自己的
+  作业文件"示例命令统一为 `jobs/my_table.json`（与 api2ods 的 `jobs/my_api.json`、sftp2ods 的
+  `jobs/my_sftp.json` 同一命名习惯；`--init` 生成的文件名规则不受影响）。
+- **补充新鲜度支持日期形态的说明**：README 明确 `freshness.date_field` 的值会规范成 `yyyy-MM-dd`
+  再比对，只认 ISO 串（取前 10 位）/ `yyyy/MM/dd` / epoch 毫秒数字，**紧凑数字串（如 `20260927`）
+  不被识别**（会误判缺数据），见「行为说明」第 6 条与「常见问题」。
 
 ## [1.5.0] - 2026-09-30
 
