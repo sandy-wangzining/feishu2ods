@@ -22,7 +22,7 @@
   - `config.py` job 配置读取与校验；`dates.py` 业务日与日期规范化
   - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
 - `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
-- `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_ai_cost.example.json`）
+- `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_example.example.json`）
 - `tests/` 离线单测：`python -m unittest discover -s tests -v`（不访问网络、不连 MaxCompute）
 - `requirements.txt` 依赖（requests + pyodps）
 
@@ -31,25 +31,26 @@
 本地：
 
 ```bash
-python feishu2ods.py --job jobs/feishu_ai_cost.json --check       # 体检（不写库、不发告警）
-python feishu2ods.py --job jobs/feishu_ai_cost.json --dry-run     # 试跑：拉数校验，不写库
-python feishu2ods.py --job jobs/feishu_ai_cost.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 原子替换）
-python feishu2ods.py --job jobs/feishu_ai_cost.json               # 不传 --bizdate：取环境变量，再默认当天-1
+python feishu2ods.py --job jobs/my_table.json --check       # 体检（不写库、不发告警）
+python feishu2ods.py --job jobs/my_table.json --dry-run     # 试跑：拉数校验，不写库
+python feishu2ods.py --job jobs/my_table.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 原子替换）
+python feishu2ods.py --job jobs/my_table.json               # 不传 --bizdate：取环境变量，再默认当天-1
 ```
 
 部署机（把工具目录同步上去即可）：
 
 ```bash
 cd ~/feishu2ods
-./venv/bin/python feishu2ods.py --job jobs/feishu_ai_cost.json --bizdate "${bizdate}"
+./venv/bin/python feishu2ods.py --job jobs/my_table.json --bizdate "${bizdate}"
 ```
 
-常用参数：`--check`（体检）、`--init`（交互式生成作业，接新表用；密钥输入不回显）、`--bizdate`（业务日 pt）、
+常用参数：`--check`（体检）、`--init`（交互式生成作业，接新表用；密钥输入不回显，`--init-out` 可指定
+输出路径）、`--bizdate`（业务日 pt）、
 `--dry-run`（不写库；校验与告警仍按正式逻辑执行，不想发告警加 `--no-notify`）、
 `--skip-freshness`（跳过新鲜度校验，兼容旧写法 `--no-check`）、`--no-notify`（不发告警）、
 `--force`（0 行写空分区前的保护放行开关，见下）、`--project` / `--table`（覆盖目标，测试用）、
-`--sql-timeout`（单条 MaxCompute SQL 超时秒数，默认 600，0=不限制；建表 / 分区增删 / 分区清理 /
-写入核对 / rename 都受保护）、`--log-file`（日志同时写一份到该文件：追加、UTF-8、
+`--sql-timeout`（单条 MaxCompute SQL 超时秒数，默认 600，0=不限制；建表 / 分区增删与清理 /
+分区核对 / 写后行数核对 / rename 都受保护）、`--log-file`（日志同时写一份到该文件：追加、UTF-8、
 父目录自动创建——Linux 上跑 cron/调度时 stdout 会被截断，落盘是事后翻查的唯一途径）。
 
 ## 接入一张新表（复用流程）
@@ -59,7 +60,7 @@ cd ~/feishu2ods
    逐列起英文键（不需要的列回车跳过）；项目、表名、注释、新鲜度告警都可回车用默认值，
    填错会当场提示重填（wiki 知识库链接里不是 base_token，会提示换 /base/ 链接）；
 3. `python feishu2ods.py --job jobs/<作业名>.json --check` 体检（配置 + API 连通 + 映射 + 目标表）；
-4. `--dry-run` 试跑，条数/日期没问题后正式跑；调度命令同 feishu_ai_cost（换 --job 即可）。
+4. `--dry-run` 试跑，条数/日期没问题后正式跑；调度命令同 my_table（换 --job 即可）。
 
 ## job 配置说明
 
@@ -77,7 +78,7 @@ cd ~/feishu2ods
 | `target.project` / `target.table` / `target.column` | 目标表（column 默认 `json`；表会自动建） |
 | `target.comment` | 可选，表注释 |
 | `target.allow_empty` | 可选，默认 `false`：拉到 0 行时拒绝写库；设为 `true` 时允许写空分区，但写前会先查目标分区现有行数，非 0 时仍需加 `--force` 才放行 |
-| `freshness.date_field` | 用哪个英文键判日期（必须是 `fields` 的英文值） |
+| `freshness.date_field` | 用哪个英文键判日期（必须是 `fields` 的英文值）；值规范化成 `yyyy-MM-dd` 后比对，支持的形态见「行为说明」第 6 条 |
 | `freshness.lag_days` | 预期日期 = bizdate - N 天，默认 0（即必须有业务日当天的数据） |
 | `freshness.webhook` | 缺失时发飞书群告警的 webhook |
 
@@ -97,7 +98,7 @@ cd ~/feishu2ods
    单行超过约 7MB 会在动分区前报错；结构正确才写 `pt=<业务日>__tmp` 临时分区 + Tunnel 分批写入，
    临时分区核对「行数 + record_id 去重数 + 最小/最大 id」（不一致不替换），再「删旧分区 + rename」原子替换；
    全程失败自动重试 3 次（重跑幂等；失败后尽力清掉临时分区，若有残留下次运行也会先清理）；
-   建表 / 分区增删与清理 / 分区核对 / rename 这些 SQL 都有超时保护（默认 600 秒，`--sql-timeout` 可调，
+   建表 / 分区增删与清理 / 分区核对 / 写后行数核对 / rename 这些 SQL 都有超时保护（默认 600 秒，`--sql-timeout` 可调，
    0=不限制；超时主动取消，避免云端卡住时调度任务无限挂起、一直占着运行锁把后续调度全挡掉）；
    **0 行保护**：`target.allow_empty=true` 且本次拉到 0 行时，写空分区前会先查目标分区现有行数——
    非 0 则拒绝写库（退出码 1）并提示加 `--force`，防止源端被截断/清空时把好数据抹掉；现有行数本来就是
@@ -107,6 +108,10 @@ cd ~/feishu2ods
    **锁只在同一台机器内生效**：本地手跑与服务器调度同时跑同一作业没有保护，正式跑请固定一台机器；
 6. 新鲜度校验（配了 `freshness` 才做）：`date_field` 里必须出现「业务日 - `lag_days`」
    （业务日 = `--bizdate` / 环境变量 / 当天-1；默认 lag_days=0，即少 bizdate 当天就告警）。
+   `date_field` 的值会先规范成 `yyyy-MM-dd` 再比对，支持的形态：ISO 串
+   （`2026-09-27T00:00:00+08:00`，取前 10 位）、`yyyy/MM/dd`、epoch 毫秒数字；
+   **紧凑数字串（如 `20260927`）不被识别**——日期列若存成这种纯文本会被误判「缺数据」，
+   需在 Base 侧改成可识别格式，或调 `lag_days` / 用 `--skip-freshness` 规避。
    **缺数据只告警不失败**：很多表是人填的（节假日/休假没人填是常态），快照照常写入——
    缺的那天只是没有数据行（DWD 按源数据日期字段重新分区，下游任务不受影响），并发一条
    飞书提醒；**表被清空（0 行）仍按失败处理**（那才是真异常）。日志会提示调 `lag_days`
@@ -114,6 +119,18 @@ cd ~/feishu2ods
 7. `--check` 只体检：配置 + API 连通 + 字段映射 + 目标表结构，不写库、不发告警、不校验新鲜度。
    它是只读的，环境变量 `bizdate` 格式不对时不会把体检拖垮（按默认当天-1 继续并打警告）；
    正式同步路径仍严格要求业务日合法（非法的环境变量 `bizdate` 直接报错，不会静默回退）。
+
+### 退出码（调度侧判断成败）
+
+| 码 | 含义 |
+|---|---|
+| 0 | 成功（含 `--dry-run`；`--check` 体检通过；`--init` 生成配置成功；0 行且 `allow_empty=true` 时，目标分区本来就空、或显式加了 `--force`，也会写空分区并返回 0） |
+| 1 | 运行失败：鉴权/拉取失败、映射的列缺失、翻页中途字段列表或表格版本号（rev）变化、写库失败、写后行数对不上、0 行保护触发、`--check` 未通过、`--init` 取消；作业文件不存在、业务日格式不对等配置类问题也归这里 |
+| 2 | 命令行参数问题（缺 `--job`、`--sql-timeout` 为负等 argparse 层），**没有发起任何远端操作** |
+| 130 | 用户中断（Ctrl+C），正式同步与 `--init` 一致 |
+
+配置类错误统一以 `SystemExit` 抛出，退出码同为 1：凡是"重跑结果一样"的问题都归到 1，
+调度直接告警即可，不必按码分流重试。
 
 ## 部署到服务器（一次性）
 
@@ -123,7 +140,8 @@ cd ~/feishu2ods
 mkdir -p ~/feishu2ods/jobs
 cd ~/feishu2ods
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-# 把 feishu2ods.py、requirements.txt、jobs/feishu_ai_cost.json 放好即可
+# 把 feishu2ods.py、feishu2ods/ 包目录、requirements.txt、jobs/my_table.json 放好即可
+# （v1.5.0 起代码拆成 feishu2ods/ 包，feishu2ods.py 只是入口壳，缺了包目录会 ImportError）
 ```
 
 ## 常见问题
@@ -136,6 +154,8 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 - `本次拉到 0 行，但该分区现有 N 行`：`target.allow_empty=true` 下的空分区保护触发——源端可能被
   截断/清空，为保住已有数据工具拒绝写库。确认表格确实变成 0 行后，重跑时加 `--force` 即可覆盖成空分区；
 - 日期校验失败但表里其实有数据：查 `freshness.date_field` 是否指对字段、`lag_days` 是否要调；
+  也看日期列的形态——只认 ISO（`2026-09-27T…` 取前 10 位）、`yyyy/MM/dd`、epoch 毫秒数字，
+  **紧凑数字串 `20260927` 不被识别**（会被误判缺数），需在 Base 侧改成可识别格式；
 - 下游解析报错/行数为 0：表格里可能有空白行（日志会提示「全为空」）、或值带尾随空格（如 `"$23.32 "`），
   用 `get_json_object(...) is not null` 过滤空白行、`trim` 后再转数值；
 - 看到 `pt=...__tmp` 分区：某次写入中断留下的临时分区，重跑该作业会自动清掉并重建，不影响正式分区；

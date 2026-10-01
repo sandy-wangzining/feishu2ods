@@ -67,7 +67,7 @@ ruff format --check .                     # 格式检查
 2. 本地跑通 `python -m unittest discover -s tests` 与 `ruff check .`、`ruff format --check .`；
 3. PR 描述里写清：**为什么改**（复现步骤 / 影响的作业）、**怎么验证的**；
 4. 涉及行为变化或修 bug 的，同步更新 `CHANGELOG.md`（修 bug 说明"原来会怎样、现在怎样"）；
-5. 涉及配置项/命令行参数的，同步更新 `README.md` 与 `jobs/feishu_ai_cost.example.json`
+5. 涉及配置项/命令行参数的，同步更新 `README.md` 与 `jobs/feishu_example.example.json`
    （三者是同一份文档的三个入口，容易漏）。
 
 提交信息用 Conventional Commits 风格（`fix:` / `feat:` / `docs:` / `test:` / `refactor:`），

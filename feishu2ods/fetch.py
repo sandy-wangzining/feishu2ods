@@ -128,15 +128,16 @@ def fetch_records(
         if overlap:
             raise SystemExit(f"第 {page} 页出现已拉取过的记录（如 {sorted(overlap)[0]}），接口返回异常，已中止")
         seen_ids.update(page_ids)
-        accumulated = len(raw_rows) + len(page_rows)
         if stream:
             page_records = _page_records(fields or [], page_ids, page_rows, mapping)
             sink.write_records(page_records)
             stats.update(page_records)
             del page_records
+            accumulated = stats.count  # 流式模式 raw_rows 不再累积，累计数只能取 stats
         else:
             raw_rows += page_rows
             record_ids += page_ids
+            accumulated = len(raw_rows)
         # 翻页日志节流：小表每页都打，大表每 20 页打一次（末页必打），调度日志不刷屏
         if page <= 10 or page % 20 == 0 or not payload.get("has_more"):
             log(f"  第 {page} 页：{len(page_rows)} 行（累计 {accumulated}）")
@@ -161,6 +162,13 @@ def fetch_records(
 
 def _page_records(fields: list[str], page_ids: list[str], page_rows: list[list], mapping: dict) -> list[dict]:
     """一页的列式行 + 记录 ID → 记录 dict 列表（流式模式用；映射校验已在首轮做过）。"""
+    if not fields:
+        # 空表时接口可能不给字段列表（返回空页，正常）；但"有记录却没给字段列表"是接口异常：
+        # 非流式路径（build_records）此时会明确报错，流式路径也要一致——
+        # 否则下面的 index 建不出键位，取值会抛裸 KeyError，报错信息比明确的 SystemExit 难懂得多。
+        if page_ids:
+            raise SystemExit("接口返回了记录但没给字段列表，无法把值映射成英文键，已中止")
+        return []
     index = {name: i for i, name in enumerate(fields)}
     records: list[dict] = []
     for record_id, row in zip(page_ids, page_rows):

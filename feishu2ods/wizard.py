@@ -151,7 +151,7 @@ def run_init(
             if not key:
                 break
             if not IDENT_RE.match(key):
-                echo("   英文键须为 字母/数字/下划线、字母开头。")
+                echo("   英文键须为 字母/数字/下划线，且不能以数字开头。")
                 continue
             if key == "record_id":
                 echo("   record_id 是保留键（记录 ID 自动输出），换一个。")
@@ -173,7 +173,7 @@ def run_init(
         project = _ask(ask, "⑥ MaxCompute 项目", "my_project")
         if IDENT_RE.match(project):
             break
-        echo("   项目名只能是 字母/数字/下划线、字母开头。")
+        echo("   项目名只能是 字母/数字/下划线，且不能以数字开头。")
     else:
         echo("❌ 项目名连续三次无效，已取消。")
         return 1
@@ -182,7 +182,7 @@ def run_init(
         table_name = _ask(ask, "   目标表名", default_table)
         if IDENT_RE.match(table_name):
             break
-        echo("   表名只能是 字母/数字/下划线、字母开头。")
+        echo("   表名只能是 字母/数字/下划线，且不能以数字开头。")
     else:
         echo("❌ 表名连续三次无效，已取消。")
         return 1

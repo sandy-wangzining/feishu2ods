@@ -18,7 +18,7 @@ WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分�
 WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
 TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
 MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
-SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表/校验/rename）最长等待秒数，0 = 不限制
+SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表 / 校验 / 分区增删 / rename）最长等待秒数，0 = 不限制
 SQL_HEARTBEAT_SECONDS = 30  # 长 SQL 的"还在执行"心跳日志间隔
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
 
@@ -111,6 +111,10 @@ def _sql_spec(spec: str) -> str:
 
     pyodps 的 partition.name 可能已带引号（pt='20260928'），统一先去掉再补引号，
     避免生成 pt=''20260928'' 这种非法写法。
+
+    边界：当前只处理单级分区。多级分区（pt=x,region=y）会被整体当成一个值拼成
+    pt='x,region=y'（非法），需要扩展。本工具的表结构被 verify_schema 强制为单列 pt，
+    所有 spec 都由内部按 pt=<值> 构造，多级分支不可达——留此说明以免后人踩坑。
     """
     key, _, value = str(spec).partition("=")
     value = value.strip()
