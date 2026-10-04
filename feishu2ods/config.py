@@ -62,6 +62,14 @@ def _require_identifier(value, where: str) -> str:
     return text
 
 
+def _require_feishu_id(value, where: str) -> str:
+    """base_token / table_id：会拼进飞书 URL 路径，拒绝空白和 / ? #（避免路径被拆/注入）。"""
+    text = _require_text(value, where)
+    if any(ch.isspace() or ch in "/?#" for ch in text):
+        raise SystemExit(f"{where} 不能包含空白或 / ? #：{text!r}")
+    return text
+
+
 def validate_job(job: dict) -> list[str]:
     """校验 job 配置；返回未知键告警列表（不阻断）。校验失败直接 SystemExit 带字段路径。
 
@@ -74,8 +82,10 @@ def validate_job(job: dict) -> list[str]:
     if not isinstance(feishu, dict):
         raise SystemExit("作业配置缺少 feishu 块（app_id / app_secret / base_token / table_id）")
     _warn_unknown_keys(feishu, FEISHU_KEYS, "feishu", warnings)
-    for key in ("app_id", "app_secret", "base_token", "table_id"):
+    for key in ("app_id", "app_secret"):
         feishu[key] = _require_text(feishu.get(key), f"feishu.{key}")
+    for key in ("base_token", "table_id"):
+        feishu[key] = _require_feishu_id(feishu.get(key), f"feishu.{key}")
     if feishu.get("base_url") is not None:
         base_url = _require_text(feishu.get("base_url"), "feishu.base_url")
         if not base_url.startswith(("http://", "https://")):

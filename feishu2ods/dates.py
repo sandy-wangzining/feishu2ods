@@ -45,23 +45,27 @@ def env_bizdate(strict: bool = True) -> date | None:
     没必要因为调度环境变量脏了就连体检都跑不起来（那时按默认业务日继续并打警告）。
     正式同步路径必须保持 strict=True（非法业务日要报错，绝不静默回退成"昨天"）。
     """
-    raw = os.environ.get("bizdate") or os.environ.get("SKYNET_BIZDATE") or ""
-    text = raw.strip()
-    if not text:
-        return None
-    try:
-        return parse_day_arg(text)
-    except SystemExit as exc:
-        if not strict:
-            log(
-                f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；"
-                f"只读体检（--check）不写库，按默认业务日继续"
-            )
-            return None
-        raise SystemExit(
-            f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}（应为 YYYYMMDD 或 YYYY-MM-DD）；"
-            f"不打算用它请先 unset，或用 --bizdate 显式指定业务日"
-        ) from exc
+    for name in ("bizdate", "SKYNET_BIZDATE"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            if strict:
+                raise SystemExit(f"环境变量 {name} 的值为空白，无法作为业务日；请 unset 或用 --bizdate 指定")
+            log(f"  警告：环境变量 {name} 的值为空白；只读体检（--check）不写库，按默认业务日继续")
+            continue
+        try:
+            return parse_day_arg(text)
+        except SystemExit as exc:
+            if not strict:
+                log(f"  警告：环境变量 {name} 的值不是合法日期：{raw!r}；只读体检（--check）不写库，按默认业务日继续")
+                return None
+            raise SystemExit(
+                f"环境变量 {name} 的值不是合法日期：{raw!r}（应为 YYYYMMDD 或 YYYY-MM-DD）；"
+                f"不打算用它请先 unset，或用 --bizdate 显式指定业务日"
+            ) from exc
+    return None
 
 
 def resolve_bizdate(args, strict: bool = True) -> date:
@@ -96,10 +100,16 @@ def normalize_date_value(value) -> str | None:
     text = str(value or "").strip()
     match = DATE_RE.match(text)
     if match:
-        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            return None
     match = SLASH_DATE_RE.match(text)
     if match:
-        return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            return None
     return None
 
 

@@ -51,6 +51,16 @@ class OfflineTestCase(unittest.TestCase):
         secrets_patcher = mock.patch.object(utils_mod, "_SECRETS", [])
         secrets_patcher.start()
         self.addCleanup(secrets_patcher.stop)
+        warned_patcher = mock.patch.object(utils_mod, "_sink_write_warned", False)
+        warned_patcher.start()
+        self.addCleanup(warned_patcher.stop)
+        # 调度环境可能带着 bizdate / SKYNET_BIZDATE：不隔离的话默认业务日用例会吃到脏值。
+        # 只摘掉这两个键，不动 PATH/TEMP（clear=True 会弄坏临时目录/外部命令）。
+        env_patcher = mock.patch.dict(os.environ, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop("bizdate", None)
+        os.environ.pop("SKYNET_BIZDATE", None)
         # 运行锁落到临时目录：lock_path 默认把锁写到工具目录的 .run-locks/，而单测用的是临时
         # 作业路径（锁名哈希每次不同），不重定向会在仓库里无限累积锁文件、污染工作区。
         # 只改测试侧的锁根路径，生产行为不变。
@@ -420,6 +430,7 @@ class TestFreshness(OfflineTestCase):
         self.assertIsNone(dates_mod.normalize_date_value(True))
         self.assertIsNone(dates_mod.normalize_date_value("abc"))
         self.assertIsNone(dates_mod.normalize_date_value(10**30))
+        self.assertIsNone(dates_mod.normalize_date_value("2026-02-31"))
 
     def test_found(self):
         records = [{"biz_date": "2026-09-27T00:00:00.000+08:00"}]
@@ -624,6 +635,26 @@ class TestFetchRecords(OfflineTestCase):
         ):
             self.assertEqual(len(cli_mod.fetch_records(self.job_feishu, self.mapping)), 2)
 
+    def test_nonstream_extra_out_not_doubled(self):
+        pages = [
+            {
+                "code": 0,
+                "data": {
+                    "fields": ["日期", "金额", "新列"],
+                    "data": [["a", "b", "c"]],
+                    "record_id_list": ["r1"],
+                    "has_more": False,
+                },
+            }
+        ]
+        extra: list[str] = []
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
+            cli_mod.fetch_records(self.job_feishu, self.mapping, extra_out=extra)
+        self.assertEqual(extra, ["新列"])
+
 
 # ---------------------------------------------------------------------------
 # MaxCompute：DDL / 结构校验 / 写入 / 计数
@@ -681,17 +712,18 @@ class TestMc(OfflineTestCase):
         odps = _FakeOdps([self._verify_row(2, mn="r1", mx="r2")])
         records = [{"record_id": "r1", "a": 1}, {"record_id": "r2", "a": 2}]
         cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", records)
+        tmp = f"20260928{mc_mod.TMP_PARTITION_SUFFIX}"
         # 先写临时分区（删残留 tmp + 建 tmp），再删正式分区、rename 顶上；
         # 分区增删走带超时的 DDL（run_sql），表对象只负责 Tunnel 写入
         self.assertEqual([c[0] for c in table.calls], ["write"])
-        self.assertEqual(table.calls[0][1], "pt=20260928__tmp")
+        self.assertEqual(table.calls[0][1], f"pt={tmp}")
         self.assertEqual(table.rows, [['{"record_id":"r1","a":1}'], ['{"record_id":"r2","a":2}']])
         sqls = "\n".join(odps.sqls)
-        self.assertIn("drop if exists partition (pt='20260928__tmp')", sqls)
-        self.assertIn("add if not exists partition (pt='20260928__tmp')", sqls)
+        self.assertIn(f"drop if exists partition (pt='{tmp}')", sqls)
+        self.assertIn(f"add if not exists partition (pt='{tmp}')", sqls)
         self.assertIn("drop if exists partition (pt='20260928')", sqls)
         self.assertIn("rename to partition (pt='20260928')", sqls)
-        self.assertIn("pt='20260928__tmp'", odps.sql)
+        self.assertIn(f"pt='{tmp}'", odps.sql)
 
     def test_write_partition_retry(self):
         table = _FakeTable(fail_first_write=True)
@@ -755,14 +787,15 @@ class TestMc(OfflineTestCase):
                 cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
         self.assertIn("正式分区可能已被删掉", str(ctx.exception))
         # 失败后尽力清掉临时分区（最后一步是 drop tmp 的分区 DDL）
-        self.assertIn("drop if exists partition (pt='20260928__tmp')", odps.sqls[-1])
+        tmp = f"20260928{mc_mod.TMP_PARTITION_SUFFIX}"
+        self.assertIn(f"drop if exists partition (pt='{tmp}')", odps.sqls[-1])
 
     def test_write_partition_cleanup_failure_keeps_error(self):
         table = mock.Mock()
         odps = _FakeOdps([self._verify_row(1, mn="r1")])
 
         def drop(o, project, table_name, spec, timeout=None):
-            if spec.endswith("__tmp"):
+            if mc_mod.TMP_PARTITION_SUFFIX in spec:
                 raise RuntimeError("delete boom")
 
         with mock.patch.object(mc_mod, "drop_partition", side_effect=drop):
@@ -771,20 +804,44 @@ class TestMc(OfflineTestCase):
         self.assertIn("正式分区未动", str(ctx.exception))
         self.assertIn("残留", str(ctx.exception))
 
+    def test_write_partition_verify_systemexit_still_cleans_tmp(self):
+        table = _FakeTable()
+        odps = _FakeOdps([self._verify_row(1, mn="r1")])
+        with mock.patch.object(mc_mod, "verify_partition", side_effect=SystemExit("核对失败")):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
+        self.assertIn("核对失败", str(ctx.exception))
+        tmp = f"20260928{mc_mod.TMP_PARTITION_SUFFIX}"
+        self.assertIn(f"drop if exists partition (pt='{tmp}')", odps.sqls[-1])
+
     def test_purge_stale_tmp_partitions(self):
         table = _FakeTable()
-        table.partitions = [_Part("pt='20260927__tmp'"), _Part("pt='20260928'"), _Part("pt='20260929__tmp'")]
+        mine = f"pt='20260927{mc_mod.TMP_PARTITION_SUFFIX}'"
+        other = "pt='20260929__tmp_otherhost_1'"
+        legacy = "pt='20260926__tmp'"
+        table.partitions = [_Part(mine), _Part("pt='20260928'"), _Part(other), _Part(legacy)]
         odps = _FakeOdps([])
         cli_mod.purge_stale_tmp_partitions(odps, table, "p", "t")
         sqls = "\n".join(odps.sqls)
-        self.assertIn("drop if exists partition (pt='20260927__tmp')", sqls)
-        self.assertIn("drop if exists partition (pt='20260929__tmp')", sqls)
+        # 历史残留（含其它机器/其它 pid 与旧版无 run id 的 __tmp）统一清理：
+        # 不清理会让 max_pt() 读到 __tmp 半成品；跨机并发不受支持（锁只保证单机互斥）
+        self.assertIn("drop if exists partition (pt='20260929__tmp_otherhost_1')", sqls)
+        self.assertIn("drop if exists partition (pt='20260926__tmp')", sqls)
+        self.assertNotIn(f"pt='20260927{mc_mod.TMP_PARTITION_SUFFIX}'", sqls)  # 本进程自己的后缀不动
         self.assertNotIn("20260928", sqls)  # 正式分区不动
 
     def test_sql_spec_normalizes_quotes(self):
         self.assertEqual(mc_mod._sql_spec("pt=20260928"), "pt='20260928'")
         self.assertEqual(mc_mod._sql_spec("pt='20260928'"), "pt='20260928'")
         self.assertEqual(mc_mod._sql_spec('pt="20260928"'), "pt='20260928'")
+
+    def test_sql_spec_rejects_bad_key_and_empty_value(self):
+        with self.assertRaises(SystemExit):
+            mc_mod._sql_spec("pt=")
+        with self.assertRaises(SystemExit):
+            mc_mod._sql_spec("pt;drop=20260928")
+        with self.assertRaises(SystemExit):
+            mc_mod._sql_spec("=20260928")
 
     def test_verify_partition(self):
         odps = _FakeOdps([{"cnt": 3, "ucnt": 3, "mn": "a", "mx": "c"}])
@@ -826,6 +883,14 @@ class TestRunLock(OfflineTestCase):
                         pass
             with utils_mod.RunLock(path):  # 释放之后可以再次拿到
                 pass
+
+    def test_exit_clears_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            lock = utils_mod.RunLock(path)
+            with lock:
+                self.assertIsNotNone(lock.fh)
+            self.assertIsNone(lock.fh)
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1630,10 @@ class TestRedact(OfflineTestCase):
         self.assertNotIn("sk-live-abcdef123456", out)
         self.assertIn("***", out)
 
+    def test_redact_secrets_skips_short_and_non_str(self):
+        out = utils_mod.redact_secrets(["ok", "1", 12345, None], "status=ok code=1")
+        self.assertEqual(out, "status=ok code=1")
+
     def test_shape_bearer(self):
         out = utils_mod.redact("Authorization: Bearer sk-abcdef123456")
         self.assertNotIn("sk-abcdef123456", out)
@@ -1602,6 +1671,10 @@ class TestRedact(OfflineTestCase):
     def test_empty_and_none(self):
         self.assertEqual(utils_mod.redact(""), "")
         self.assertIsNone(utils_mod.redact(None))
+
+    def test_redact_skips_short_registered_secrets(self):
+        utils_mod._SECRETS.append("ok")
+        self.assertEqual(utils_mod.redact("status=ok"), "status=ok")
 
 
 class TestCollectSecretValues(OfflineTestCase):
@@ -1690,10 +1763,18 @@ class TestLogFile(OfflineTestCase):
             def flush(self):
                 pass
 
+            def close(self):
+                pass
+
         sink = BrokenSink()
         utils_mod.add_log_sink(sink)
         try:
-            utils_mod.log("照常输出")  # 不该抛
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                utils_mod.log("照常输出")  # 不该抛
+                utils_mod.log("第二次仍不抛")
+            warning = err.getvalue()
+            self.assertIn("log-file 写入失败", warning)
+            self.assertEqual(warning.count("log-file 写入失败"), 1)
         finally:
             utils_mod.remove_log_sink(sink)
 
@@ -1705,6 +1786,11 @@ class TestLogFile(OfflineTestCase):
             self.assertEqual(len(utils_mod._sinks), 0)  # 句柄已摘掉，重复调用不串
             self.assertTrue(log_path.is_file())
             self.assertIn("--job", log_path.read_text(encoding="utf-8"))
+
+    def test_main_log_file_directory_returns_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = cli_mod.main(["--job", "x", "--log-file", tmp])
+        self.assertEqual(rc, 1)
 
 
 class TestSqlTimeout(OfflineTestCase):
@@ -1718,6 +1804,13 @@ class TestSqlTimeout(OfflineTestCase):
         with self.assertRaises(SystemExit) as ctx:
             cli_mod.parse_args(["--job", "x", "--sql-timeout", "-5"])
         self.assertEqual(ctx.exception.code, 2)
+
+    def test_main_parse_args_error_returns_code(self):
+        logs = []
+        with mock.patch.object(cli_mod, "log", logs.append):
+            rc = cli_mod.main(["--job", "x", "--sql-timeout", "-5"])
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("退出码 2" in str(line) for line in logs), logs)
 
     def test_run_sql_with_timeout_success(self):
         odps = _FakeOdps([{"cnt": 1}])
@@ -1939,7 +2032,11 @@ class TestBizdateMore(OfflineTestCase):
 
     def test_env_bizdate_empty_string(self):
         with mock.patch.dict(os.environ, {"bizdate": ""}, clear=True):
-            self.assertIsNone(dates_mod.env_bizdate())
+            with self.assertRaises(SystemExit) as ctx:
+                dates_mod.env_bizdate()
+            self.assertIn("空白", str(ctx.exception))
+        with mock.patch.dict(os.environ, {"bizdate": ""}, clear=True):
+            self.assertIsNone(dates_mod.env_bizdate(strict=False))
 
     def test_env_skynet_fallback(self):
         with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "20260928"}, clear=True):
@@ -1961,6 +2058,21 @@ class TestBizdateMore(OfflineTestCase):
             self.assertIsNone(dates_mod.env_bizdate(strict=False))
         with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "2026-9-7"}, clear=True):
             self.assertIsNone(dates_mod.env_bizdate(strict=False))
+
+    def test_env_whitespace_bizdate_does_not_shadow_skynet_non_strict(self):
+        """空白 bizdate 不得用 or 短路挡住合法的 SKYNET_BIZDATE（非严格可回落到后者）。"""
+        with mock.patch.dict(os.environ, {"bizdate": "   ", "SKYNET_BIZDATE": "20260928"}, clear=True):
+            self.assertEqual(dates_mod.env_bizdate(strict=False), date(2026, 9, 28))
+
+    def test_env_whitespace_bizdate_strict_errors(self):
+        with mock.patch.dict(os.environ, {"bizdate": "   ", "SKYNET_BIZDATE": "20260928"}, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                dates_mod.env_bizdate(strict=True)
+            self.assertIn("空白", str(ctx.exception))
+        args = make_args(bizdate="")
+        with mock.patch.dict(os.environ, {"bizdate": "  "}, clear=True):
+            with self.assertRaises(SystemExit):
+                dates_mod.resolve_bizdate(args, strict=True)
 
     def test_resolve_bizdate_non_strict_falls_back_to_default(self):
         class _FixedDatetime(datetime):
@@ -2097,6 +2209,24 @@ class TestValidateJobMore(OfflineTestCase):
         config_mod.validate_job(job)
         self.assertEqual(job["feishu"]["app_id"], "cli_x")
 
+    def test_base_token_rejects_url_metachar(self):
+        job = make_job()
+        job["feishu"]["base_token"] = "IC/x"
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+        job = make_job()
+        job["feishu"]["table_id"] = "tbl x"
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+        job = make_job()
+        job["feishu"]["table_id"] = "tbl?x"
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+        job = make_job()
+        job["feishu"]["base_token"] = "IC#x"
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
 
 class TestNormalizeDateMore(OfflineTestCase):
     def test_iso_with_millis_and_tz(self):
@@ -2127,6 +2257,11 @@ class TestNormalizeDateMore(OfflineTestCase):
 
     def test_whitespace_trimmed(self):
         self.assertEqual(dates_mod.normalize_date_value(" 2026-09-27 "), "2026-09-27")
+
+    def test_invalid_calendar_dates_rejected(self):
+        self.assertIsNone(dates_mod.normalize_date_value("2026-02-31"))
+        self.assertIsNone(dates_mod.normalize_date_value("2026-13-01"))
+        self.assertIsNone(dates_mod.normalize_date_value("2026/9/31"))
 
 
 class TestBuildRecordsMore(OfflineTestCase):
@@ -2285,6 +2420,65 @@ class TestRunLockMore(OfflineTestCase):
             a = pathlib.Path(tmp) / "jobs" / "a" / "demo.json"
             b = pathlib.Path(tmp) / "jobs" / "b" / "demo.json"
             self.assertNotEqual(cli_mod.lock_path(a), cli_mod.lock_path(b))
+
+    def test_lock_path_resolves_before_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = pathlib.Path(tmp) / "demo.json"
+            real.write_text("{}", encoding="utf-8")
+            via_dot = pathlib.Path(tmp) / "." / "demo.json"
+            self.assertEqual(cli_mod.lock_path(via_dot).name, cli_mod.lock_path(real).name)
+
+    def test_lock_open_unicode_error_is_systemexit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+            with mock.patch("builtins.open", side_effect=err):
+                with self.assertRaises(SystemExit) as ctx:
+                    utils_mod.RunLock(path).__enter__()
+            self.assertIn("无法创建运行锁", str(ctx.exception))
+
+    def test_lock_marker_write_failure_still_released(self):
+        """拿到锁之后写标记失败（含非 OSError）仍要释放，否则下次运行会误判占用。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            real_open = open
+
+            def wrapping_open(*args, **kwargs):
+                handle = real_open(*args, **kwargs)
+                if pathlib.Path(args[0]) == path:
+
+                    def boom(_data):
+                        raise UnicodeEncodeError("ascii", "主机", 0, 1, "strict")
+
+                    handle.write = boom
+                return handle
+
+            with mock.patch("builtins.open", wrapping_open):
+                with utils_mod.RunLock(path):
+                    pass
+            with utils_mod.RunLock(path):
+                pass
+
+    def test_lock_post_acquire_error_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "x.lock"
+            real_open = open
+
+            def wrapping_open(*args, **kwargs):
+                handle = real_open(*args, **kwargs)
+                if pathlib.Path(args[0]) == path:
+
+                    def boom(_data):
+                        raise RuntimeError("marker boom")
+
+                    handle.write = boom
+                return handle
+
+            with mock.patch("builtins.open", wrapping_open):
+                with self.assertRaises(RuntimeError):
+                    utils_mod.RunLock(path).__enter__()
+            with utils_mod.RunLock(path):
+                pass
 
     def test_lock_path_same_job_same_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2517,6 +2711,23 @@ class TestReviewHardening(OfflineTestCase):
         ddl2 = mc_mod.build_ddl("p", "t", "json", "it's")
         self.assertIn("it''s", ddl2)
 
+    def test_ddl_and_partition_reject_bad_identifiers(self):
+        """库入口自己校验标识符，不依赖 validate_job。"""
+        bad = "p;drop"
+        with self.assertRaises(SystemExit) as ctx:
+            mc_mod.build_ddl(bad, "t", "json", "c")
+        self.assertIn("标识符", str(ctx.exception))
+        o = mock.Mock()
+        for fn in (
+            lambda: mc_mod.ensure_table(o, bad, "t", "json", "c"),
+            lambda: mc_mod.drop_partition(o, bad, "t", "pt=20260928"),
+            lambda: mc_mod.add_partition(o, "p", "t-1", "pt=20260928"),
+            lambda: mc_mod.rename_partition(o, "p", "t;x", "pt=20260928__tmp", "pt=20260928"),
+        ):
+            with self.assertRaises(SystemExit):
+                fn()
+        o.run_sql.assert_not_called()
+
     def test_sql_spec_escapes_server_side_value(self):
         """purge 场景的 spec 来自服务端 partition.name：转义不能少。"""
         self.assertEqual(mc_mod._sql_spec("pt=20260928__tmp"), "pt='20260928__tmp'")
@@ -2670,6 +2881,31 @@ class TestReviewHardening(OfflineTestCase):
                 cli_mod.run_sync(make_args(), job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertIn("freshness 必须是对象", str(ctx.exception))
 
+    def test_lag_days_zero_is_not_treated_as_missing(self):
+        job = make_job()
+        job["freshness"] = {"date_field": "biz_date", "lag_days": 0}
+        records = [{"record_id": "r1", "biz_date": "2026-09-26"}]
+        messages: list[str] = []
+        args = make_args(skip_freshness=False, no_notify=True, dry_run=True)
+        with (
+            mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
+            mock.patch.object(cli_mod, "log", side_effect=lambda m: messages.append(str(m))),
+        ):
+            code = cli_mod.run_sync(args, job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertEqual(code, 0)
+        self.assertTrue(any("晚一天出数" in m for m in messages), messages)
+        self.assertFalse(any("业务日 - 0 天" in m for m in messages), messages)
+
+    def test_lag_days_must_be_non_negative_int(self):
+        job = make_job()
+        job["freshness"] = {"date_field": "biz_date", "lag_days": "1"}
+        with mock.patch.object(
+            cli_mod, "fetch_records", side_effect=fetch_stub([{"record_id": "r1", "biz_date": "2026-09-28"}])
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.run_sync(make_args(), job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertIn("lag_days", str(ctx.exception))
+
     def test_int_exit_code_is_logged(self):
         """运行期抛出的 int SystemExit 必须留痕（原来既不打印也不写日志，--log-file 里一字没有）。"""
         logs = []
@@ -2753,7 +2989,7 @@ class TestReviewHardening(OfflineTestCase):
         self.assertEqual(job["maxcompute"]["endpoint"], "http://mc.example/api")
 
     def test_wizard_file_is_created_with_600(self):
-        """生成的文件含明文密钥：先按 0600 创建再写入（不留 0644 可读窗口期）。"""
+        """生成的文件含明文密钥：写临时文件再 replace，不 O_TRUNC 截断正在用的作业文件。"""
         fields = ["日期"]
 
         def fake_fetch(feishu):
@@ -2764,7 +3000,6 @@ class TestReviewHardening(OfflineTestCase):
         )
         fake_os = mock.Mock(wraps=wizard_mod.os)
         fake_os.name = "posix"
-        fake_os.O_WRONLY, fake_os.O_CREAT, fake_os.O_TRUNC = os.O_WRONLY, os.O_CREAT, os.O_TRUNC
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp) / "w6.json"
             with mock.patch.object(wizard_mod, "os", fake_os):
@@ -2778,8 +3013,12 @@ class TestReviewHardening(OfflineTestCase):
                 )
             self.assertEqual(code, 0)
             self.assertTrue(out.is_file())
-        open_call = next(call for call in fake_os.open.call_args_list if os.fspath(call.args[0]) == str(out))
-        self.assertEqual(open_call.args[2], 0o600)
+        live_opens = [call for call in fake_os.open.call_args_list if call.args and os.fspath(call.args[0]) == str(out)]
+        self.assertEqual(live_opens, [])  # 不得 O_TRUNC 打开正在用的作业文件
+        self.assertTrue(fake_os.replace.called)
+        chmod_calls = [call for call in fake_os.chmod.call_args_list if os.fspath(call.args[0]) == str(out)]
+        self.assertTrue(chmod_calls)
+        self.assertEqual(chmod_calls[-1].args[1], 0o600)
 
 
 if __name__ == "__main__":

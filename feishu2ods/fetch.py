@@ -121,7 +121,7 @@ def fetch_records(
                         "Base 里找不到 fields 映射的列：" + "、".join(missing) + "（列名可能被改名/删除，请核对）"
                     )
                 extra = [name for name in fields if name and name not in mapping]
-                if extra:
+                if extra and stream:
                     log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
                     if extra_out is not None:
                         extra_out.extend(extra)

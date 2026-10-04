@@ -9,8 +9,9 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
 
-from .config import DEFAULT_COLUMN, IDENT_RE, validate_job
+from .config import DEFAULT_COLUMN, DEFAULT_FRESHNESS_LAG_DAYS, IDENT_RE, validate_job
 from .fetch import fetch_field_sample
 from .mc import DEFAULT_ENDPOINT
 
@@ -239,7 +240,7 @@ def run_init(
         else:
             webhook = ""
             echo("   连续三次格式不对，先留空（之后可在 job 文件里补 freshness.webhook）。")
-        freshness = {"date_field": date_field, "lag_days": 0}
+        freshness = {"date_field": date_field, "lag_days": DEFAULT_FRESHNESS_LAG_DAYS}
         if webhook:
             freshness["webhook"] = webhook
 
@@ -268,17 +269,27 @@ def run_init(
         return 1
 
     out = pathlib.Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
+    tmp_name = None
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        # 文件含 app_secret/AK/SK 明文：先按 0600 创建再写入（write_text 会先按默认 umask
-        # （通常 0644）创建、再 chmod，中间存在同机其他用户可读的窗口期）；
-        # newline="\n"：生成的文件固定 LF，Windows 上跑出来的也能直接给服务器用
-        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # 文件含 app_secret/AK/SK 明文：先写同目录临时文件再 os.replace，避免 O_TRUNC
+        # 先截断正在用的作业文件——写到一半崩溃会把密钥配置抹成空文件。
+        # mkstemp 默认 0600；newline="\n"：生成的文件固定 LF，Windows 上跑出来的也能给服务器用
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, out)
+        tmp_name = None
         if os.name != "nt":
             os.chmod(out, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
     except OSError as exc:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
         echo(f"❌ 写文件失败：{exc}")
         return 1
     echo("")

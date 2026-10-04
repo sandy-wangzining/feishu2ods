@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import socket
 import time
 
 from .config import IDENT_RE
@@ -18,23 +20,32 @@ except ImportError:  # pragma: no cover - 离线测试环境可以不带 pyodps
 PARTITION_COLUMN = "pt"  # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
 WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分区重写）
 WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
-TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename 成正式分区（缩短下游可见窗口）
+
+
+def _tmp_run_id() -> str:
+    """本进程的临时分区标记：主机名 + pid，避免两台机器共用同一个 __tmp 名互相覆盖。"""
+    host = re.sub(r"[^A-Za-z0-9_]", "_", socket.gethostname() or "host")[:32] or "host"
+    return f"{host}_{os.getpid()}"
+
+
+TMP_RUN_ID = _tmp_run_id()
+TMP_PARTITION_SUFFIX = f"__tmp_{TMP_RUN_ID}"  # 写库用临时分区后缀（含本机本进程标记）
 MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
 SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表 / 校验 / 分区增删 / rename）最长等待秒数，0 = 不限制
 SQL_HEARTBEAT_SECONDS = 30  # 长 SQL 的"还在执行"心跳日志间隔
 # https：作业没写 endpoint 时 AK/SK 签名与查询结果不能走明文 HTTP
 DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
 # 分区值白名单：pt 恒为 8 位业务日（用 [0-9] 而不是 \d：\d 还认全角/阿拉伯-印度数字），
-# 写入期的临时分区在 pt 后带 __tmp 后缀
+# 写入期的临时分区在 pt 后带 __tmp 或 __tmp_<run> 后缀
 _PT_RE = re.compile(r"\A[0-9]{8}\Z")
-_TMP_PT_RE = re.compile(r"\A[0-9]{8}__tmp\Z")
+_TMP_PT_RE = re.compile(r"\A[0-9]{8}__tmp(?:_[A-Za-z0-9_]+)?\Z")
 
 
 def _require_pt(pt, *, tmp_ok: bool = False) -> str:
     """分区值形态校验（写库、count、核对统一从这里过）。"""
     text = str(pt)
     if not (_PT_RE.match(text) or (tmp_ok and _TMP_PT_RE.match(text))):
-        suffix = "（写入期可带 __tmp 后缀）" if tmp_ok else ""
+        suffix = "（写入期可带 __tmp 或 __tmp_<主机_pid> 后缀）" if tmp_ok else ""
         raise SystemExit(f"分区值必须是 8 位业务日{suffix}：{text!r}")
     return text
 
@@ -94,7 +105,10 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
 # MaxCompute：建表 / 结构校验 / 写分区（临时分区 + 原子替换）/ 写后校验
 # =============================================================================
 def build_ddl(project: str, table: str, column: str, comment: str) -> str:
-    """目标表 DDL：单列 string + pt 分区 + 表注释（标识符已在 validate_job 校验过）。"""
+    """目标表 DDL：单列 string + pt 分区 + 表注释（标识符入口再校验，不依赖调用方）。"""
+    project = _require_identifier(project, "target.project")
+    table = _require_identifier(table, "target.table")
+    column = _require_identifier(column, "target.column")
     # comment 来自作业配置（用户可任意编辑）：反斜杠是 MaxCompute 字符串字面量里的转义符，
     # 只替换单引号不够——结尾的 "\" 会吃掉收尾引号、把后续内容当 SQL 解析。先转义反斜杠
     table_comment = comment or "飞书多维表格记录 JSON 原样落库（写临时分区后原子替换 pt=<业务日>）"
@@ -118,6 +132,9 @@ def connect_odps(maxcompute: dict, project: str):
 
 def ensure_table(o, project: str, table: str, column: str, comment: str, timeout: int = SQL_TIMEOUT_SECONDS):
     """不存在则建表；存在返回表对象（结构校验由 verify_schema 负责）。"""
+    project = _require_identifier(project, "target.project")
+    table = _require_identifier(table, "target.table")
+    column = _require_identifier(column, "target.column")
     run_sql_with_timeout(o, build_ddl(project, table, column, comment), timeout=timeout, desc=f"建表 {table}")
     return o.get_table(table)
 
@@ -155,15 +172,18 @@ def _sql_spec(spec: str) -> str:
     所有 spec 都由内部按 pt=<值> 构造，多级分支不可达——留此说明以免后人踩坑。
     """
     key, _, value = str(spec).partition("=")
+    key = key.strip()
+    if not IDENT_RE.match(key):
+        raise SystemExit(f"分区字段名不是合法标识符：{key!r}（来自 {spec!r}）")
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         value = value[1:-1]
-    if key and value:
-        # 防御性转义：spec 多数由内部按 pt=<值> 构造，但 purge_stale_tmp_partitions 的
-        # spec 来自服务端的 partition.name——反斜杠/引号不能原样拼进 DDL
-        escaped = value.replace("\\", "\\\\").replace("'", "''")
-        return f"{key}='{escaped}'"
-    return spec
+    if not value:
+        raise SystemExit(f"分区值不能为空：{spec!r}")
+    # 防御性转义：spec 多数由内部按 pt=<值> 构造，但 purge_stale_tmp_partitions 的
+    # spec 来自服务端的 partition.name——反斜杠/引号不能原样拼进 DDL
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"{key}='{escaped}'"
 
 
 def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
@@ -173,6 +193,8 @@ def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = S
     卡住时同样会无限挂起、一直占着运行锁。`IF EXISTS` 提供与 `delete_partition(if_exists=True)`
     一致的幂等语义（分区不存在也不报错）。
     """
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
     run_sql_with_timeout(
         o,
         f"alter table {project}.{table_name} drop if exists partition ({_sql_spec(spec)})",
@@ -186,6 +208,8 @@ def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQ
 
     `IF NOT EXISTS` 提供与 `create_partition(if_not_exists=True)` 一致的幂等语义（分区已存在不报错）。
     """
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
     run_sql_with_timeout(
         o,
         f"alter table {project}.{table_name} add if not exists partition ({_sql_spec(spec)})",
@@ -202,6 +226,8 @@ def rename_partition(
     「删旧分区 + rename」之间只有两条 DDL 的空窗，远比「先删再填」整段写入短；
     写入期间旧快照一直可读，下游不会读到空/半截分区。
     """
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
     run_sql_with_timeout(
         o,
         f"alter table {project}.{table_name} "
@@ -295,33 +321,39 @@ def write_partition(
             rename_partition(o, project, table_name, tmp_spec, final_spec, timeout=timeout)
 
         last: Exception | None = None
-        for attempt in range(1, WRITE_ATTEMPTS + 1):
-            try:
-                once()
-                return
-            except Exception as exc:  # noqa: BLE001 - 统一重试并给出「重跑可修复」的结论
-                last = exc
-                if attempt < WRITE_ATTEMPTS:
-                    log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
-                    time.sleep(WRITE_RETRY_DELAY)
-        # 尽力清掉临时分区：留在表里的 tmp 值（如 20260928__tmp）字符串序大于正式分区，下游
-        # 用 max_pt() 取最新分区时可能读到半成品；清理失败只多打一条告警，不改变失败结论
+        success = False
         tmp_cleaned = True
         try:
-            drop_partition(o, project, table_name, tmp_spec, timeout=timeout)
-        except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
-            tmp_cleaned = False
-            log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
-        leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
-        if final_deleted:
-            raise SystemExit(
-                f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
-                f"{leftover}重跑本作业即可恢复）：{redact(last)}"
-            )
-        raise SystemExit(
-            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
-            f"{leftover}重跑本作业即可修复）：{redact(last)}"
-        )
+            for attempt in range(1, WRITE_ATTEMPTS + 1):
+                try:
+                    once()
+                    success = True
+                    return
+                except Exception as exc:  # noqa: BLE001 - 统一重试并给出「重跑可修复」的结论
+                    last = exc
+                    if attempt < WRITE_ATTEMPTS:
+                        log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
+                        time.sleep(WRITE_RETRY_DELAY)
+        finally:
+            # 失败（含 verify 抛 SystemExit / KeyboardInterrupt）都尽力清掉本轮临时分区：
+            # 只捕 Exception 会把 SystemExit 漏掉，tmp 分区留在表里、下游 max_pt() 可能读到半成品
+            if not success:
+                try:
+                    drop_partition(o, project, table_name, tmp_spec, timeout=timeout)
+                except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
+                    tmp_cleaned = False
+                    log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
+                if last is not None:
+                    leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
+                    if final_deleted:
+                        raise SystemExit(
+                            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
+                            f"{leftover}重跑本作业即可恢复）：{redact(last)}"
+                        ) from last
+                    raise SystemExit(
+                        f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
+                        f"{leftover}重跑本作业即可修复）：{redact(last)}"
+                    ) from last
     finally:
         if _temp_spool is not None:
             _temp_spool.close()
@@ -340,15 +372,18 @@ def count_partition(o, project: str, table_name: str, pt: str, timeout: int = SQ
 
 
 def purge_stale_tmp_partitions(o, table, project: str, table_name: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
-    """清掉历史失败残留的 __tmp 临时分区（正式写入之前调用）。
+    """清掉历史失败残留的临时分区（正式写入之前调用）。
 
-    残留的 tmp 分区值（如 20260927__tmp）在字符串序上大于同日期正式分区，会让下游
-    用 max_pt() 时读到半成品；每次正式运行前统一清一遍，避免一次中断长时间污染下游。
+    残留的 tmp 分区值（如 20260927__tmp_iZxxx_123，旧版则是 20260927__tmp）在字符串序上
+    大于同日期正式分区，会让下游用 max_pt() 时读到半成品；每次正式运行前统一清一遍——
+    含其它机器/其它 pid 的历史残留：运行锁只保证单机互斥、正式调度固定跑一台机器
+    （见 README），跨机并发不受支持，残留不清理的危害远大于误删在写分区的代价。
+    本进程自己的后缀在此时不可能存在（它在写库阶段才创建），显式排除以防万一。
     删除同样走带超时的 DDL（pyodps 的 table.delete_partition 不限时，卡住会挂死整个任务）。
     """
     for part in list(table.partitions):
         spec = str(part.name)
-        if TMP_PARTITION_SUFFIX in spec:
+        if "__tmp" in spec and TMP_PARTITION_SUFFIX not in spec:
             log(f"  清理残留临时分区：{table_name} {spec}")
             drop_partition(o, project, table_name, spec, timeout=timeout)
 

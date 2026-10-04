@@ -130,6 +130,34 @@
 - **控制台补丁与编码兜底加固**：`_console_patched` 的 check-then-set 放进锁里（多线程首次
   调用不再重复 reconfigure）；`setup_console` 的异常捕获收窄到"流不支持 reconfigure"
   （含 `io.UnsupportedOperation`，它是 OSError/ValueError 的子类），不再吞掉编程错误。
+- **临时分区名带"本机+进程"标记，purge 统一清理所有 `__tmp` 残留**：写入期临时分区从
+  `pt=20260928__tmp` 改为 `pt=20260928__tmp_<主机>_<pid>`；写库前的清理会清掉**所有**
+  `__tmp*` 历史残留（含旧版无标记的），避免残留分区字符串序大于正式分区、被下游 max_pt()
+  读到半成品——运行锁只保证单机互斥、正式调度固定一台机器（见 README），跨机并发不受支持。
+- **写分区失败（含校验 SystemExit / Ctrl+C）也保证清理本轮临时分区**：原来重试循环只 catch
+  Exception，SystemExit/KeyboardInterrupt 会跳过 tmp 清理、失败说明也不带"重跑可修复"结论；
+  现在 finally 统一清理，并 `from last` 保留原始异常链。
+- **拉数之后的整段流程统一收口落盘文件**：notify / 统计 / 新鲜度校验抛异常时不再泄漏 spool
+  句柄（原来 try/finally 只包写库段）；dry-run 走同一个删除路径。
+- **`main` 的参数与日志文件错误也进统一日志出口**：parse_args / --log-file 的 SystemExit
+  原来在 try 之外（注释声称的分支不可达），现在参数错也有带时间戳的日志；`--help/--version`
+  的退出码 0 原样放行。
+- **运行锁加固**：锁名先 `resolve()` 再哈希（同一作业的不同写法命中同一把锁）；POSIX 上
+  `O_NOFOLLOW`（锁路径是符号链接时拒绝跟随，避免 truncate 破坏任意文件）；拿到锁后任何异常
+  都会释放并置空句柄；`__exit__` 幂等（重复调用不再对已关闭句柄操作）。
+- **环境变量 bizdate/SKYNET_BIZDATE 逐个尝试**：第一个非法不再跳过第二个；空白值在严格模式
+  （正式同步）下直接报错（避免静默写错 pt），只读体检（--check）按未设置继续并告警。
+- **日期值规范化校验真实日历日期**（2026-13-99、2026/2/30 不再当成合法日期）；
+  `freshness.lag_days` 在 run_sync 也做非负整数校验。
+- **`base_token`/`table_id` 拒绝 URL 元字符**（空白、`/ ? #`——它们会直接拼进接口 URL 路径）。
+- **`_sql_spec` 与分区 DDL 补校验**：分区字段名必须是合法标识符、值不能为空；DDL 与
+  drop/add/rename 入口统一补 `_require_identifier`（不再依赖调用方先校验）。
+- **向导写配置改为原子写**：mkstemp（0600）+ fsync + `os.replace`，写到一半崩溃不会把已有
+  作业文件（含明文密钥）截断。
+- **日志与脱敏**：`--log-file` 写入失败向 stderr 提示一次；短于 `_SECRET_MIN_LEN` 的登记
+  密钥值不再参与值级替换（`1`/`ok` 这类会把正常文本搅乱）；`remove_log_sink` 收窄异常。
+- **fetch：非流式模式的未映射列不再重复收集**（原来告警打两遍、extra_out 出现重复列名）。
+- **spool.close 幂等**（重复调用是空操作）。
 
 ### 功能
 
@@ -170,6 +198,10 @@
   悄悄不一致）；`TestSpoolWriter` 的 spool 创建即登记 `addCleanup`（断言失败也保证临时文件
   与句柄回收）。另核实：报告中"_SECRETS 追加无清理会跨用例污染"不成立——测试基类已按用例把
   `utils._SECRETS` patch 成独立列表并还原，无需修改。
+- **第二次复审批次的回归用例**：purge 全量清理（含其它主机/旧版 `__tmp` 残留、本进程后缀除外）、
+  写分区遇 SystemExit 仍清临时分区、锁名先 resolve 再哈希、非流式 `extra_out` 不重复、
+  utf-16 JSON 错误体、`code=null`/"0" 视为成功、`base_token` 元字符拒绝、真实日历日期校验、
+  空白 bizdate 语义（严格报错 / 体检容忍）、原子写（不 O_TRUNC 在用文件）等（离线用例 266 → 285）。
 
 ### 工程
 

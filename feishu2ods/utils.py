@@ -30,6 +30,7 @@ _SECRETS: list[str] = []  # 日志脱敏用（job 里读到的密钥值）
 _console_patched = False
 _lock = threading.Lock()
 _sinks: list = []  # 日志文件副本（--log-file）；句柄由调用方负责关闭
+_sink_write_warned = False  # --log-file 写入失败只向 stderr 提示一次，避免刷屏
 
 
 def setup_console() -> None:
@@ -56,12 +57,13 @@ def remove_log_sink(handle) -> None:
     with _lock:
         if handle in _sinks:
             _sinks.remove(handle)
+    closer = getattr(handle, "close", None)
+    if not callable(closer):
+        return
     try:
-        handle.close()
-    except ValueError:
+        closer()
+    except (OSError, ValueError):
         # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
-        pass
-    except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
         pass
 
 
@@ -72,6 +74,7 @@ def log(msg: str) -> None:
     绝不影响控制台输出与主流程（磁盘满/句柄被关都不该让同步任务挂掉）。
     """
     global _console_patched
+    global _sink_write_warned
     if not _console_patched:
         # check-then-set 放进锁里：多线程首次调用时不会重复执行 setup_console
         # （TextIOWrapper.reconfigure 不是线程安全的）
@@ -90,8 +93,13 @@ def log(msg: str) -> None:
             try:
                 handle.write(line + "\n")
                 handle.flush()
-            except Exception:  # noqa: BLE001 - 日志文件问题不影响主流程
-                pass
+            except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程
+                if not _sink_write_warned:
+                    _sink_write_warned = True
+                    print(
+                        f"警告：--log-file 写入失败（后续同类错误不再重复提示）：{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
 
 
 # =============================================================================
@@ -197,10 +205,10 @@ def _redact_shapes(text: str) -> str:
 
     def _json(match: re.Match) -> str:
         """JSON/配置片段里的 "key": "value"：只吃字符串值，保留引号结构。"""
-        quote = match.group("q")
+        qchar = match.group("q")
         prefix, value = match.group(1), match.group(4)
         if _is_sensitive_key(match.group(2)):
-            return f"{prefix}{quote}***{quote}"
+            return f"{prefix}{qchar}***{qchar}"
         # 值本身可能是"被 JSON 编码成字符串的一整段 JSON"：内层引号是 \"，任何按引号认
         # 边界的规则都匹配不到。反转义 → 脱敏 → 再转义回去
         if '\\"' in value:
@@ -211,9 +219,9 @@ def _redact_shapes(text: str) -> str:
             if decoded is not None:
                 redacted = _redact_shapes(decoded)
                 if redacted != decoded:
-                    return f"{prefix}{quote}{json.dumps(redacted, ensure_ascii=False)[1:-1]}{quote}"
+                    return f"{prefix}{qchar}{json.dumps(redacted, ensure_ascii=False)[1:-1]}{qchar}"
         # 键名不敏感时值里也可能藏着密钥（'X-Api-Key: xxx' 头行、查询串、嵌套结构），递归一次
-        return f"{prefix}{quote}{_redact_shapes(value)}{quote}"
+        return f"{prefix}{qchar}{_redact_shapes(value)}{qchar}"
 
     def _query(match: re.Match) -> str:
         """URL 查询串 / `key=value`：命中密钥词才替换，其余递归兜底。"""
@@ -272,7 +280,8 @@ def redact(text) -> str:
     out = str(text)  # 宽容度：调用方直接传异常对象/数字也不会炸
     for secret in sorted(set(_SECRETS), key=len, reverse=True):
         # 长值先替：短值先替会把长密钥切成半截、留下可辨认的碎片
-        if not secret:
+        # 短于 _SECRET_MIN_LEN 的值（`1` / `ok`）出现在普通文本里太常见，值级替换会把报错搅乱
+        if not secret or len(secret) < _SECRET_MIN_LEN:
             continue
         for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
             if variant:
@@ -291,9 +300,8 @@ def redact_secrets(values, text) -> str:
     if not text:
         return text
     out = str(text)
-    for secret in sorted(set(values or ()), key=len, reverse=True):
-        if not secret:
-            continue
+    secrets = {secret for secret in (values or ()) if isinstance(secret, str) and len(secret) >= _SECRET_MIN_LEN}
+    for secret in sorted(secrets, key=len, reverse=True):
         for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
             if variant:
                 out = out.replace(variant, "***")
@@ -383,42 +391,74 @@ class RunLock:
             return self
         try:
             # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
-            self.fh = open(self.path, "a+")
-        except OSError as exc:
+            # encoding + errors=replace：locale 非 UTF-8 时读写中文主机名不会抛 UnicodeError
+            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接，拒绝跟随（避免锁到别人的文件上）
+            open_kwargs = {"encoding": "utf-8", "errors": "replace"}
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow:
+                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf)
+            self.fh = open(self.path, "a+", **open_kwargs)
+        except (OSError, UnicodeError) as exc:
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
-            )
-        if not _try_lock(self.fh):
-            holder = ""
-            try:
-                self.fh.seek(0)
-                holder = (self.fh.read(200) or "").strip()
-            except OSError:
-                pass
-            self.fh.close()
-            self.fh = None
-            detail = f"（持有者：{holder}）" if holder else ""
-            raise SystemExit(
-                f"已有任务在运行{detail}（锁文件 {self.path}），本次退出。"
-                f"该锁只在同一台机器上生效，跨机并发（如本地与服务器同时跑）请自行避免。"
-            )
+            ) from exc
+        acquired = False
         try:
-            # 拿到锁之后才截断+写标记：拿不到锁时绝不能动内容
-            self.fh.seek(0)
-            self.fh.truncate()
-            self.fh.write(f"{os.getpid()} {socket.gethostname()} {datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
-            self.fh.flush()
-        except OSError:  # 写标记只是给人看，失败不影响加锁
-            pass
-        return self
+            if not _try_lock(self.fh):
+                holder = ""
+                try:
+                    self.fh.seek(0)
+                    holder = (self.fh.read(200) or "").strip()
+                except (OSError, UnicodeError):
+                    pass
+                try:
+                    self.fh.close()
+                except (OSError, ValueError):
+                    pass
+                self.fh = None
+                detail = f"（持有者：{holder}）" if holder else ""
+                raise SystemExit(
+                    f"已有任务在运行{detail}（锁文件 {self.path}），本次退出。"
+                    f"该锁只在同一台机器上生效，跨机并发（如本地与服务器同时跑）请自行避免。"
+                )
+            acquired = True
+            try:
+                # 拿到锁之后才截断+写标记：拿不到锁时绝不能动内容
+                self.fh.seek(0)
+                self.fh.truncate()
+                self.fh.write(
+                    f"{os.getpid()} {socket.gethostname()} {datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                self.fh.flush()
+            except (OSError, UnicodeError):  # 写标记只是给人看，失败不影响加锁
+                pass
+            return self
+        except BaseException:
+            # 锁已拿到但随后失败（含 UnicodeEncodeError）：__enter__ 没返回则 __exit__ 不会跑，必须在这里释放
+            if self.fh is not None:
+                try:
+                    if acquired:
+                        _unlock(self.fh)
+                finally:
+                    try:
+                        self.fh.close()
+                    except (OSError, ValueError):
+                        pass
+                    self.fh = None
+            raise
 
     def __exit__(self, *exc_info):
         """解锁并关句柄；锁文件本身保留（不删文件，避免削掉别人的锁）。"""
-        if self.fh is not None:
+        if self.fh is None:
+            return
+        try:
+            _unlock(self.fh)
+        finally:
             try:
-                _unlock(self.fh)
-            finally:
                 self.fh.close()
+            except (OSError, ValueError):
+                pass
+            self.fh = None
 
 
 def _try_lock(fh) -> bool:
@@ -462,8 +502,9 @@ def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathl
     锁名带路径哈希：jobs/a/api.json 与 jobs/b/api.json 同名不同作业，只按文件名会互相阻塞。
     注意：锁文件在各机器本地磁盘上，只保证单机互斥（跨机并发仍会互相写坏，正式跑固定一台）。
     """
-    stem = job_path.stem or "job"
-    digest = hashlib.sha1(str(job_path).encode("utf-8")).hexdigest()[:8]
+    resolved = pathlib.Path(job_path).expanduser().resolve()
+    stem = resolved.stem or "job"
+    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:8]
     name = f"{stem}-{digest}"
     if root is not None:
         base = pathlib.Path(root)

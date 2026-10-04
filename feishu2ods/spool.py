@@ -50,6 +50,7 @@ class SpoolWriter:
             target = path if path is not None else "系统临时目录"
             raise OSError(f"建不了落盘临时文件（{target}）：{exc}") from exc
         self.count = 0
+        self._closed = False
 
     def write_records(self, records: list[dict]) -> int:
         """把一批记录序列化后写入文件（返回本批条数）。"""
@@ -79,7 +80,10 @@ class SpoolWriter:
             yield batch
 
     def close(self, keep: bool = False) -> None:
-        """关闭并（默认）删除临时文件；keep=True 时保留（排障用）。"""
+        """关闭并（默认）删除临时文件；keep=True 时保留（排障用）。重复调用是空操作。"""
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._handle.close()
         finally:
