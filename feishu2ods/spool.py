@@ -28,14 +28,23 @@ class SpoolWriter:
     """
 
     def __init__(self, path: pathlib.Path | None = None):
+        created = None
         try:
             if path is None:
                 handle, name = tempfile.mkstemp(prefix="feishu2ods-", suffix=".jsonl")
                 os.close(handle)
-                path = pathlib.Path(name)
+                created = pathlib.Path(name)
+                path = created
             self.path = pathlib.Path(path)
             self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
         except OSError as exc:
+            # mkstemp 已经把文件创建出来了：后续 open 失败（句柄用尽/磁盘满）时不能把
+            # 临时文件留在系统 temp 里，best-effort 清掉
+            if created is not None:
+                try:
+                    created.unlink(missing_ok=True)
+                except OSError:
+                    pass
             # 临时目录不可写/磁盘满/路径不存在：转成"带原因的人话"再抛出，由调用方（cli）
             # 记日志并按运行失败（退出码 1）结束——不让裸 OSError/FileNotFoundError 糊在用户脸上
             target = path if path is not None else "系统临时目录"
@@ -105,7 +114,10 @@ class FetchStats:
                     self.min_id = record_id
                 if not self.max_id or record_id > self.max_id:
                     self.max_id = record_id
-            if all(value is None for key, value in record.items() if key != "record_id"):
+            values = [value for key, value in record.items() if key != "record_id"]
+            if values and all(value is None for value in values):
+                # all() 对空序列恒为 True：只有 record_id 的记录（字段映射为空/接口没返回字段）
+                # 不该被算成"空白行"，否则 empty_rows 的数据质量提示会失真
                 self.empty_rows += 1
             if self.date_field:
                 day = normalize_date_value(record.get(self.date_field))

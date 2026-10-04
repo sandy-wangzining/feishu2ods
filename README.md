@@ -72,7 +72,7 @@ cd ~/feishu2ods
 | `feishu.base_token` / `feishu.table_id` | 多维表格 token / 数据表 ID |
 | `feishu.base_url` | 可选，告警卡片里带表格链接 |
 | `maxcompute.project` | 默认项目（`target.project` 未给时用它） |
-| `maxcompute.endpoint` | 可选，默认美国硅谷接入地址 |
+| `maxcompute.endpoint` | 可选，默认美国硅谷接入地址（https） |
 | `maxcompute.access_key_id` / `access_key_secret` | 阿里云凭证 |
 | `fields` | Base 列名 → JSON 英文键（必填；英文键须是字母/数字/下划线，唯一） |
 | `target.project` / `target.table` / `target.column` | 目标表（column 默认 `json`；表会自动建） |

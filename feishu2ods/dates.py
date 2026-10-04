@@ -109,11 +109,17 @@ def freshness_problem(records, date_field: str, expected: str) -> tuple[str, str
     records 两种形态都认：记录列表（旧调用方，内部按 date_field 提取日期）或
     已 normalize 过的日期集合（流式路径传 FetchStats.date_values，元素是 str）。
     """
-    first = next(iter(records), None) if records is not None else None
+    # 迭代器（生成器）先实体化：下面要"先看一条判类型、再整体遍历"，直接两次遍历生成器
+    # 会消费掉第一条记录（它的日期不参与比较，可能误报"缺数据"）
+    if records is None:
+        records = []
+    elif not isinstance(records, (list, tuple, set, frozenset)):
+        records = list(records)
+    first = next(iter(records), None)
     if isinstance(first, dict):
         seen = {normalize_date_value(record.get(date_field)) for record in records}
     else:
-        seen = set(records or ())
+        seen = set(records)
     seen.discard(None)
     if expected in seen:
         return None

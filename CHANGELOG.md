@@ -77,6 +77,60 @@
   `count_partition` 查目标分区现有行数，**非 0 则拒绝写库并以退出码 1 结束**（提示
   "若确认就是要写空分区，请加 `--force`"）；现有行数本来就是 0 则正常写空分区。
 
+- **拼进 SQL 的分区值加白名单、标识符补校验（安全）**：MaxCompute 没有绑定参数，`pt` 与
+  project/table/column 只能拼进语句；现在 `count_partition` / `verify_partition` 统一走
+  `_partition_clause`（白名单：8 位业务日，写入期临时分区带 `__tmp` 后缀）并对标识符做
+  `_require_identifier` 校验，引号/反斜杠/空格等注入面归零（原实现只对 pt 做引号转义）。
+  同时 `_sql_spec`（DDL 用）对来自服务端 `partition.name` 的值补转义。
+- **表注释转义反斜杠**：`target.comment` 来自作业配置（用户可任意编辑），原来只把单引号
+  双写；MaxCompute 字符串字面量里反斜杠本身是转义符，结尾的 `\` 会吃掉收尾引号、把后续
+  内容当 SQL 解析。现在先转义反斜杠再转义引号；config 侧同时把注释去掉首尾空白并拒绝换行。
+- **默认 MaxCompute endpoint 改 https**：作业未写 endpoint 时（向导生成的配置、示例模板）
+  走明文 HTTP 会暴露 AK/SK 签名与查询结果；`mc.DEFAULT_ENDPOINT` 与 `jobs/*.example.json`
+  统一改 https。
+- **向导写文件先按 0600 创建再写入（安全）**：生成的文件含 `app_secret` / `access_key_secret`
+  明文，原来 `write_text` 先按默认 umask（通常 0644）创建、再 chmod，存在同机其他用户可读
+  的窗口期；现在创建即 0600，并在输出里提醒"请勿提交到版本库"。
+- **向导显式询问 endpoint（不再写死 us-west-1）**：非 us-west-1 地域的项目原来生成的配置
+  一跑就连不上，且报错要到真正执行时才出现；现在像其它字段一样交互询问（默认值仍为
+  us-west-1，格式不对会重问）。
+- **`freshness` 缺 `date_field` / 写成非对象给干净的配置错**：原来直接 `freshness["date_field"]`
+  下标取值，配置漏字段时抛裸 `KeyError`，被 `main` 的兜底 except 变成"未预期错误"+traceback，
+  用户看不出是配置问题。现在给出明确报错（且校验放在建落盘临时文件之前，失败退出时没有
+  悬挂句柄）。
+- **0 行失败路径保留落盘文件**：`target.allow_empty=false` 且拉到 0 行时原来 `spool.close()`
+  删掉落盘文件，偏离本文件"失败留证（哪怕是空的 0 行快照）"的约定；现在与其它失败路径
+  统一 `keep=True` 并打印文件路径。
+- **int 退出码的 `SystemExit` 留痕**：运行期抛出的 int 退出码（如库内部 `sys.exit(1)`）原来
+  既不打印也不写日志，`--log-file` 里完全查不到这次为什么失败；现在按统一格式记一笔
+  （"以退出码 N 结束"）。
+- **`fetch_records` 的 sink/stats 必须成对传入**：只传一个会静默退化成"全量累积并返回 list"
+  （既不落盘、返回类型也变，大表可能直接爆内存），现在在函数入口快速失败（TypeError）。
+- **防死循环的 seen 集合改为有界（内存契约）**：原来把全量 `record_id` 存进 set，500 万行
+  要几百 MB，与"峰值内存只与单页/页数有关"的承诺矛盾；现在改为页级指纹（sha1）+ 上一页
+  ID 集合，忽略 offset 的重复页与相邻页重叠仍会被立刻中止。
+- **兼容分支（旧签名传记录列表）的临时 spool 在写入失败时被清理**：原来赋值发生在写入
+  之后，写入抛错（磁盘满等）时临时文件与句柄永远不被 close；现在先赋值再写、失败即清理。
+- **SQL 超时取消失败留日志**：`instance.stop()` 失败原来静默吞掉，运维看到"已主动停止"会
+  以为云端 SQL 真的停了（可能仍在跑、占着运行锁）；现在记一条"取消失败（云端可能仍在执行）"。
+- **空记录判定修正**：`all()` 对空序列恒为 True——只有 `record_id`、没有任何映射字段的记录
+  原来被算成"空白行"，`empty_rows` 的数据质量提示失真；现在显式判空。
+- **`SpoolWriter` 建文件失败的临时文件清理**：`mkstemp` 已创建文件、随后 `open` 失败
+  （句柄用尽/磁盘满）时原来把文件留在系统 temp；现在 best-effort 清掉再抛人话报错。
+- **`fields` 列名去空白后写回配置**：带首尾空白的 Base 列名原来能通过校验但拉取时匹配不上
+  列、整列静默为 null（与"校验通过的值会写回"的文档承诺不符）；现在写回去空白后的列名，
+  去空白后重名会直接报错。
+- **http:// 地址给出明文传输告警**：`feishu.base_url` / `maxcompute.endpoint` /
+  `freshness.webhook` 允许 http（本地调试）但必须留痕——token、AK/SK 签名与告警内容会明文
+  经网络传输；现在在未知键告警之外各补一条明文提示。
+- **`freshness_problem` 不再消费迭代器入参的第一条记录**：原来"先看一条判类型、再整体遍历"
+  对生成器会把它前进一格，第一条记录的日期不参与比较、可能误报"缺数据"；现在先实体化再判。
+- **`_URL_AUTH_RE` 的 scheme 部分限长（安全）**：无上限时在长小写字母数字串上会在每个起始
+  位置贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒），限长后配合 `://`/`@` 预判保持线性。
+- **控制台补丁与编码兜底加固**：`_console_patched` 的 check-then-set 放进锁里（多线程首次
+  调用不再重复 reconfigure）；`setup_console` 的异常捕获收窄到"流不支持 reconfigure"
+  （含 `io.UnsupportedOperation`，它是 OSError/ValueError 的子类），不再吞掉编程错误。
+
 ### 功能
 
 - **新增 `--log-file`（运维）**：日志同时写一份到指定文件——追加、UTF-8、父目录自动创建；
@@ -105,6 +159,17 @@
 - **单测不再往仓库目录写锁文件**：单测用临时作业路径、锁名哈希每次不同，原来会把运行锁写到
   仓库的 `.run-locks/` 下并无限累积。现在测试基类把锁根路径 `monkeypatch` 到临时目录，并在
   收尾时清理——只改测试侧，生产行为不变。
+- **离线用例补齐本轮修复的回归覆盖**：分区值白名单（含全角数字）、表注释转义、`_sql_spec`
+  转义、兼容分支临时 spool 清理、取消失败日志、sink/stats 成对、重复页/相邻页重叠检测、
+  `fields` 去空白写回与重名、注释去空白/拒换行、http 明文告警、生成器入参、`freshness`
+  缺字段的干净报错、int 退出码留痕、mkstemp 失败清理、向导 endpoint 询问与 0600、脱敏
+  线性判据等（用例 245 → 266）。
+- **测试夹具与生命周期修正**：`argparse.Namespace(...)` 字面量统一收敛到 `make_args()`
+  构造（字段集合与 `parse_args` 对齐，避免实现新增 `args.xxx` 时用例以 AttributeError 而非
+  真实行为失败）；`sql_timeout=600` 改用 `mc_mod.SQL_TIMEOUT_SECONDS`（常量改动后不再
+  悄悄不一致）；`TestSpoolWriter` 的 spool 创建即登记 `addCleanup`（断言失败也保证临时文件
+  与句柄回收）。另核实：报告中"_SECRETS 追加无清理会跨用例污染"不成立——测试基类已按用例把
+  `utils._SECRETS` patch 成独立列表并还原，无需修改。
 
 ### 工程
 
@@ -133,6 +198,7 @@
 - **补充新鲜度支持日期形态的说明**：README 明确 `freshness.date_field` 的值会规范成 `yyyy-MM-dd`
   再比对，只认 ISO 串（取前 10 位）/ `yyyy/MM/dd` / epoch 毫秒数字，**紧凑数字串（如 `20260927`）
   不被识别**（会误判缺数据），见「行为说明」第 6 条与「常见问题」。
+- README：`maxcompute.endpoint` 默认值标注为 https。
 
 ## [1.5.0] - 2026-09-30
 

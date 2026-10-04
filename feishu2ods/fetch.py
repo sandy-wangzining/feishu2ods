@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 from .auth import FEISHU_HOST, ApiHttpError, get_tenant_token, request_json
@@ -42,19 +43,27 @@ def fetch_records(
     返回 stats——峰值内存只与单页数据量有关，大表不再全量驻留内存（run_sync 用）。
     两者都不给：保持旧行为，全量累积后返回记录列表（--check / 小表调用方用）。
     """
+    if (sink is None) != (stats is None):
+        # 只传一个会静默退化成"全量累积并返回 list"：既不落盘、返回类型也从 FetchStats
+        # 变成 list，调用方很难察觉（大表下可能直接爆内存）——成对校验，快速失败
+        raise TypeError("fetch_records 的 sink 与 stats 必须成对传入（流式模式）或都不传（全量模式）")
     url = _records_url(feishu)
     token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
     fields: list[str] | None = None
     rev: object = None
     rev_seen = False
     record_ids: list[str] = []
-    seen_ids: set[str] = set()
+    # 防死循环的状态：上一页 ID（检测相邻页重叠）+ 页级指纹（检测接口忽略 offset 重复返回
+    # 同一页）。两者内存都只与单页/页数有关——原来把全量 record_id 存进 set，500 万行
+    # 要几百 MB，与"峰值内存只与单页有关"的承诺矛盾
+    last_page_ids: set[str] = set()
+    seen_page_hashes: set[str] = set()
     raw_rows: list[list] = []
     offset = 0
     page = 1
     token_refreshed = False
     rate_tries = 0
-    stream = sink is not None and stats is not None
+    stream = sink is not None
     while True:
         try:
             data = request_json(
@@ -122,12 +131,18 @@ def fetch_records(
         page_ids = [str(item) for item in (payload.get("record_id_list") or [])]
         if len(page_rows) != len(page_ids):
             raise SystemExit(f"第 {page} 页行数与记录 ID 数不一致（{len(page_rows)} ≠ {len(page_ids)}），已中止")
-        # 记录 ID 全局唯一：出现重复说明接口忽略了 offset（重复返回同一页）或翻页窗口重叠，
-        # 这样兜底能立刻中止，而不是白翻 MAX_PAGES 页后才发现是死循环
-        overlap = seen_ids.intersection(page_ids)
-        if overlap:
-            raise SystemExit(f"第 {page} 页出现已拉取过的记录（如 {sorted(overlap)[0]}），接口返回异常，已中止")
-        seen_ids.update(page_ids)
+        # 防死循环兜底：接口忽略 offset 时会重复返回同一页（页级指纹命中）；
+        # 翻页窗口重叠时相邻两页会出现重复记录（与上一页比对）。命中即中止，
+        # 而不是白翻 MAX_PAGES 页后才发现
+        if page_ids:
+            page_hash = hashlib.sha1("\x00".join(page_ids).encode("utf-8"), usedforsecurity=False).hexdigest()
+            if page_hash in seen_page_hashes:
+                raise SystemExit(f"第 {page} 页与之前某页的记录完全相同，接口可能忽略了 offset，已中止")
+            seen_page_hashes.add(page_hash)
+            overlap = last_page_ids.intersection(page_ids)
+            if overlap:
+                raise SystemExit(f"第 {page} 页与上一页有重复记录（如 {sorted(overlap)[0]}），接口返回异常，已中止")
+            last_page_ids = set(page_ids)
         if stream:
             page_records = _page_records(fields or [], page_ids, page_rows, mapping)
             sink.write_records(page_records)

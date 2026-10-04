@@ -29,6 +29,7 @@ from feishu2ods import dates as dates_mod  # noqa: E402
 from feishu2ods import fetch as fetch_mod  # noqa: E402
 from feishu2ods import mc as mc_mod  # noqa: E402
 from feishu2ods import notify as notify_mod  # noqa: E402
+from feishu2ods import spool as spool_mod  # noqa: E402
 from feishu2ods import utils as utils_mod  # noqa: E402
 from feishu2ods import wizard as wizard_mod  # noqa: E402
 
@@ -81,6 +82,31 @@ def make_job(**overrides) -> dict:
     for key, value in overrides.items():
         job[key] = value
     return job
+
+
+def make_args(**overrides) -> argparse.Namespace:
+    """cli 参数默认值（字段集合与 cli.parse_args 的真实结果对齐；测试要什么改什么）。
+
+    用统一构造函数而不是各处手写 argparse.Namespace：字段集合不一致时，
+    实现新增 args.xxx 的访问会让用例以 AttributeError 而非真实行为失败/掩盖问题。
+    """
+    base = dict(
+        job="jobs/x.json",
+        init=False,
+        init_out="",
+        check=False,
+        bizdate="",
+        dry_run=False,
+        force=False,
+        skip_freshness=False,
+        no_notify=False,
+        project="",
+        table="",
+        sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS,
+        log_file="",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
 
 
 class _Col:
@@ -253,12 +279,12 @@ class TestBizdate(OfflineTestCase):
                 dates_mod.env_bizdate()
 
     def test_resolve_cli_wins(self):
-        args = argparse.Namespace(bizdate="20260101")
+        args = make_args(bizdate="20260101")
         with mock.patch.dict(os.environ, {"bizdate": "20260202"}, clear=True):
             self.assertEqual(dates_mod.resolve_bizdate(args), date(2026, 1, 1))
 
     def test_resolve_env(self):
-        args = argparse.Namespace(bizdate="")
+        args = make_args(bizdate="")
         with mock.patch.dict(os.environ, {"bizdate": "20260202"}, clear=True):
             self.assertEqual(dates_mod.resolve_bizdate(args), date(2026, 2, 2))
 
@@ -268,7 +294,7 @@ class TestBizdate(OfflineTestCase):
             def now(cls, tz=None):
                 return cls(2026, 9, 29, 10, 0, tzinfo=utils_mod.CN_TZ).astimezone(tz) if tz else cls(2026, 9, 29, 10, 0)
 
-        args = argparse.Namespace(bizdate="")
+        args = make_args(bizdate="")
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(dates_mod, "datetime", _FixedDatetime):
             self.assertEqual(dates_mod.resolve_bizdate(args), date(2026, 9, 28))
 
@@ -847,6 +873,7 @@ class TestRunInit(OfflineTestCase):
             "",  # 注释（默认）
             "LTAI_TEST",  # AK
             "SK_SECRET_XYZ",  # SK
+            "",  # endpoint（默认 us-west-1）
             "y",  # 新鲜度
             "biz_date",  # date_field
             "",  # webhook
@@ -858,6 +885,8 @@ class TestRunInit(OfflineTestCase):
         job = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(job["fields"], {"日期": "biz_date", "金额": "amount"})
         self.assertEqual(job["target"]["table"], "ods_probe_job_json_df")
+        # endpoint 显式问过（不再写死 us-west-1）：回车采纳默认值
+        self.assertEqual(job["maxcompute"]["endpoint"], mc_mod.DEFAULT_ENDPOINT)
         self.assertEqual(job["freshness"], {"date_field": "biz_date", "lag_days": 0})
         config_mod.validate_job(json.loads(json.dumps(job)))  # 生成的配置必须能过校验
         # 密钥不能出现在任何回显里
@@ -909,6 +938,7 @@ class TestRunInit(OfflineTestCase):
             "",  # 注释（默认）
             "LTAI_TEST",
             "SK_SECRET_XYZ",
+            "",  # endpoint（默认）
             "n",  # 不要新鲜度
         ]
         code, echoed = self._run(answers, fake_fetch)
@@ -933,6 +963,7 @@ class TestRunInit(OfflineTestCase):
             "",
             "LTAI_TEST",
             "SK_SECRET_XYZ",
+            "",  # endpoint（默认）
             "n",
         ]
         code, _ = self._run(answers, fake_fetch)
@@ -973,7 +1004,7 @@ class TestWiring(OfflineTestCase):
             self.assertEqual(cli_mod.run_check(make_job(), "p", "t", "json", "20260928"), 1)
 
     def test_run_sync_dry_run_pass(self):
-        args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=False, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-28", "amount": "$1"}]
         with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
@@ -981,7 +1012,7 @@ class TestWiring(OfflineTestCase):
 
     def test_run_sync_freshness_warns_but_continues(self):
         # 缺数据只告警不失败（人填的表，节假日没人填是常态）：rc=0、照常写、飞书告警一次
-        args = argparse.Namespace(skip_freshness=False, no_notify=False, dry_run=True)
+        args = make_args(skip_freshness=False, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
@@ -994,7 +1025,7 @@ class TestWiring(OfflineTestCase):
 
     def test_run_sync_freshness_warns_but_no_notify_flag_silences_webhook(self):
         # --no-notify 只关飞书提醒：rc 仍是 0（缺数据不阻塞）
-        args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=False, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
@@ -1006,7 +1037,7 @@ class TestWiring(OfflineTestCase):
 
     def test_run_sync_zero_records_still_fails(self):
         # 真异常（表被清空 = 0 行）仍然失败：缺数放行不等于放行空表
-        args = argparse.Namespace(skip_freshness=False, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=False, no_notify=True, dry_run=True)
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub([])),
             mock.patch.object(cli_mod, "notify") as notifier,
@@ -1016,7 +1047,7 @@ class TestWiring(OfflineTestCase):
         notifier.assert_not_called()
 
     def test_run_sync_new_fields_notifies_once(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=False, dry_run=True)
+        args = make_args(skip_freshness=True, no_notify=False, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
 
         def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
@@ -1037,7 +1068,7 @@ class TestWiring(OfflineTestCase):
         self.assertIn("新列B", joined)
 
     def test_run_sync_new_fields_no_notify_flag(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
 
         def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
@@ -1054,14 +1085,14 @@ class TestWiring(OfflineTestCase):
         notifier.assert_not_called()
 
     def test_run_sync_skip_freshness(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 0)
 
     def test_run_sync_warns_empty_rows(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": None, "amount": None}]
         messages: list[str] = []
         with (
@@ -1073,7 +1104,7 @@ class TestWiring(OfflineTestCase):
         self.assertTrue(any("全为空" in m for m in messages))
 
     def test_run_sync_writes_and_counts(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         table = mock.Mock()
         odps = mock.Mock()
@@ -1097,7 +1128,7 @@ class TestWiring(OfflineTestCase):
         self.assertEqual(counter.call_args.kwargs["timeout"], 600)
 
     def test_run_sync_count_mismatch(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         with (
             mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub(records)),
@@ -1156,15 +1187,17 @@ class TestFetchStats(OfflineTestCase):
         self.assertEqual(stats.min_id, "r1")
 
     def test_empty_rows_detection(self):
+        """空白行 = 映射过的字段全为 None；只有 record_id 的记录（没有字段可判空）不算——
+        all() 对空序列恒为 True，不显式判空会把这类记录误计成空白行。"""
         stats = cli_mod.FetchStats()
         stats.update(
             [
                 {"record_id": "r1", "a": None, "b": None},  # 全空
                 {"record_id": "r2", "a": 1},  # 有值
-                {"record_id": "r3"},  # 只有 record_id（也全空）
+                {"record_id": "r3"},  # 只有 record_id：不算空白行
             ]
         )
-        self.assertEqual(stats.empty_rows, 2)
+        self.assertEqual(stats.empty_rows, 1)
 
     def test_date_values_and_counter(self):
         stats = cli_mod.FetchStats(date_field="biz_date")
@@ -1193,8 +1226,14 @@ class TestFetchStats(OfflineTestCase):
 
 
 class TestSpoolWriter(OfflineTestCase):
+    def _spool(self, *args) -> cli_mod.SpoolWriter:
+        """创建即登记清理：断言失败时也保证临时文件与句柄被回收。"""
+        spool = cli_mod.SpoolWriter(*args)
+        self.addCleanup(spool.close)
+        return spool
+
     def test_roundtrip_rows(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         spool.write_records([{"a": 1}, {"b": "中文"}])
         rows = list(spool.iter_rows())
         self.assertEqual(rows, ['{"a":1}', '{"b":"中文"}'])
@@ -1202,39 +1241,39 @@ class TestSpoolWriter(OfflineTestCase):
         spool.close()
 
     def test_write_returns_count(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         self.assertEqual(spool.write_records([{"a": 1}, {"a": 2}]), 2)
         spool.close()
 
     def test_batches(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         spool.write_records([{"i": i} for i in range(5)])
         batches = list(spool.iter_batches(batch_size=2))
         self.assertEqual([len(b) for b in batches], [2, 2, 1])
         spool.close()
 
     def test_iter_rows_rerunnable(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         spool.write_records([{"a": 1}])
         self.assertEqual(len(list(spool.iter_rows())), 1)
         self.assertEqual(len(list(spool.iter_rows())), 1)  # 重试场景：重新读一遍
         spool.close()
 
     def test_empty_spool(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         self.assertEqual(list(spool.iter_rows()), [])
         self.assertEqual(list(spool.iter_batches()), [])
         spool.close()
 
     def test_close_deletes_file(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         path = spool.path
         spool.write_records([{"a": 1}])
         spool.close()
         self.assertFalse(path.exists())
 
     def test_close_keep(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         path = spool.path
         spool.write_records([{"a": 1}])
         spool.close(keep=True)
@@ -1242,7 +1281,7 @@ class TestSpoolWriter(OfflineTestCase):
         path.unlink()
 
     def test_iter_rows_strips_newline(self):
-        spool = cli_mod.SpoolWriter()
+        spool = self._spool()
         spool.write_records([{"a": "x\ny"}])  # 值里含换行会被 JSON 转义
         rows = list(spool.iter_rows())
         self.assertEqual(len(rows), 1)
@@ -1252,7 +1291,7 @@ class TestSpoolWriter(OfflineTestCase):
     def test_custom_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "spool.jsonl"
-            spool = cli_mod.SpoolWriter(path)
+            spool = self._spool(path)
             spool.write_records([{"a": 1}])
             spool.close(keep=True)
             self.assertEqual(path.read_text(encoding="utf-8"), '{"a":1}\n')
@@ -1593,7 +1632,7 @@ class TestSpoolFailure(OfflineTestCase):
         self.assertIn("建不了落盘临时文件", str(ctx.exception))
 
     def test_run_sync_spool_failure_returns_1(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True, sql_timeout=600)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True, sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS)
         messages: list[str] = []
         with (
             mock.patch.object(cli_mod, "SpoolWriter", side_effect=OSError("No space left")),
@@ -1751,7 +1790,7 @@ class TestRunSyncSpoolLifecycle(OfflineTestCase):
     """run_sync 流式路径的 spool 生命周期。"""
 
     def test_dry_run_cleans_spool(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True)
         records = [{"record_id": "r1", "biz_date": "2026-09-27", "amount": "$1"}]
         spool_holder = {}
 
@@ -1764,8 +1803,9 @@ class TestRunSyncSpoolLifecycle(OfflineTestCase):
         self.assertEqual(code, 0)
         self.assertFalse(spool_holder["spool"].path.exists())
 
-    def test_zero_rows_cleans_spool(self):
-        args = argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=True)
+    def test_zero_rows_keeps_spool_for_debugging(self):
+        """0 行失败路径保留落盘文件（"失败留证"：哪怕是空的 0 行快照，也要能事后排查）。"""
+        args = make_args(skip_freshness=True, no_notify=True, dry_run=True)
         spool_holder = {}
 
         def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
@@ -1775,10 +1815,14 @@ class TestRunSyncSpoolLifecycle(OfflineTestCase):
         with mock.patch.object(cli_mod, "fetch_records", side_effect=fake_fetch):
             code = cli_mod.run_sync(args, make_job(), "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertEqual(code, 1)  # 0 行保护
-        self.assertFalse(spool_holder["spool"].path.exists())
+        path = spool_holder["spool"].path
+        self.assertTrue(path.exists())
+        self.addCleanup(path.unlink, missing_ok=True)  # 留证文件由用例自己清掉
 
     def _sync_args(self):
-        return argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600, force=False)
+        return make_args(
+            skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS, force=False
+        )
 
     def _fetch_capture(self, records, holder):
         def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
@@ -1906,7 +1950,7 @@ class TestBizdateMore(OfflineTestCase):
             self.assertEqual(dates_mod.env_bizdate(), date(2026, 9, 27))
 
     def test_resolve_bizdate_bad_env_fails(self):
-        args = argparse.Namespace(bizdate="")
+        args = make_args(bizdate="")
         with mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True):
             with self.assertRaises(SystemExit):
                 dates_mod.resolve_bizdate(args)
@@ -1924,7 +1968,7 @@ class TestBizdateMore(OfflineTestCase):
             def now(cls, tz=None):
                 return cls(2026, 9, 29, 10, 0, tzinfo=utils_mod.CN_TZ)
 
-        args = argparse.Namespace(bizdate="")
+        args = make_args(bizdate="")
         with (
             mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True),
             mock.patch.object(dates_mod, "datetime", _FixedDatetime),
@@ -2372,7 +2416,9 @@ class TestEmptyPartitionGuard(OfflineTestCase):
 
     @staticmethod
     def _args(force=False):
-        return argparse.Namespace(skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=600, force=force)
+        return make_args(
+            skip_freshness=True, no_notify=True, dry_run=False, sql_timeout=mc_mod.SQL_TIMEOUT_SECONDS, force=force
+        )
 
     @staticmethod
     def _job():
@@ -2428,6 +2474,312 @@ class TestEmptyPartitionGuard(OfflineTestCase):
         self.assertEqual(code, 0)
         writer.assert_called_once()  # 分区本来就空：正常写空分区，不拦
         self.assertEqual(counter.call_count, 2)  # 写前保护 + 写后核对各一次
+
+
+class TestReviewHardening(OfflineTestCase):
+    """本轮线上巡检评审修复的回归用例。"""
+
+    # ------------------------------------------------------------- mc：SQL / 临时 spool
+
+    def test_partition_clause_whitelist(self):
+        """拼进 SQL 的分区值必须过白名单（注入形态一律拒绝），且不发起任何查询。"""
+        o = mock.Mock()
+        for bad in ("2026-09-28", "20260928'; drop table t --", "", "202609281", "２０２６０９２８"):
+            with self.assertRaises(SystemExit):
+                mc_mod.count_partition(o, "p", "t", bad)
+        o.run_sql.assert_not_called()
+        # 核对路径同样校验（临时分区带 __tmp 后缀是允许的）
+        with self.assertRaises(SystemExit):
+            mc_mod.verify_partition(o, "p", "t", "json", "x'")
+        o.run_sql.assert_not_called()
+
+    def test_verify_partition_allows_tmp_suffix(self):
+        o = mock.Mock()
+        instance = mock.Mock()
+        instance.open_reader.return_value.__enter__ = mock.Mock(
+            return_value=iter([{"cnt": 0, "ucnt": 0, "mn": None, "mx": None}])
+        )
+        instance.open_reader.return_value.__exit__ = mock.Mock(return_value=False)
+        o.run_sql.return_value = instance
+        got = mc_mod.verify_partition(o, "p", "t", "json", "20260928__tmp")
+        self.assertEqual(got, (0, 0, "", ""))
+        self.assertIn("pt = '20260928__tmp'", o.run_sql.call_args.args[0])
+
+    def test_write_partition_rejects_bad_pt(self):
+        with self.assertRaises(SystemExit) as ctx:
+            mc_mod.write_partition(mock.Mock(), mock.Mock(), "p", "t", "json", "2026-09-28", [])
+        self.assertIn("8 位业务日", str(ctx.exception))
+
+    def test_ddl_comment_escapes_backslash_and_quote(self):
+        """表注释里反斜杠是转义符：结尾的 "\\" 会吃掉收尾引号、把后续当 SQL 解析。"""
+        ddl = mc_mod.build_ddl("p", "t", "json", "尾\\")
+        self.assertIn("尾\\\\", ddl)
+        ddl2 = mc_mod.build_ddl("p", "t", "json", "it's")
+        self.assertIn("it''s", ddl2)
+
+    def test_sql_spec_escapes_server_side_value(self):
+        """purge 场景的 spec 来自服务端 partition.name：转义不能少。"""
+        self.assertEqual(mc_mod._sql_spec("pt=20260928__tmp"), "pt='20260928__tmp'")
+        self.assertEqual(mc_mod._sql_spec("pt=a'b"), "pt='a''b'")
+        self.assertEqual(mc_mod._sql_spec("pt=a\\b"), "pt='a\\\\b'")
+
+    def test_compat_branch_cleans_temp_spool_on_write_failure(self):
+        """旧签名（传记录列表）的临时 spool 在写入失败时也要被清理（句柄+文件）。"""
+        made = []
+        real_init = spool_mod.SpoolWriter.__init__
+
+        def spy_init(instance, path=None):
+            real_init(instance, path)
+            made.append(instance.path)
+
+        with (
+            mock.patch.object(spool_mod.SpoolWriter, "__init__", spy_init),
+            mock.patch.object(spool_mod.SpoolWriter, "write_records", side_effect=OSError("disk full")),
+        ):
+            with self.assertRaises(OSError):
+                mc_mod.write_partition(mock.Mock(), mock.Mock(), "p", "t", "json", "20260928", [{"record_id": "r1"}])
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].exists(), "兼容分支写入失败后临时 spool 未被清理")
+
+    def test_timeout_stop_failure_is_logged(self):
+        """取消失败要留痕：运维看到"已主动停止"会以为云端 SQL 真的停了。"""
+
+        class Hanging:
+            def is_successful(self):
+                return False
+
+            def is_terminated(self):
+                return False
+
+            def stop(self):
+                raise RuntimeError("stop failed")
+
+        o = mock.Mock()
+        o.run_sql.return_value = Hanging()
+        logs = []
+        with mock.patch.object(mc_mod, "log", logs.append):
+            with self.assertRaises(TimeoutError):
+                mc_mod.run_sql_with_timeout(o, "select 1", timeout=0.001)
+        self.assertTrue(any("取消失败" in str(line) for line in logs), logs)
+
+    # ------------------------------------------------------------- fetch：流式契约 / 防死循环
+
+    def test_sink_stats_must_be_paired(self):
+        """只传 sink 或只传 stats：静默退化成全量模式（不落盘、返回类型也变），必须快速失败。"""
+        with self.assertRaises(TypeError):
+            cli_mod.fetch_records({}, {}, sink=object())
+        with self.assertRaises(TypeError):
+            cli_mod.fetch_records({}, {}, stats=object())
+
+    def test_identical_page_repeated_is_detected(self):
+        """接口忽略 offset 时会重复返回同一页：页级指纹命中即中止，不能白翻到上限。"""
+        feishu = {"app_id": "cli_x", "app_secret": "s" * 8, "base_token": "ICx", "table_id": "tblx"}
+        page = {
+            "code": 0,
+            "data": {"fields": ["日期"], "data": [["2026-09-27"]], "record_id_list": ["r1"], "has_more": True},
+        }
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=[page, page]),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.fetch_records(feishu, {"日期": "biz_date"})
+        self.assertIn("完全相同", str(ctx.exception))
+
+    def test_adjacent_page_overlap_is_detected(self):
+        feishu = {"app_id": "cli_x", "app_secret": "s" * 8, "base_token": "ICx", "table_id": "tblx"}
+        pages = [
+            {
+                "code": 0,
+                "data": {"fields": ["日期"], "data": [["a"], ["b"]], "record_id_list": ["r1", "r2"], "has_more": True},
+            },
+            {
+                "code": 0,
+                "data": {"fields": ["日期"], "data": [["c"], ["d"]], "record_id_list": ["r2", "r3"], "has_more": False},
+            },
+        ]
+        with (
+            mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+            mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.fetch_records(feishu, {"日期": "biz_date"})
+        self.assertIn("与上一页", str(ctx.exception))
+
+    # ------------------------------------------------------------- config：写回 / 告警
+
+    def test_fields_source_names_are_stripped_and_written_back(self):
+        job = make_job()
+        job["fields"] = {" 日期 ": "biz_date", "金额": "amount"}
+        config_mod.validate_job(job)
+        self.assertEqual(list(job["fields"]), ["日期", "金额"])
+        # 去空白后重名要报错（不能静默把两个源列折叠成一个）
+        job2 = make_job()
+        job2["fields"] = {"日期": "biz_date", " 日期 ": "amount"}
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.validate_job(job2)
+        self.assertIn("重复", str(ctx.exception))
+
+    def test_comment_is_stripped_and_newline_rejected(self):
+        job = make_job()
+        job["target"]["comment"] = "  注释  "
+        config_mod.validate_job(job)
+        self.assertEqual(job["target"]["comment"], "注释")
+        job2 = make_job()
+        job2["target"]["comment"] = "两行\n注释"
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.validate_job(job2)
+        self.assertIn("换行", str(ctx.exception))
+
+    def test_plaintext_http_warns(self):
+        """http:// 不阻断（本地调试可用），但必须留一条明文传输告警。"""
+        job = make_job()
+        job["feishu"]["base_url"] = "http://127.0.0.1:8000/base/ICx"
+        job["maxcompute"]["endpoint"] = "http://service.example/api"
+        job["freshness"]["webhook"] = "http://open.feishu.cn/hook/1"
+        warnings = config_mod.validate_job(job)
+        text = "\n".join(warnings)
+        self.assertIn("base_url", text)
+        self.assertIn("endpoint", text)
+        self.assertIn("webhook", text)
+
+    # ------------------------------------------------------------- dates / cli / spool
+
+    def test_freshness_problem_accepts_generator(self):
+        """迭代器入参不能被"看一眼元素类型"消费掉第一条（它的日期漏比较会误报缺数据）。"""
+        gen = ({"d": "2026-09-27"} for _ in range(1))
+        self.assertIsNone(dates_mod.freshness_problem(gen, "d", "2026-09-27"))
+        self.assertEqual(
+            dates_mod.freshness_problem(iter([{"d": "2026-09-26"}]), "d", "2026-09-27"),
+            ("2026-09-27", "2026-09-26"),
+        )
+
+    def test_freshness_missing_date_field_is_clean_error(self):
+        job = make_job()
+        job["freshness"] = {"lag_days": 0}
+        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub([])):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.run_sync(make_args(), job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertIn("date_field", str(ctx.exception))
+
+    def test_freshness_non_object_is_clean_error(self):
+        job = make_job()
+        job["freshness"] = "yes"
+        with mock.patch.object(cli_mod, "fetch_records", side_effect=fetch_stub([])):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod.run_sync(make_args(), job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
+        self.assertIn("freshness 必须是对象", str(ctx.exception))
+
+    def test_int_exit_code_is_logged(self):
+        """运行期抛出的 int SystemExit 必须留痕（原来既不打印也不写日志，--log-file 里一字没有）。"""
+        logs = []
+        with (
+            mock.patch.object(cli_mod, "_run", side_effect=SystemExit(3)),
+            mock.patch.object(cli_mod, "log", logs.append),
+        ):
+            rc = cli_mod.main([])
+        self.assertEqual(rc, 3)
+        self.assertTrue(any("以退出码 3 结束" in str(line) for line in logs), logs)
+
+    def test_temp_file_cleaned_when_open_fails(self):
+        """mkstemp 建了文件、随后 open 失败（句柄用尽/磁盘满）时不能把临时文件留在 temp。"""
+        made = []
+        real_mkstemp = spool_mod.tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            handle, name = real_mkstemp(*args, **kwargs)
+            made.append(pathlib.Path(name))
+            return handle, name
+
+        with (
+            mock.patch.object(spool_mod.tempfile, "mkstemp", side_effect=spy_mkstemp),
+            mock.patch.object(spool_mod, "open", side_effect=OSError("too many open files"), create=True),
+        ):
+            with self.assertRaises(OSError):
+                spool_mod.SpoolWriter()
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0].exists())
+
+    # ------------------------------------------------------------- utils / wizard
+
+    def test_url_auth_regex_stays_linear(self):
+        """_URL_AUTH_RE 的 scheme 部分必须限长：无上限时在长小写字母数字串上会 O(n²)。"""
+
+        def elapsed(kb: int) -> float:
+            n = kb * 1024
+            text = "a" * n + "://" + "b" * n + "@"
+            started = time.perf_counter()
+            out = utils_mod.redact(text)
+            self.assertEqual(out, text)
+            return time.perf_counter() - started
+
+        small, big = elapsed(4), elapsed(16)
+        self.assertLess(big, max(small * 8, 0.5), f"脱敏耗时 {small:.3f}s → {big:.3f}s，疑似 O(n²)")
+
+    def test_wizard_endpoint_is_asked_and_used(self):
+        fields = ["日期"]
+
+        def fake_fetch(feishu):
+            return fields, {}
+
+        answers = iter(
+            [
+                "ep_job",  # 作业名
+                "IC4TEST",  # base_token
+                "tblTEST",  # table_id
+                "cli_test123",  # app_id
+                "secret-abc-123",  # app_secret
+                "biz_date",  # 日期 → 英文键
+                "",  # 项目（默认）
+                "",  # 表名（默认）
+                "",  # 注释（默认）
+                "LTAI_TEST",  # AK
+                "SK_SECRET_XYZ",  # SK
+                "http://mc.example/api",  # endpoint（非默认值，必须写进配置）
+                "n",  # 不要新鲜度
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            code = wizard_mod.run_init(
+                out_path="",
+                ask=lambda prompt="": next(answers, ""),
+                echo=lambda *a: None,
+                workdir=pathlib.Path(tmp),
+                fetch_fields=fake_fetch,
+                ask_secret=lambda prompt="": next(answers, ""),
+            )
+            self.assertEqual(code, 0)
+            job = json.loads((pathlib.Path(tmp) / "jobs" / "ep_job.json").read_text(encoding="utf-8"))
+        self.assertEqual(job["maxcompute"]["endpoint"], "http://mc.example/api")
+
+    def test_wizard_file_is_created_with_600(self):
+        """生成的文件含明文密钥：先按 0600 创建再写入（不留 0644 可读窗口期）。"""
+        fields = ["日期"]
+
+        def fake_fetch(feishu):
+            return fields, {}
+
+        answers = iter(
+            ["w6_job", "IC4TEST", "tblTEST", "cli_test123", "s" * 10, "biz_date", "", "", "", "LTAI", "SK", "", "n"]
+        )
+        fake_os = mock.Mock(wraps=wizard_mod.os)
+        fake_os.name = "posix"
+        fake_os.O_WRONLY, fake_os.O_CREAT, fake_os.O_TRUNC = os.O_WRONLY, os.O_CREAT, os.O_TRUNC
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "w6.json"
+            with mock.patch.object(wizard_mod, "os", fake_os):
+                code = wizard_mod.run_init(
+                    out_path=str(out),
+                    ask=lambda prompt="": next(answers, ""),
+                    echo=lambda *a: None,
+                    workdir=pathlib.Path(tmp),
+                    fetch_fields=fake_fetch,
+                    ask_secret=lambda prompt="": next(answers, ""),
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(out.is_file())
+        open_call = next(call for call in fake_os.open.call_args_list if os.fspath(call.args[0]) == str(out))
+        self.assertEqual(open_call.args[2], 0o600)
 
 
 if __name__ == "__main__":

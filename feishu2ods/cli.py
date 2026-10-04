@@ -159,12 +159,21 @@ def run_sync(
     feishu = job["feishu"]
     maxcompute = job["maxcompute"]
     target_cfg = job["target"]
+    freshness = job.get("freshness")
+    if freshness is not None and not isinstance(freshness, dict):
+        # validate_job 会拦；库调用方没走校验时给干净的配置错，而不是 'str' object has no attribute 'get'
+        raise SystemExit("freshness 必须是对象（date_field / lag_days / webhook）")
 
     # ---- ① 拉数（流式：记录边拉边落盘，全量不驻留内存）----
-    webhook = str((job.get("freshness") or {}).get("webhook") or "")
+    webhook = str((freshness or {}).get("webhook") or "")
     base_url = str(feishu.get("base_url") or "")
     new_fields: list[str] = []
-    date_field = str((job.get("freshness") or {}).get("date_field") or "")
+    date_field = str((freshness or {}).get("date_field") or "")
+    if freshness and not args.skip_freshness and not date_field:
+        # validate_job 要求 freshness 必带 date_field；没走校验的调用方在这里得到干净的配置错，
+        # 而不是 KeyError（会被 main 的兜底 except 变成"未预期错误"+traceback）。
+        # 校验放在建 spool 之前：失败退出时没有已打开的临时文件要收口
+        raise SystemExit("freshness.date_field 缺失：freshness 开启时必须指定用哪个键判日期")
     try:
         spool = SpoolWriter()
     except OSError as exc:
@@ -216,13 +225,14 @@ def run_sync(
             if base_url:
                 lines.append(f"**数据表**：{base_url}")
             notify(webhook, "飞书多维表格同步：0 条记录", lines, footer=f"目标表 {project}.{table_name}")
-        spool.close()
+        # 失败留证（哪怕是空的 0 行快照）：本文件其它失败路径都用 keep=True，这里保持一致
+        spool.close(keep=True)
+        log(f"已保留本次落盘的数据文件（排查用）：{spool.path}")
         return 1
-    freshness = job.get("freshness")
     if freshness and not args.skip_freshness:
         lag_days = freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS)
         expected = (bizdate - timedelta(days=lag_days)).isoformat()
-        problem = freshness_problem(stats.date_values, freshness["date_field"], expected)
+        problem = freshness_problem(stats.date_values, date_field, expected)
         if problem is not None:
             # 缺数据只告警、不失败：很多表是人填的（节假日/休假没人填是常态），
             # 缺一天不等于任务失败——快照照常写入（DWD 按源数据日期字段重新分区，
@@ -240,7 +250,7 @@ def run_sync(
             if not args.no_notify:
                 lines = [
                     f"**作业**：{job.get('job')}",
-                    f"**预期已有**：{expected}（{freshness['date_field']}）",
+                    f"**预期已有**：{expected}（{date_field}）",
                     f"**当前最新**：{latest or '无'}",
                     f"**当前条数**：{count:,}",
                     "本次已照常写入快照（缺的那天只是没有数据行），下游任务不受影响；",
@@ -258,7 +268,7 @@ def run_sync(
             dup_dates = [day for day, dup_count in stats.date_counter.items() if day and dup_count > 1]
             if dup_dates:
                 log(f"  警告：以下日期在 Base 里出现多行：{'、'.join(sorted(dup_dates)[:10])}（DWD 同一天会落多行）")
-            log(f"新鲜度校验通过：{freshness['date_field']} 已包含业务日 {expected}")
+            log(f"新鲜度校验通过：{date_field} 已包含业务日 {expected}")
 
     # ---- ③ 写库（dry-run 跳过）----
     if args.dry_run:
@@ -332,6 +342,9 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         # 配置/运行类错误（统一以 SystemExit 抛出）：走统一日志出口（带时间戳+脱敏）后退出
         if isinstance(exc.code, int):
+            # 没带消息的 int 退出码也要留痕（argparse 的参数错走这里）：原来既不打印也不写
+            # 日志，cron/调度场景下 --log-file 里完全查不到这次为什么失败
+            log(f"❌ 以退出码 {exc.code} 结束（未附带错误信息）")
             return exc.code
         log(f"❌ {redact(exc)}")
         return 1

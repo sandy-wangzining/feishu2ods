@@ -80,6 +80,12 @@ def validate_job(job: dict) -> list[str]:
         base_url = _require_text(feishu.get("base_url"), "feishu.base_url")
         if not base_url.startswith(("http://", "https://")):
             raise SystemExit(f"feishu.base_url 必须是 http(s) 开头的地址：{base_url!r}")
+        if base_url.startswith("http://"):
+            # 允许 http 但必须留痕：tenant_access_token（Authorization 头）与整表数据
+            # 会以明文经网络传输，中间代理/网关都能读到
+            warnings.append(
+                "feishu.base_url 是 http:// 明文地址：token 与表格数据会明文传输，建议改 https（本地调试可忽略）"
+            )
         feishu["base_url"] = base_url
 
     maxcompute = job.get("maxcompute")
@@ -92,6 +98,8 @@ def validate_job(job: dict) -> list[str]:
         endpoint = _require_text(maxcompute.get("endpoint"), "maxcompute.endpoint")
         if not endpoint.startswith(("http://", "https://")):
             raise SystemExit(f"maxcompute.endpoint 必须是 http(s) 开头的地址：{endpoint!r}")
+        if endpoint.startswith("http://"):
+            warnings.append("maxcompute.endpoint 是 http:// 明文地址：AK/SK 签名与查询结果会明文传输，建议改 https")
         maxcompute["endpoint"] = endpoint
     if maxcompute.get("project") is not None:
         maxcompute["project"] = _require_identifier(maxcompute.get("project"), "maxcompute.project")
@@ -100,15 +108,22 @@ def validate_job(job: dict) -> list[str]:
     if not isinstance(fields, dict) or not fields:
         raise SystemExit("作业配置缺少 fields（Base 列名 → JSON 英文键 的映射，至少一条）")
     seen: dict[str, str] = {}
-    for source, target in fields.items():
-        _require_text(source, "fields 的列名")
+    normalized: dict[str, str] = {}
+    for raw_source, target in fields.items():
+        source = _require_text(raw_source, "fields 的列名")
         if not isinstance(target, str) or not IDENT_RE.match(target):
             raise SystemExit(f"fields[{source!r}] 的英文键不合法（字母/数字/下划线，且不能以数字开头）：{target!r}")
         if target == "record_id":
             raise SystemExit("fields 里不能用 record_id 作为英文键（record_id 固定为记录 ID，自动输出）")
         if target in seen:
             raise SystemExit(f"fields 的英文键重复：{target!r}（{seen[target]!r} 与 {source!r}）")
+        if source in normalized:
+            raise SystemExit(f"fields 的列名去掉首尾空白后重复：{source!r}")
         seen[target] = source
+        normalized[source] = target
+    # 写回去空白后的列名（文档承诺"校验通过的值会写回"）：带首尾空白的 Base 列名原样留着
+    # 会在拉取时匹配不上列、整列静默为 null
+    job["fields"] = fields = normalized
 
     target_cfg = job.get("target")
     if not isinstance(target_cfg, dict):
@@ -122,8 +137,15 @@ def validate_job(job: dict) -> list[str]:
         target_cfg["project"] = _require_identifier(target_cfg.get("project"), "target.project")
     if not (target_cfg.get("project") or maxcompute.get("project")):
         raise SystemExit("没有目标项目：请在 target.project 或 maxcompute.project 里指定")
-    if target_cfg.get("comment") is not None and not isinstance(target_cfg.get("comment"), str):
-        raise SystemExit("target.comment 必须是字符串")
+    if target_cfg.get("comment") is not None:
+        comment = target_cfg.get("comment")
+        if not isinstance(comment, str):
+            raise SystemExit("target.comment 必须是字符串")
+        comment = comment.strip()
+        if "\r" in comment or "\n" in comment:
+            # 换行会把 DDL 的 tblproperties 行拆断；引号/反斜杠由 mc.build_ddl 转义
+            raise SystemExit("target.comment 不能包含换行")
+        target_cfg["comment"] = comment
     if "allow_empty" in target_cfg and not isinstance(target_cfg.get("allow_empty"), bool):
         raise SystemExit(f"target.allow_empty 必须是 true/false，实际 {target_cfg.get('allow_empty')!r}")
 
@@ -143,5 +165,9 @@ def validate_job(job: dict) -> list[str]:
             webhook = _require_text(freshness.get("webhook"), "freshness.webhook")
             if not webhook.startswith(("http://", "https://")):
                 raise SystemExit(f"freshness.webhook 必须是 http(s) 开头的地址：{webhook!r}")
+            if webhook.startswith("http://"):
+                warnings.append(
+                    "freshness.webhook 是 http:// 明文地址：告警内容会明文传输，建议改 https（本地调试可忽略）"
+                )
             freshness["webhook"] = webhook
     return warnings

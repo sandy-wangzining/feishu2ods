@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import re
 import time
 
+from .config import IDENT_RE
 from .spool import BATCH_SIZE, FetchStats, SpoolWriter
 from .utils import log, redact
 
@@ -20,7 +22,38 @@ TMP_PARTITION_SUFFIX = "__tmp"  # 写库用临时分区后缀；写完 rename �
 MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
 SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表 / 校验 / 分区增删 / rename）最长等待秒数，0 = 不限制
 SQL_HEARTBEAT_SECONDS = 30  # 长 SQL 的"还在执行"心跳日志间隔
-DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+# https：作业没写 endpoint 时 AK/SK 签名与查询结果不能走明文 HTTP
+DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
+# 分区值白名单：pt 恒为 8 位业务日（用 [0-9] 而不是 \d：\d 还认全角/阿拉伯-印度数字），
+# 写入期的临时分区在 pt 后带 __tmp 后缀
+_PT_RE = re.compile(r"\A[0-9]{8}\Z")
+_TMP_PT_RE = re.compile(r"\A[0-9]{8}__tmp\Z")
+
+
+def _require_pt(pt, *, tmp_ok: bool = False) -> str:
+    """分区值形态校验（写库、count、核对统一从这里过）。"""
+    text = str(pt)
+    if not (_PT_RE.match(text) or (tmp_ok and _TMP_PT_RE.match(text))):
+        suffix = "（写入期可带 __tmp 后缀）" if tmp_ok else ""
+        raise SystemExit(f"分区值必须是 8 位业务日{suffix}：{text!r}")
+    return text
+
+
+def _require_identifier(value, where: str) -> str:
+    """会拼进 DDL/SQL 的标识符（project/table/column）：白名单校验（与 config 同口径）。"""
+    text = str(value)
+    if not IDENT_RE.match(text):
+        raise SystemExit(f"{where} 不是合法标识符（字母/数字/下划线，且不能以数字开头）：{text!r}")
+    return text
+
+
+def _partition_clause(pt) -> str:
+    """拼进 SQL 的 `pt = '<值>'` 子句。
+
+    MaxCompute 没有绑定参数，分区值只能拼进语句；白名单把"能拼什么"锁死
+    （pt 恒为 8 位业务日、写入期临时分区带 __tmp 后缀），注入面归零。
+    """
+    return f"{PARTITION_COLUMN} = '{_require_pt(pt, tmp_ok=True)}'"
 
 
 # =============================================================================
@@ -46,8 +79,10 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
         if timeout and timeout > 0 and now - started > timeout:
             try:
                 instance.stop()
-            except Exception:  # noqa: BLE001 - 取消失败不影响报错
-                pass
+            except Exception as exc:  # noqa: BLE001 - 取消失败不影响报错
+                # 不静默：运维看到"已主动停止"会以为云端 SQL 真的停了（可能仍在跑、占着运行锁），
+                # 排障线索不能丢
+                log(f"    {desc} 取消失败（云端可能仍在执行）：{redact(exc)}")
             raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
         if timeout and timeout > 0 and now - last_log >= SQL_HEARTBEAT_SECONDS:
             log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
@@ -60,7 +95,10 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
 # =============================================================================
 def build_ddl(project: str, table: str, column: str, comment: str) -> str:
     """目标表 DDL：单列 string + pt 分区 + 表注释（标识符已在 validate_job 校验过）。"""
-    table_comment = (comment or "飞书多维表格记录 JSON 原样落库（写临时分区后原子替换 pt=<业务日>）").replace("'", "''")
+    # comment 来自作业配置（用户可任意编辑）：反斜杠是 MaxCompute 字符串字面量里的转义符，
+    # 只替换单引号不够——结尾的 "\" 会吃掉收尾引号、把后续内容当 SQL 解析。先转义反斜杠
+    table_comment = comment or "飞书多维表格记录 JSON 原样落库（写临时分区后原子替换 pt=<业务日>）"
+    table_comment = table_comment.replace("\\", "\\\\").replace("'", "''")
     return (
         f"create table if not exists {project}.{table} (\n"
         f"    {column} string comment '多维表格记录 JSON（英文键，值原样）'\n"
@@ -120,7 +158,12 @@ def _sql_spec(spec: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         value = value[1:-1]
-    return f"{key}='{value}'" if key and value else spec
+    if key and value:
+        # 防御性转义：spec 多数由内部按 pt=<值> 构造，但 purge_stale_tmp_partitions 的
+        # spec 来自服务端的 partition.name——反斜杠/引号不能原样拼进 DDL
+        escaped = value.replace("\\", "\\\\").replace("'", "''")
+        return f"{key}='{escaped}'"
+    return spec
 
 
 def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
@@ -190,16 +233,23 @@ def write_partition(
     - 空快照（target.allow_empty=true）走同样的替换流程（清空正式分区）；否则上游已拦下空表。
     - 兼容旧调用方：第 7 参传记录列表、stats 不给时，就地装进临时 spool + stats。
     """
+    pt = _require_pt(pt)  # 最终分区名直接由它派生（pt / pt__tmp），先过形态白名单
     _temp_spool = None
     if stats is None:
         if not isinstance(spool, (list, tuple)):
             raise TypeError("write_partition 需要同时传 spool 与 stats（新签名）或记录列表（旧签名）")
         records = list(spool)
         spool = SpoolWriter()
-        stats = FetchStats()
-        spool.write_records(records)
-        stats.update(records)
-        _temp_spool = spool  # 兼容分支的临时 spool 归本函数管：结束时统一清理
+        _temp_spool = spool  # 先归本函数管：下面写入抛错时也要保证被 close，否则临时文件泄漏
+        try:
+            stats = FetchStats()
+            spool.write_records(records)
+            stats.update(records)
+        except BaseException:
+            # 兼容分支的写入失败（磁盘满等）还没进下面的 try/finally，在这里先清理再上抛
+            _temp_spool.close()
+            _temp_spool = None
+            raise
     try:
         if stats.count and not stats.min_id:
             raise SystemExit("有记录缺少 record_id，无法做写后核对（检查 Base 接口返回）")
@@ -279,7 +329,9 @@ def write_partition(
 
 def count_partition(o, project: str, table_name: str, pt: str, timeout: int = SQL_TIMEOUT_SECONDS) -> int:
     """写后行数核对：select count(*)（与拉取条数不一致按失败处理）。"""
-    sql = f"select count(*) as cnt from {project}.{table_name} where {PARTITION_COLUMN} = '{pt}'"
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
+    sql = f"select count(*) as cnt from {project}.{table_name} where {_partition_clause(pt)}"
     instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
     with instance.open_reader() as reader:
         for row in reader:
@@ -309,10 +361,13 @@ def verify_partition(
     三件套能覆盖漏行、重复、整段错写（Tunnel 是分批原子提交，配合足够）；逐条比对内容对大表成本太高，不做。
     返回 (行数, 去重 id 数, 最小 id, 最大 id)，空分区时后两项为空串。
     """
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
+    column = _require_identifier(column, "target.column")
     sql = (
         f"select count(*) as cnt, count(distinct rid) as ucnt, min(rid) as mn, max(rid) as mx from ("
         f"select get_json_object({column}, '$.record_id') as rid "
-        f"from {project}.{table_name} where {PARTITION_COLUMN} = '{pt}')"
+        f"from {project}.{table_name} where {_partition_clause(pt)})"
     )
     instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"核对 {table_name} 分区 {pt}")
     with instance.open_reader() as reader:

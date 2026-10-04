@@ -37,7 +37,9 @@ def setup_console() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - 某些重定向流不支持 reconfigure
+        except (AttributeError, OSError, ValueError):
+            # 只吞"这个流不支持 reconfigure"（含 io.UnsupportedOperation，它是 OSError/ValueError
+            # 的子类）；吞掉别的异常会把本函数自身的编程错误也一起静默
             pass
 
 
@@ -71,8 +73,12 @@ def log(msg: str) -> None:
     """
     global _console_patched
     if not _console_patched:
-        setup_console()
-        _console_patched = True
+        # check-then-set 放进锁里：多线程首次调用时不会重复执行 setup_console
+        # （TextIOWrapper.reconfigure 不是线程安全的）
+        with _lock:
+            if not _console_patched:
+                setup_console()
+                _console_patched = True
     line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
     with _lock:
         try:
@@ -127,8 +133,9 @@ _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
-# requests 的连接类异常消息会原样回显整条地址
-_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
+# requests 的连接类异常消息会原样回显整条地址。scheme 部分限长（{0,63}）：无上限时
+# 在长小写字母数字串上会在每个起始位置贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒）
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 值要吃到行尾：只吃第一个词的话 "Authorization: Token abc…" 会变成 "*** abc…"（凭证明文留下）
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
@@ -231,8 +238,8 @@ def _redact_shapes(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
-    # URL userinfo 规则的 [a-z0-9+.\-]* 没有长度上限，长文本上会在每个起始位置贪婪回扫；
-    # 它必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判（其余规则都有长度上限）
+    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判省掉
+    # 一次无谓的全量扫描；scheme 部分已限长（见 _URL_AUTH_RE），配合预判保持线性
     if "://" in out and "@" in out:
         out = _URL_AUTH_RE.sub(_url_auth, out)
     out = _WEBHOOK_RE.sub(_webhook, out)

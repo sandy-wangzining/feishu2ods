@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import pathlib
 import re
+import sys
 
 from .config import DEFAULT_COLUMN, IDENT_RE, validate_job
 from .fetch import fetch_field_sample
@@ -36,6 +38,8 @@ def _default_ask_secret(prompt: str = "") -> str:
     try:
         return getpass.getpass(prompt)
     except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+        # 退回 input() 时输入会明文回显，而提示语里写着"输入不回显"——必须显式纠正预期
+        print("（警告：当前环境无法隐藏输入，接下来输入的密钥会明文回显）", file=sys.stderr)
         return input(prompt)
 
 
@@ -200,6 +204,17 @@ def run_init(
     else:
         echo("❌ access_key_id / access_key_secret 连续三次为空，已取消。")
         return 1
+    # endpoint 不再写死 us-west-1：非该地域的项目生成出来会一跑就连不上，
+    # 而报错要到真正执行时才出现——这里显式问一次（默认值仍是 us-west-1）
+    endpoint = ""
+    for _ in range(3):
+        endpoint = _ask(ask, "   endpoint（非 us-west-1 地域的项目请改）", DEFAULT_ENDPOINT)
+        if endpoint.startswith(("http://", "https://")):
+            break
+        echo("   endpoint 必须以 http(s):// 开头。")
+    else:
+        echo("❌ endpoint 连续三次无效，已取消。")
+        return 1
 
     # ⑧ 新鲜度
     freshness = None
@@ -232,7 +247,7 @@ def run_init(
         "job": job_name,
         "description": f"飞书多维表格 {base_token}/{table_id} → {project}.{table_name}（json + pt 分区，临时分区 + 原子替换）",
         "feishu": feishu,
-        "maxcompute": {"project": project, "endpoint": DEFAULT_ENDPOINT, "access_key_id": ak, "access_key_secret": sk},
+        "maxcompute": {"project": project, "endpoint": endpoint, "access_key_id": ak, "access_key_secret": sk},
         "fields": mapping,
         "target": {
             "project": project,
@@ -255,13 +270,20 @@ def run_init(
     out = pathlib.Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
+        # 文件含 app_secret/AK/SK 明文：先按 0600 创建再写入（write_text 会先按默认 umask
+        # （通常 0644）创建、再 chmod，中间存在同机其他用户可读的窗口期）；
         # newline="\n"：生成的文件固定 LF，Windows 上跑出来的也能直接给服务器用
-        out.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+        if os.name != "nt":
+            os.chmod(out, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
     except OSError as exc:
         echo(f"❌ 写文件失败：{exc}")
         return 1
     echo("")
     echo(f"✅ 已生成：{out}")
+    echo("   ⚠️ 文件含明文密钥（app_secret / AccessKeySecret），请勿提交到版本库；只保留在使用机器上。")
     echo(f"   下一步：python feishu2ods.py --job {out} --check      # 体检（不写库）")
     echo(f"           python feishu2ods.py --job {out} --dry-run    # 试跑（不写库）")
     return 0
