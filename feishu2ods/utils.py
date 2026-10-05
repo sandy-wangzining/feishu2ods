@@ -90,7 +90,11 @@ def log(msg: str) -> None:
             if not _console_patched:
                 setup_console()
                 _console_patched = True
-    line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
+    try:
+        safe_msg = redact(msg)
+    except Exception:  # noqa: BLE001 - 脱敏失败退化为原文：日志绝不能反过来把业务打挂
+        safe_msg = str(msg)
+    line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {safe_msg}"
     # print 与 sink 写入都放在锁外：慢速目标（管道压满、NFS/满盘上的 --log-file）只会
     # 拖慢这条日志本身，不该把全局 _lock 占住——否则其它线程的 log/add_log_sink/
     # remove_log_sink 会一起卡死，整个进程表现为停滞
@@ -390,7 +394,13 @@ def redact(text) -> str:
             f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
             for b in secret.encode("utf-8", "surrogatepass")
         )
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
+        try:
+            encoded_forms = (quote(secret, safe=""), quote_plus(secret))
+        except UnicodeError:
+            # 含孤立代理字符的密钥（surrogateescape 解出的路径名被登记为敏感值）：
+            # quote 内部 strict 编码会抛——跳过编码变体，绝不让脱敏反过来打崩业务
+            encoded_forms = ()
+        for variant in (secret, *encoded_forms, aggressive):
             if variant:
                 out = out.replace(variant, "***")
     return _redact_shapes(out)
@@ -419,7 +429,13 @@ def redact_secrets(values, text) -> str:
             f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
             for b in secret.encode("utf-8", "surrogatepass")
         )
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
+        try:
+            encoded_forms = (quote(secret, safe=""), quote_plus(secret))
+        except UnicodeError:
+            # 含孤立代理字符的密钥（surrogateescape 解出的路径名被登记为敏感值）：
+            # quote 内部 strict 编码会抛——跳过编码变体，绝不让脱敏反过来打崩业务
+            encoded_forms = ()
+        for variant in (secret, *encoded_forms, aggressive):
             if variant:
                 out = out.replace(variant, "***")
     return redact(out)

@@ -1969,7 +1969,7 @@ class TestRedact(OfflineTestCase):
     def test_redact_survives_recursion_error_from_json(self):
         """反转义时 json.loads 抛 RecursionError（超深嵌套）不能打穿脱敏流程。"""
         with mock.patch.object(utils_mod.json, "loads", side_effect=RecursionError("too deep")):
-            out = utils_mod.redact('{"k": "v\"x"}')
+            out = utils_mod.redact('{"k": "v"x"}')
         self.assertIsInstance(out, str)
 
     def test_deeply_nested_equals_does_not_recursion_error(self):
@@ -2019,6 +2019,13 @@ class TestRedact(OfflineTestCase):
         out = utils_mod.redact_secrets([secret], f"url?data={encoded} end")
         self.assertNotIn(encoded, out)
         self.assertIn("***", out)
+
+    def test_redact_survives_surrogate_secret(self):
+        """含孤立代理字符的密钥（surrogateescape 路径名）：脱敏不能抛 UnicodeEncodeError。"""
+        secret = "sk-abc" + chr(0xDCE9) + "xyz"
+        out = utils_mod.redact_secrets([secret], "err: " + secret + " end")
+        self.assertIsInstance(out, str)
+        self.assertNotIn(secret, out)
 
     def test_redact_secrets_accepts_bare_scalar_values(self):
         """values 直接传裸标量（数字/字符串）也不能炸：非 str 值跳过、不误伤文本。"""
