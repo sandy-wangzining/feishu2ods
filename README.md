@@ -11,6 +11,27 @@
 
 环境要求：Python 3.10+（代码用到 `X | None` 类型标注），依赖见 `requirements.txt`（requests + pyodps）。
 
+## 安装
+
+```bash
+# 方式一：pip（建议放虚拟环境；在源码目录执行）
+python3 -m venv venv && ./venv/bin/pip install .    # macOS / Linux
+py -3 -m venv venv; .\venv\Scripts\pip install .    # Windows（PowerShell）
+feishu2ods --version
+
+# 方式二：pipx（全局命令行工具，隔离环境；Windows / macOS / Linux 通用）
+pipx install .
+
+# 方式三：直接从 GitHub 安装
+pipx install "git+https://github.com/sandy-wangzining/feishu2ods.git"
+
+# 方式四：源码直接跑（不安装；Windows 把 python 换成 py -3 即可）
+python feishu2ods.py --job jobs/xxx.json --check
+```
+
+> `python feishu2ods.py` 与 `python -m feishu2ods` 等价（前者是保留给既有调度命令的入口壳）。
+> 运行时要求 Python 3.10+（代码用到 `X | None` 类型标注），Windows 上会自动带上 `tzdata` 依赖。
+
 ## 目录
 
 - `feishu2ods/` 代码包（v1.5.0 起从单文件拆出，按职责分模块）：
@@ -23,7 +44,7 @@
   - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
 - `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
 - `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_example.example.json`）
-- `tests/` 离线单测：`python -m unittest discover -s tests -v`（不访问网络、不连 MaxCompute）
+- `tests/` 离线单测：`python -m unittest discover -s tests -v`（349 条，不访问网络、不连 MaxCompute）
 - `requirements.txt` 依赖（requests + pyodps）
 
 ## 快速开始（已有作业）
@@ -127,6 +148,11 @@ cd ~/feishu2ods
    它是只读的，环境变量 `bizdate` 格式不对时不会把体检拖垮（按默认当天-1 继续并打警告）；
    正式同步路径仍严格要求业务日合法（非法的环境变量 `bizdate` 直接报错，不会静默回退）。
 
+8. **脱敏**：日志与异常里的 app_secret、tenant_access_token、AK/SK、webhook 一律脱敏——
+   形态规则（`Bearer …`、`"key": "value"`、`app_secret=…`）之外，还按配置里的密钥值精确遮蔽，
+   包括其 URL 编码形态（`quote` / `quote_plus`，以及把 `-` 也编码的激进编码器形态；含中文的
+   密钥同样覆盖）：接口把凭证写进自由文本报错时也不会漏；飞书告警卡片走同一套脱敏。
+
 ### 退出码（调度侧判断成败）
 
 | 码 | 含义 |
@@ -166,4 +192,6 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 - 下游解析报错/行数为 0：表格里可能有空白行（日志会提示「全为空」）、或值带尾随空格（如 `"$23.32 "`），
   用 `get_json_object(...) is not null` 过滤空白行、`trim` 后再转数值；
 - 看到 `pt=...__tmp` 分区：某次写入中断留下的临时分区，重跑该作业会自动清掉并重建，不影响正式分区；
+- 日志/告警里会不会出现密钥：不会——统一过脱敏（形态规则 + 按配置里的密钥值精确遮蔽，
+  含 URL 编码形态），告警卡片同样脱敏后才发出；
 - 接新表拿不准配置：`--init` 生成后先 `--check`，报错信息都会指到具体字段。
