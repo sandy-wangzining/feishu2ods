@@ -2013,6 +2013,11 @@ class TestRedact(OfflineTestCase):
         self.assertNotIn(encoded, out)
         self.assertIn("***", out)
 
+    def test_redact_secrets_accepts_bare_scalar_values(self):
+        """values 直接传裸标量（数字/字符串）也不能炸：非 str 值跳过、不误伤文本。"""
+        out = utils_mod.redact_secrets(123456, "charge failed id=123456")
+        self.assertEqual(out, "charge failed id=123456")
+
     def test_redact_secrets_value_first(self):
         out = utils_mod.redact_secrets(["sk-live-abcdef123456"], "error body sk-live-abcdef123456 end")
         self.assertNotIn("sk-live-abcdef123456", out)

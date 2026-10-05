@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **redact_secrets 接受裸标量 values（健壮性）**：`values` 直接传数字/字符串时，原来会把
+  字符串拆成单字符或抛 TypeError；现在按"只有一个密钥"包一层（非字符串值仍跳过、不误伤
+  文本；与 sftp2ods / api2ods 同款）。
+
 - **值级脱敏补一个口子（安全）**：密钥值的 URL 编码形态原来只替 quote/quote_plus 两种
   （`+`/`/`/`=` 被覆盖），部分编码器把 `-` 也编码成 `%2D` 时仍会漏——补"非字母数字全编码"
   变体（`redact` 的值级替换与 `redact_secrets` 两处，与 sftp2ods / api2ods 同口径）。

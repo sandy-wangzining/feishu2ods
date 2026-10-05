@@ -400,6 +400,10 @@ def redact_secrets(values, text) -> str:
     if not text:
         return text
     out = str(text)
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        # 标量（单个字符串/数字）会让下面的 for 抛 TypeError 或把字符串拆成单字符：
+        # 值与 api2ods/sftp2ods 同口径，按"只有一个密钥"包一层
+        values = [values]
     secrets = {secret for secret in (values or ()) if isinstance(secret, str) and len(secret) >= _SECRET_MIN_LEN}
     for secret in sorted(secrets, key=len, reverse=True):
         # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
