@@ -91,38 +91,42 @@ def log(msg: str) -> None:
                 setup_console()
                 _console_patched = True
     line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
-    with _lock:
+    # print 与 sink 写入都放在锁外：慢速目标（管道压满、NFS/满盘上的 --log-file）只会
+    # 拖慢这条日志本身，不该把全局 _lock 占住——否则其它线程的 log/add_log_sink/
+    # remove_log_sink 会一起卡死，整个进程表现为停滞
+    try:
         try:
-            try:
-                print(line, flush=True)
-            except UnicodeEncodeError:
-                encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-                print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
-        except (OSError, ValueError, RuntimeError, AttributeError):
-            # stdout 管道已关闭/断管（BrokenPipeError、`| head` 提前退出、句柄被关；
-            # sys.stdout 属性缺失/解释器收尾等极端形态会抛 RuntimeError/AttributeError）：
-            # 日志函数不能反过来把业务打挂（写文件的那一路下面还有自己的兜底）
-            pass
-        for handle in _sinks:
-            try:
-                handle.write(line + "\n")
-                handle.flush()
-            except Exception as exc:  # noqa: BLE001 - 日志失败绝不能打挂业务（见下）
-                # 这里必须兜住**所有**异常：sink 是外部句柄，写失败的花样不受控
-                # （磁盘满/句柄已关/被塞了 None 之类），而"日志不得打挂业务"是硬约定。
-                # 但必须可见一次，且区分"预期内的 I/O 失败"与"看起来是编程错误"
-                if not _sink_write_warned:
-                    _sink_write_warned = True
-                    kind = "" if isinstance(exc, (OSError, ValueError)) else "（疑似代码缺陷）"
-                    msg = redact(str(exc))
-                    try:
-                        print(
-                            f"警告：--log-file 写入失败{kind}（后续同类错误不再重复提示）：{type(exc).__name__}: {msg}",
-                            file=sys.stderr,
-                        )
-                    except (OSError, ValueError, RuntimeError, AttributeError):
-                        # stderr 也断管/被关（含属性缺失的极端形态）：放弃提示，但绝不让 log() 抛出去
-                        pass
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        # stdout 管道已关闭/断管（BrokenPipeError、`| head` 提前退出、句柄被关；
+        # sys.stdout 属性缺失/解释器收尾等极端形态会抛 RuntimeError/AttributeError）：
+        # 日志函数不能反过来把业务打挂（写文件的那一路下面还有自己的兜底）
+        pass
+    with _lock:
+        sinks = list(_sinks)  # 快照：写的时候不持锁
+    for handle in sinks:
+        try:
+            handle.write(line + "\n")
+            handle.flush()
+        except Exception as exc:  # noqa: BLE001 - 日志失败绝不能打挂业务（见下）
+            # 这里必须兜住**所有**异常：sink 是外部句柄，写失败的花样不受控
+            # （磁盘满/句柄已关/被塞了 None 之类），而"日志不得打挂业务"是硬约定。
+            # 但必须可见一次，且区分"预期内的 I/O 失败"与"看起来是编程错误"
+            if not _sink_write_warned:
+                _sink_write_warned = True
+                kind = "" if isinstance(exc, (OSError, ValueError)) else "（疑似代码缺陷）"
+                msg = redact(str(exc))
+                try:
+                    print(
+                        f"警告：--log-file 写入失败{kind}（后续同类错误不再提示）：{type(exc).__name__}: {msg}",
+                        file=sys.stderr,
+                    )
+                except (OSError, ValueError, RuntimeError, AttributeError):
+                    # stderr 也断管/被关（含属性缺失的极端形态）：放弃提示，但绝不让 log() 抛出去
+                    pass
 
 
 # =============================================================================

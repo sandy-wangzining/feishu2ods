@@ -2130,6 +2130,28 @@ class TestLogFile(OfflineTestCase):
                 cli_mod._open_log_file(tmp)
             self.assertIn("指向的是目录", str(ctx.exception))
 
+    def test_log_sink_write_happens_outside_lock(self):
+        """慢 sink（NFS/满盘）只该拖慢这条日志，不该占住全局锁卡死其它线程。"""
+        seen = {}
+
+        class Probe:
+            def write(self, *_a):
+                seen["locked"] = utils_mod._lock.locked()
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        probe = Probe()
+        utils_mod.add_log_sink(probe)
+        try:
+            utils_mod.log("hello")
+        finally:
+            utils_mod.remove_log_sink(probe)
+        self.assertIs(seen["locked"], False)
+
     def test_log_writes_to_file_sink(self):
         handle = io.StringIO()
         utils_mod.add_log_sink(handle)
