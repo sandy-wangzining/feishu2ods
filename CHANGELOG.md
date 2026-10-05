@@ -6,6 +6,12 @@
 
 ### 修复
 
+- **锁名计算对任意文件名都成立（可靠性）**：作业路径含非 UTF-8 字节（surrogateescape 的
+  代理字符，如从旧系统解包出来的文件名）时，锁名哈希原来 `encode("utf-8")` 直接抛
+  UnicodeEncodeError、进程在加锁前就崩溃；改用 `os.fsencode`（与文件系统同口径）。
+  值级脱敏的"激进编码"变体对同款代理字符补 `surrogatepass`（异常消息带着整条路径时
+  不会反过来把脱敏打崩）。
+
 - **日志写入不再持有全局锁（可靠性）**：log() 原来在模块级锁内执行 stdout 与 --log-file
   的 write/flush——慢速目标（管道被压满、NFS/满盘上的日志盘）会把其它线程的 log_once /
   add_log_sink / remove_log_sink 一起卡死，整个进程表现为停滞；现在锁内只做 sink 快照，

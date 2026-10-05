@@ -295,7 +295,9 @@ def _redact_shapes(text: str, _depth: int = 0) -> str:
         if '\\"' in value:
             try:
                 decoded = json.loads(f'"{value}"')
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError：值里含超深嵌套（构造性 payload）时 json.loads 会递归爆栈；
+                # 脱敏流程不能反过来把进程打崩，按"反转义失败"处理
                 decoded = None
             if decoded is not None:
                 redacted = _redact_shapes(decoded, _depth + 1)
@@ -385,7 +387,8 @@ def redact(text) -> str:
         # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
         # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
         aggressive = "".join(
-            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
+            for b in secret.encode("utf-8", "surrogatepass")
         )
         for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:
@@ -413,7 +416,8 @@ def redact_secrets(values, text) -> str:
         # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
         # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
         aggressive = "".join(
-            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
+            for b in secret.encode("utf-8", "surrogatepass")
         )
         for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:
@@ -736,7 +740,7 @@ def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathl
     stem = resolved.stem or "job"
     # sha256 截 16 位十六进制：sha1 只取 8 位（32 位）时不同作业有可观的碰撞概率，
     # 撞了会互相阻塞（解锁时还可能删错对方的锁）；与 sftp2ods / api2ods 的锁同口径
-    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(os.fsencode(str(resolved).encode("utf-8"))).hexdigest()[:16]
     return _lock_base_dir(root) / f"{stem}-{digest}.lock"
 
 

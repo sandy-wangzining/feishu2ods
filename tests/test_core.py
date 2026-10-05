@@ -1032,6 +1032,8 @@ class TestMc(OfflineTestCase):
         job = make_job()
         job["target"]["allow_empty"] = "false"
         spool_holder = {}
+        # 提前注册清理（放在断言之前）：断言失败时临时 spool 也不能泄漏
+        self.addCleanup(lambda: spool_holder.get("spool") and spool_holder["spool"].path.unlink(missing_ok=True))
 
         def fake_fetch(feishu, mapping, max_pages=None, extra_out=None, sink=None, stats=None):
             spool_holder["spool"] = sink
@@ -1041,7 +1043,6 @@ class TestMc(OfflineTestCase):
             with self.assertRaises(SystemExit) as ctx:
                 cli_mod.run_sync(args, job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertIn("allow_empty", str(ctx.exception))
-        self.addCleanup(spool_holder["spool"].path.unlink, missing_ok=True)
 
     def test_probe_failure_falls_back_to_rebuild_not_drop_first(self):
         """tmp 探测失败（不可信）时不能按"还在"处理：快速路径会先 drop 正式分区，
@@ -1964,6 +1965,12 @@ class TestRedact(OfflineTestCase):
         out = utils_mod.redact('{"password": 12345, "page": 2}')
         self.assertNotIn("12345", out)
         self.assertIn("***", out)
+
+    def test_redact_survives_recursion_error_from_json(self):
+        """反转义时 json.loads 抛 RecursionError（超深嵌套）不能打穿脱敏流程。"""
+        with mock.patch.object(utils_mod.json, "loads", side_effect=RecursionError("too deep")):
+            out = utils_mod.redact('{"k": "v\"x"}')
+        self.assertIsInstance(out, str)
 
     def test_deeply_nested_equals_does_not_recursion_error(self):
         """构造性文本（上千个等号连写）不能把脱敏本身打成 RecursionError。
