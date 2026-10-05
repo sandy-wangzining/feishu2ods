@@ -51,7 +51,6 @@ def fetch_records(
     token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
     fields: list[str] | None = None
     rev: object = None
-    rev_seen = False
     record_ids: list[str] = []
     # 防死循环的状态：上一页 ID（检测相邻页重叠）+ 页级指纹（检测接口忽略 offset 重复返回
     # 同一页）。两者内存都只与单页/页数有关——原来把全量 record_id 存进 set，500 万行
@@ -61,7 +60,9 @@ def fetch_records(
     raw_rows: list[list] = []
     offset = 0
     page = 1
-    token_refreshed = False
+    # 允许的 token 重取次数：大表翻页可能跑几十分钟以上、token（2h）会过期，
+    # 一次性标志会让第二次失效直接中止整轮；给个上限防死循环即可
+    token_refreshes_left = 3
     rate_tries = 0
     stream = sink is not None
     while True:
@@ -74,8 +75,8 @@ def fetch_records(
                 headers={"Authorization": f"Bearer {token}"},
             )
         except ApiHttpError as exc:
-            if exc.status == 401 and not token_refreshed:
-                token_refreshed = True
+            if exc.status == 401 and token_refreshes_left > 0:
+                token_refreshes_left -= 1
                 log("  access token 已失效，重新获取后重试本页")
                 token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
                 continue
@@ -84,8 +85,8 @@ def fetch_records(
             raise SystemExit("拉取记录失败：接口返回不是 JSON 对象")
         if data.get("code") != 0:
             code = data.get("code")
-            if code in TOKEN_ERROR_CODES and not token_refreshed:
-                token_refreshed = True
+            if code in TOKEN_ERROR_CODES and token_refreshes_left > 0:
+                token_refreshes_left -= 1
                 log(f"  access token 已失效（code={code}），重新获取后重试本页")
                 token = get_tenant_token(feishu["app_id"], feishu["app_secret"])
                 continue
@@ -97,17 +98,17 @@ def fetch_records(
             raise SystemExit(f"拉取记录失败：code={code} msg={data.get('msg')}")
 
         payload = data.get("data") or {}
-        # 表格版本号一致性：offset 翻页期间被删行会静默漏数据，页间 rev 变了就中止
+        # 表格版本号一致性：offset 翻页期间被删行会静默漏数据，页间 rev 变了就中止。
+        # 用「首个带 rev 的页」建立基准，而不是死认第一页——首屏偶发缺 rev 时，
+        # 原实现会把后续所有页的 rev 比对全部跳过（检查静默失效），现在不会。
         page_rev = payload.get("rev")
-        if rev_seen:
-            if rev is not None and page_rev is not None and page_rev != rev:
-                raise SystemExit(
-                    f"翻页期间表格内容发生变化（rev {rev} → {page_rev}）：offset 翻页可能漏行，"
-                    f"本次快照不可信，已中止；请稍后重跑"
-                )
-        else:
+        if rev is None:
             rev = page_rev
-            rev_seen = True
+        elif page_rev is not None and page_rev != rev:
+            raise SystemExit(
+                f"翻页期间表格内容发生变化（rev {rev} → {page_rev}）：offset 翻页可能漏行，"
+                f"本次快照不可信，已中止；请稍后重跑"
+            )
         page_fields = [str(item) for item in (payload.get("fields") or [])]
         if fields is None:
             fields = page_fields

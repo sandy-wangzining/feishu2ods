@@ -35,7 +35,9 @@ from .utils import (
     redact,
     redact_secrets,
     remove_log_sink,
+    reset_lock_warning,
     setup_console,
+    table_lock_path,
 )
 from .wizard import run_init
 
@@ -72,7 +74,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--bizdate",
-        default="",
+        default=None,
+        # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
+        # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退成"昨天"
         help="业务日 pt（YYYYMMDD 或 YYYY-MM-DD）；默认取环境变量 bizdate/SKYNET_BIZDATE，再默认当天-1",
     )
     parser.add_argument("--dry-run", action="store_true", help="只拉数并打印统计，不写 MaxCompute")
@@ -218,7 +222,11 @@ def run_sync(
             )
 
         # ---- ② 空表 / 新鲜度校验（缺失 → 告警 + 非 0 退出，不写库）----
-        allow_empty = bool(target_cfg.get("allow_empty", False))
+        allow_empty = target_cfg.get("allow_empty", False)
+        if not isinstance(allow_empty, bool):
+            # validate_job 会拦；库调用方没走校验时，bool("false") 会静默变成 True、跳过 0 行保护
+            # （源表被截断成 0 行时照样写空分区、退出码 0）。与 lag_days 同口径：显式校验类型。
+            raise SystemExit(f"target.allow_empty 必须是 true/false，实际 {allow_empty!r}")
         if count == 0 and not allow_empty:
             log("❌ 拉取到 0 条记录，已中止（target.allow_empty=false，拒绝写入空分区）")
             if not args.no_notify:
@@ -373,6 +381,7 @@ def _run(args, started: float) -> int:
     # 脱敏表是模块级状态：每次运行前先清空再登记，避免同一进程里多次调用 main() 时
     # 上一轮的密钥值残留（值级替换会一直带着它，且下一轮日志脱敏口径被污染）。
     _SECRETS.clear()
+    reset_lock_warning()  # 同上："文件系统不支持锁"的告警去重也按每次运行重来
     # 先把 job 里疑似密钥的值登记进脱敏表，再校验/打日志：
     # 校验报错会回显非法值，密钥写错形态时也不该出现在日志里
     for secret in collect_secret_values(job):
@@ -388,7 +397,11 @@ def _run(args, started: float) -> int:
     if args.table:
         args.table = _require_identifier(args.table, "--table")
     project = args.project or target_cfg.get("project") or maxcompute.get("project")
-    table_name = args.table or target_cfg["table"]
+    # validate_job 已保证 target.table 存在并写回；这里仍用 .get + 明确报错做防御：
+    # 未来调用顺序若变化，KeyError 会被当成"未预期错误"，而这句能直接指出缺什么
+    table_name = args.table or target_cfg.get("table")
+    if not table_name:
+        raise SystemExit("没有目标表名：请在作业文件的 target.table 里指定（或用 --table 覆盖）")
     column = target_cfg.get("column") or DEFAULT_COLUMN
     # --check 是只读体检：环境变量 bizdate 格式不对时不该把体检也拖垮（按默认业务日继续）；
     # 正式同步路径保持严格（非法业务日必须报错，绝不静默回退成"昨天"写错分区）
@@ -405,7 +418,10 @@ def _run(args, started: float) -> int:
         return run_check(job, project, table_name, column, pt)
 
     with RunLock(lock_path(pathlib.Path(args.job).resolve())):  # 同机同一作业互斥；不同作业可并行
-        return run_sync(args, job, project, table_name, column, pt, bizdate, started)
+        # 表级锁再兜一层：不同作业（两份配置）指向同一张表时，上面的作业锁互不阻塞，
+        # purge/rename 会互相拆台、一方数据被静默覆盖——同机同表也必须串行
+        with RunLock(table_lock_path(project, table_name)):
+            return run_sync(args, job, project, table_name, column, pt, bizdate, started)
 
 
 if __name__ == "__main__":

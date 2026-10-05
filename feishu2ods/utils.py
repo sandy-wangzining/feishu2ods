@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -45,9 +46,16 @@ def setup_console() -> None:
 
 
 def add_log_sink(handle) -> None:
-    """把日志再写一份到文件（--log-file），句柄由调用方负责关闭。"""
+    """把日志再写一份到文件（--log-file），句柄由调用方负责关闭。
+
+    重复登记同一句柄会让每条日志写两遍，且摘除/关闭后列表里还留着失效句柄（再写就抛）；
+    这里按身份去重，None 直接忽略（留在列表里会让每次 log() 都炸在 handle.write 上）。
+    """
+    if handle is None:
+        return
     with _lock:
-        _sinks.append(handle)
+        if handle not in _sinks:
+            _sinks.append(handle)
 
 
 def remove_log_sink(handle) -> None:
@@ -85,21 +93,36 @@ def log(msg: str) -> None:
     line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg)}"
     with _lock:
         try:
-            print(line, flush=True)
-        except UnicodeEncodeError:
-            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-            print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
+            try:
+                print(line, flush=True)
+            except UnicodeEncodeError:
+                encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+                print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            # stdout 管道已关闭/断管（BrokenPipeError、`| head` 提前退出、句柄被关；
+            # sys.stdout 属性缺失/解释器收尾等极端形态会抛 RuntimeError/AttributeError）：
+            # 日志函数不能反过来把业务打挂（写文件的那一路下面还有自己的兜底）
+            pass
         for handle in _sinks:
             try:
                 handle.write(line + "\n")
                 handle.flush()
-            except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程
+            except Exception as exc:  # noqa: BLE001 - 日志失败绝不能打挂业务（见下）
+                # 这里必须兜住**所有**异常：sink 是外部句柄，写失败的花样不受控
+                # （磁盘满/句柄已关/被塞了 None 之类），而"日志不得打挂业务"是硬约定。
+                # 但必须可见一次，且区分"预期内的 I/O 失败"与"看起来是编程错误"
                 if not _sink_write_warned:
                     _sink_write_warned = True
-                    print(
-                        f"警告：--log-file 写入失败（后续同类错误不再重复提示）：{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
+                    kind = "" if isinstance(exc, (OSError, ValueError)) else "（疑似代码缺陷）"
+                    msg = redact(str(exc))
+                    try:
+                        print(
+                            f"警告：--log-file 写入失败{kind}（后续同类错误不再重复提示）：{type(exc).__name__}: {msg}",
+                            file=sys.stderr,
+                        )
+                    except (OSError, ValueError, RuntimeError, AttributeError):
+                        # stderr 也断管/被关（含属性缺失的极端形态）：放弃提示，但绝不让 log() 抛出去
+                        pass
 
 
 # =============================================================================
@@ -133,23 +156,67 @@ _SENSITIVE_WORDS = {
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
-_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']+)")
+_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})([\"']?)([:=])([ \t]*)([^&\s\"']+)")
+# 敏感键的值吃到行尾/`&`为止：`password=my secret` 原来只遮 "my"、"secret" 明文留下
+# （口令短语很常见）。负向先行断言只挡「引号后紧跟 ***」的已遮罩文本（避免把
+# `"secret_key": "***", "page": 2` 整行再吞一遍）；未闭合引号（password="abc 被日志
+# 截断）或「带引号的键」+ 不带引号的值（\"password\": my secret）必须走这条兜底——
+# 否则 KV/JSON 要收尾引号、常规 QUERY 的值类不吃引号，三套规则全绕过
+_QUERY_SPACE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)(?!\s*[\"']?\s*\*\*\*)(?P<val>[^&\n]+)"
+)
+
+
+def _mask_spaced_values(text: str) -> str:
+    """敏感键 + 无引号值遮到行尾/`&`（口令短语含空格不被第一个词截断）。
+
+    用扫描器而不是一次 sub：非敏感键的贪婪值会吞掉其后的 k=v（sub 不重叠），
+    这里非敏感只前移到"值起点"继续扫，后续键照常处理。
+    """
+    parts: list[str] = []
+    pos = 0
+    while True:
+        match = _QUERY_SPACE_RE.search(text, pos)
+        if not match:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos : match.start()])
+        head = f"{match.group('key')}{match.group('q')}{match.group('sep')}"
+        if _is_sensitive_key(match.group("key")):
+            parts.append(head + "***")
+            pos = match.end()
+        else:
+            parts.append(head)
+            pos = match.start("val")
+    return "".join(parts)
+
+
 # 同时认单引号：异常里直接插值的 dict（f"{cfg}"）和 repr（{exc!r}）都是单引号形态。
 # 值用「回引号」收尾而不是 [^"']*：repr 对「值里含单引号」的串会改用双引号包裹。
 # 值体里 (?!\\.) 让两个分支互斥：否则一串反斜杠会让回溯指数爆炸（同 api2ods/sftp2ods 的修复）。
 _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!\\.)(?!(?P=q))[\s\S])*)(?P=q)""")
+# 键不带引号、值带引号（access_token='t-xxx' / app_secret: "xx"）：f-string 的 !r 插值与
+# repr 的输出正好是这种形态，而 _QUERY_RE 的值部分 [^&\s"']+ 不吃引号——行中出现的这类
+# 取值会整段漏遮（行首的由 _HEADER_RE 兜底，行中不会）。值体与 _JSON_RE 同款互斥分支，
+# 转义引号与「另一种引号出现在值里」（repr 会改用另一种引号包裹）都能认。
+_KV_QUOTED_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})(\s*[:=]\s*)(?P<q>[\"'])((?:\\.|(?!\\.)(?!(?P=q))[^\n])*)(?P=q)"
+)
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
 # requests 的连接类异常消息会原样回显整条地址。scheme 部分限长（{0,63}）：无上限时
 # 在长小写字母数字串上会在每个起始位置贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒）
-_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^/\s@]+)@")
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^\s/]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 值要吃到行尾：只吃第一个词的话 "Authorization: Token abc…" 会变成 "*** abc…"（凭证明文留下）
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
 # 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>；scheme 部分可选——
 # requests 的异常消息里只带 URL 的路径（"Max retries exceeded with url: /open-apis/..."）
-_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']*?)?/hook/)[A-Za-z0-9\-_]{4,}")
+# 可选前缀限长（{0,1024}）：无上限的惰性展开在"超长且无空白、又没有 /hook/"的
+# 文本上会二次回溯（每个 https:// 起点都要扫到 token 末尾）；限长后保持线性。
+# 真实 webhook 的 URL 前缀远短于 1024 字符。
+_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']{0,256}?)?/hook/)[A-Za-z0-9\-_]{4,}")
 # 飞书 webhook 里的 hook id（/hook/<id>）：报错/日志里常只出现后半截
 _WEBHOOK_ID_RE = re.compile(r"/hook/([A-Za-z0-9\-_]{4,})")
 
@@ -181,15 +248,25 @@ def _is_sensitive_key(name) -> bool:
     )
 
 
-def _redact_shapes(text: str) -> str:
+# 脱敏递归的深度上限：正常文本（嵌套 JSON、值里再嵌 k=v）深度 ≤3；构造性文本
+# （如 "a=b=c=…" 上千个等号、第三方响应体里的任意内容）能把递归喂到 Python 上限，
+# 把"脱敏"本身打成 RecursionError。到上限按"宁可多脱敏"整段遮掉。
+_MAX_REDACT_DEPTH = 10
+
+
+def _redact_shapes(text: str, _depth: int = 0) -> str:
     """形态级脱敏：把「认得出的凭证写法」里的值换成 ***。
 
-    覆盖：Bearer/Basic、JSON/配置片段（"secret_key": "…"）、URL userinfo、飞书 webhook、
-    URL query（?token=…）、请求头行（X-Api-Key: …）。
+    覆盖：Bearer/Basic、JSON/配置片段（"secret_key": "…"）、带引号值（token='…'）、
+    URL userinfo、飞书 webhook、URL query（?token=…）、请求头行（X-Api-Key: …）。
     规则顺序按"认得出的形态"从严到宽：Bearer/Basic 与配置片段先处理——query 规则会按
     `=` / `:` 把值截断，先跑它的话 `header: 'Authorization=Bearer abc'` 会被切成
     `Authorization=`，后面的 Bearer 规则就再也匹配不到了（令牌原样留在日志里）。
+
+    _depth：内部递归深度，调用方不要传（见 _MAX_REDACT_DEPTH）。
     """
+    if _depth >= _MAX_REDACT_DEPTH:
+        return "***"
 
     def _bearer(match: re.Match) -> str:
         """Bearer / Basic 形态：scheme 保留，值换掉。"""
@@ -217,31 +294,44 @@ def _redact_shapes(text: str) -> str:
             except ValueError:
                 decoded = None
             if decoded is not None:
-                redacted = _redact_shapes(decoded)
+                redacted = _redact_shapes(decoded, _depth + 1)
                 if redacted != decoded:
                     return f"{prefix}{qchar}{json.dumps(redacted, ensure_ascii=False)[1:-1]}{qchar}"
         # 键名不敏感时值里也可能藏着密钥（'X-Api-Key: xxx' 头行、查询串、嵌套结构），递归一次
-        return f"{prefix}{qchar}{_redact_shapes(value)}{qchar}"
+        return f"{prefix}{qchar}{_redact_shapes(value, _depth + 1)}{qchar}"
+
+    def _kv_quoted(match: re.Match) -> str:
+        """`key='value'` / `key: "value"`（键无引号、值有引号）：命中密钥词才遮值。"""
+        key, gap, qchar, value = (match.group(1), match.group(2), match.group(3), match.group(4))
+        head = f"{key}{gap}{qchar}"
+        if _is_sensitive_key(key):
+            return f"{head}***{qchar}"
+        # 键名不敏感时值里也可能藏着密钥（'note=access_token=abc'）：递归一次兜底
+        redacted = _redact_shapes(value, _depth + 1)
+        if redacted != value:
+            return f"{head}{redacted}{qchar}"
+        return match.group(0)
 
     def _query(match: re.Match) -> str:
-        """URL 查询串 / `key=value`：命中密钥词才替换，其余递归兜底。"""
-        if _is_sensitive_key(match.group(1)):
-            return f"{match.group(1)}=***"
-        value = match.group(2)
+        """URL 查询串 / `"key": 12345`：命中密钥词才替换，其余递归兜底。"""
+        key, quote, sep, gap, value = (match.group(1), match.group(2), match.group(3), match.group(4), match.group(5))
+        head = f"{key}{quote}{sep}{gap}"  # 原样保留引号/分隔符/空白，只换值
+        if _is_sensitive_key(key):
+            return f"{head}***"
         if "%" in value:
             try:
                 decoded = unquote(value)
             except Exception:  # noqa: BLE001 - 解码失败按原文处理
                 decoded = value
-            if decoded != value and _redact_shapes(decoded) != decoded:
-                return f"{match.group(1)}=***"
-        return f"{match.group(1)}={_redact_shapes(value)}"
+            if decoded != value and _redact_shapes(decoded, _depth + 1) != decoded:
+                return f"{head}***"
+        return f"{head}{_redact_shapes(value, _depth + 1)}"
 
     def _header(match: re.Match) -> str:
         """多行文本里的一行 "Header: value"：只吃头名命中密钥词的行。"""
         if _is_sensitive_key(match.group(2)):
             return f"{match.group(1)}***"
-        return f"{match.group(1)}{_redact_shapes(match.group(3))}"
+        return f"{match.group(1)}{_redact_shapes(match.group(3), _depth + 1)}"
 
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
@@ -254,6 +344,9 @@ def _redact_shapes(text: str) -> str:
     # JSON 片段规则至少要出现引号才可能匹配：没引号的长文本直接跳过，省一遍全量扫描
     if '"' in out or "'" in out:
         out = _JSON_RE.sub(_json, out)
+        out = _KV_QUOTED_RE.sub(_kv_quoted, out)
+    # 敏感键 + 无引号值先整体遮到行尾（password=my secret），再走常规 query 扫描
+    out = _mask_spaced_values(out)
     out = _QUERY_RE.sub(_query, out)
     # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
     return _HEADER_RE.sub(_header, out)
@@ -283,7 +376,14 @@ def redact(text) -> str:
         # 短于 _SECRET_MIN_LEN 的值（`1` / `ok`）出现在普通文本里太常见，值级替换会把报错搅乱
         if not secret or len(secret) < _SECRET_MIN_LEN:
             continue
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
+        # 编码形态的说法：`+`/`/`/`=` 会被 quote 编码；部分编码器更激进，连 `-` 也编码
+        # 成 %2D——明文、quote、quote_plus 与"非字母数字全编码"四种形态一起替换
+        # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
+        # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
+        aggressive = "".join(
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+        )
+        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:
                 out = out.replace(variant, "***")
     return _redact_shapes(out)
@@ -302,7 +402,12 @@ def redact_secrets(values, text) -> str:
     out = str(text)
     secrets = {secret for secret in (values or ()) if isinstance(secret, str) and len(secret) >= _SECRET_MIN_LEN}
     for secret in sorted(secrets, key=len, reverse=True):
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
+        # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
+        # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
+        aggressive = "".join(
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+        )
+        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:
                 out = out.replace(variant, "***")
     return redact(out)
@@ -361,10 +466,17 @@ def collect_secret_values(job: dict) -> list[str]:
 
 
 def _api_err(data) -> str:
-    """接口返回里的 code/msg → 报错片段（data 不是对象时也能安全展示）。"""
+    """接口返回里的 code/msg → 报错片段（data 不是对象时也能安全展示）。
+
+    返回值统一过 redact：调用方把它拼进 SystemExit/异常，而 SystemExit 文本可能被
+    调度器直接打到 stderr，不经过 log() 的脱敏——接口回显的网关错误页里可能带
+    `https://user:pass@host` 或 `?access_token=xxx`，msg 里也常回显参数。
+    """
     if isinstance(data, dict):
-        return f"code={data.get('code')} msg={data.get('msg')}"
-    return f"接口返回不是 JSON 对象：{str(data)[:200]}"
+        return redact(f"code={data.get('code')} msg={data.get('msg')}")
+    # 先脱敏再截断：先截 200 字符会把成对的引号截断（值只剩开引号），所有按「成对引号」
+    # 认边界的形态规则失配，凭证原样漏出
+    return f"接口返回不是 JSON 对象：{redact(str(data))[:200]}"
 
 
 # =============================================================================
@@ -396,7 +508,9 @@ class RunLock:
             open_kwargs = {"encoding": "utf-8", "errors": "replace"}
             nofollow = getattr(os, "O_NOFOLLOW", 0)
             if nofollow:
-                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf)
+                # 显式传 mode：io.open 的 opener 约定只有 (path, flags)，os.open 缺省 mode=0o777
+                # （umask 决定最终权限，umask=0 时锁文件 0777）；锁文件按 0600 创建
+                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
             self.fh = open(self.path, "a+", **open_kwargs)
         except (OSError, UnicodeError) as exc:
             raise SystemExit(
@@ -462,21 +576,73 @@ class RunLock:
 
 
 def _try_lock(fh) -> bool:
-    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。"""
+    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。
+
+    三类 OSError 必须分开：忙 = False（真有人持锁）；"文件系统不支持锁"（ENOLCK/ENOTSUP，
+    如 NFS/只读挂载）= 告警一次后按无锁继续；其余上抛，别让它冒充"已有任务在运行"。
+    """
     if fcntl is not None:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return _lock_oserror_result(exc)
     if msvcrt is not None:
         try:
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return _lock_oserror_result(exc)
     return True  # 两种锁都没有：不阻塞（退回"无锁"行为）
+
+
+# flock / msvcrt 忙（别人正持锁）。EDEADLK/EDEADLOCK 会出现于 Windows 的 LK_NBLCK。
+_LOCK_BUSY = {errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK}
+for _name in ("EDEADLK", "EDEADLOCK"):
+    if hasattr(errno, _name):
+        _LOCK_BUSY.add(getattr(errno, _name))
+# 文件系统不支持锁 / 锁资源耗尽：不是"别人在跑"，不能伪装成"已有任务在运行"
+_LOCK_UNSUPPORTED = {
+    value for value in (getattr(errno, name, None) for name in ("ENOLCK", "ENOTSUP", "EOPNOTSUPP")) if value
+}
+_lock_warned = False
+
+
+def reset_lock_warning() -> None:
+    """清掉"文件系统不支持锁"的告警去重标记（每次运行开始时调，与 _SECRETS 同口径）。"""
+    global _lock_warned
+    _lock_warned = False
+
+
+def _lock_oserror_result(exc: OSError) -> bool:
+    """加锁失败的 OSError：忙 → False；文件系统不支持锁 → 默认 fail-closed 拒绝执行，
+    除非显式设置 FEISHU2ODS_ALLOW_NO_LOCK=1 接受无互斥风险。
+
+    拿不到 errno（部分 Windows msvcrt 失败形态）时保守按"忙"处理：宁可提示得含糊一点，
+    也不能把"确实有别的实例在跑"误判成"没有锁"而放过去（并发写同一分区才是真事故）。
+    """
+    global _lock_warned
+    code = exc.errno
+    if code is None or code == 0 or code in _LOCK_BUSY:
+        return False
+    if code in _LOCK_UNSUPPORTED:
+        if os.environ.get("FEISHU2ODS_ALLOW_NO_LOCK", "").strip() == "1":
+            if not _lock_warned:
+                _lock_warned = True
+                log(
+                    f"  警告：文件系统不支持运行锁（{exc}）；FEISHU2ODS_ALLOW_NO_LOCK=1 "
+                    f"已显式接受无互斥风险，本次不加锁继续"
+                )
+            return True
+        # fail-closed：无锁继续会让两个实例并发写同一作业/表（purge/rename 互拆、数据被
+        # 静默覆盖），宁可拒绝执行——把锁目录指到支持锁的本地磁盘再跑
+        raise SystemExit(
+            f"运行锁所在文件系统不支持加锁（{exc}）：拒绝无锁执行（并发实例会互相写坏数据）。"
+            f"请用 FEISHU2ODS_LOCK_DIR 把锁目录指到本地磁盘，"
+            f"或确认无人并发时设置 FEISHU2ODS_ALLOW_NO_LOCK=1"
+        )
+    raise
 
 
 def _unlock(fh) -> None:
@@ -494,35 +660,84 @@ def _unlock(fh) -> None:
             pass
 
 
-def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathlib.Path:
-    """每个作业一把运行锁（不同作业可并行，同一作业不会重复跑）。
+def _lock_base_dir(root: pathlib.Path | None = None) -> pathlib.Path:
+    """运行锁目录解析（lock_path 与 table_lock_path 共用）。
 
-    优先放工具目录下 .run-locks/；工具目录不可写（如 pip 装在只读位置）时退回系统临时目录；
-    root 显式指定锁目录（单元测试用，避免往工具目录写测试残留）。
-    锁名带路径哈希：jobs/a/api.json 与 jobs/b/api.json 同名不同作业，只按文件名会互相阻塞。
-    注意：锁文件在各机器本地磁盘上，只保证单机互斥（跨机并发仍会互相写坏，正式跑固定一台）。
+    优先级：root 参数（单元测试用）> 环境变量 FEISHU2ODS_LOCK_DIR > 工具目录下
+    .run-locks/ > 系统临时目录。`FEISHU2ODS_LOCK_DIR` 用于把锁钉在与运行者身份/环境
+    无关的同一目录上——否则"root 能写工具目录、普通用户退回 TMPDIR"这类差异会让同一
+    作业的两个实例锁在不同文件上，互斥静默失效。
     """
-    resolved = pathlib.Path(job_path).expanduser().resolve()
-    stem = resolved.stem or "job"
-    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:8]
-    name = f"{stem}-{digest}"
     if root is not None:
         base = pathlib.Path(root)
         base.mkdir(parents=True, exist_ok=True)
-        return base / f"{name}.lock"
+        return base
+    override = os.environ.get("FEISHU2ODS_LOCK_DIR", "").strip()
+    if override:
+        base = pathlib.Path(override).expanduser()
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # 显式指定的目录不可用要立刻失败：静默换目录等于互斥失效，正是这个开关要防的事
+            raise SystemExit(f"FEISHU2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
+        return base
     candidates = [
         pathlib.Path(__file__).resolve().parent / ".run-locks",
         pathlib.Path(tempfile.gettempdir()) / "feishu2ods-locks",
     ]
-    for base in candidates:
+    for index, base in enumerate(candidates):
         try:
             base.mkdir(parents=True, exist_ok=True)
             # 探测文件名必须唯一（mkstemp）：并发启动时共享的探测文件会被别的进程删掉，
             # 导致"静默"落到下一个候选目录——同一作业的两个实例锁在不同路径上，互斥失效
             handle, probe = tempfile.mkstemp(prefix=".probe-", dir=str(base))
             os.close(handle)
-            os.unlink(probe)
-            return base / f"{name}.lock"
         except OSError:
             continue
-    return pathlib.Path(tempfile.gettempdir()) / f"feishu2ods-{name}.lock"
+        try:
+            os.unlink(probe)
+        except OSError:
+            # 探测文件删不掉（少见：只读挂载/文件被占用）不该把整个目录判成不可用——
+            # 否则会静默换目录，同一作业的两个实例锁在不同路径上，互斥失效。
+            pass
+        if index > 0:
+            # 退回目录是按用户/环境解析的（TMPDIR、macOS 的 /var/folders、systemd PrivateTmp）：
+            # 不同身份/环境跑同一作业可能拿到不同目录，互斥静默失效。至少把事实说出来
+            log(
+                f"  提示：工具目录不可写，运行锁放在 {base}；"
+                f"若存在多用户/多环境混跑，请用 FEISHU2ODS_LOCK_DIR 固定同一锁目录"
+            )
+        return base
+    # 两个候选目录都探测失败（极罕见：工具目录与系统临时目录都不可写）：最后退回系统
+    # 临时目录。路径可能与其它实例的锁目录不一致（互斥可能失效），必须显式提示
+    fallback = pathlib.Path(tempfile.gettempdir())
+    log(
+        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
+        f"请用 FEISHU2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
+    )
+    return fallback
+
+
+def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathlib.Path:
+    """每个作业一把运行锁（不同作业可并行，同一作业不会重复跑）。
+
+    锁名带路径哈希：jobs/a/api.json 与 jobs/b/api.json 同名不同作业，只按文件名会互相阻塞。
+    注意：锁文件在各机器本地磁盘上，只保证单机互斥（跨机并发仍会互相写坏，正式跑固定一台）。
+    """
+    resolved = pathlib.Path(job_path).expanduser().resolve()
+    stem = resolved.stem or "job"
+    # sha256 截 16 位十六进制：sha1 只取 8 位（32 位）时不同作业有可观的碰撞概率，
+    # 撞了会互相阻塞（解锁时还可能删错对方的锁）；与 sftp2ods / api2ods 的锁同口径
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return _lock_base_dir(root) / f"{stem}-{digest}.lock"
+
+
+def table_lock_path(project: str, table: str, root: pathlib.Path | None = None) -> pathlib.Path:
+    """目标表级运行锁：不同作业（两份配置）指向同一张表时也要串行。
+
+    作业锁只管"同一个作业不重复跑"：jobs/a.json 与 jobs/b.json 写同一张表时互不阻塞，
+    一边的 purge 会清掉另一边正在写的临时分区、rename 交叉执行，最终一方数据被静默覆盖
+    （各自的写后核对只校验自己这批行数，发现不了）。锁名直接用「项目.表名」：两者都已过
+    标识符白名单（字母/数字/下划线），做文件名安全；同一张表的任何写法都会撞到同一把锁。
+    """
+    return _lock_base_dir(root) / f"table-{project}.{table}.lock"

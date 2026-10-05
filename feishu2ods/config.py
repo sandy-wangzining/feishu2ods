@@ -62,11 +62,19 @@ def _require_identifier(value, where: str) -> str:
     return text
 
 
+_FEISHU_ID_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+
+
 def _require_feishu_id(value, where: str) -> str:
-    """base_token / table_id：会拼进飞书 URL 路径，拒绝空白和 / ? #（避免路径被拆/注入）。"""
+    """base_token / table_id：会拼进飞书 URL 路径，按正向白名单校验。
+
+    黑名单（只挡空白与 /?#）挡不住 ".." 和 "%2F" 这类能改变路径语义的值——
+    `bases/../tables/...` 会把带 tenant_access_token 的请求打到非预期接口。
+    飞书的 base_token/table_id 都是字母数字（可含 - _），白名单之外一律拒绝。
+    """
     text = _require_text(value, where)
-    if any(ch.isspace() or ch in "/?#" for ch in text):
-        raise SystemExit(f"{where} 不能包含空白或 / ? #：{text!r}")
+    if not _FEISHU_ID_RE.match(text):
+        raise SystemExit(f"{where} 只允许字母/数字/下划线/中划线：{text!r}")
     return text
 
 
