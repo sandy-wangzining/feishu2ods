@@ -2049,6 +2049,17 @@ class TestRedact(OfflineTestCase):
             finally:
                 handle.close()
 
+    def test_reset_secret_values_accepts_scalars(self):
+        """标量入参要规范化：字符串不能被按字符拆开（脱敏表为空）、数字不能 TypeError。"""
+        utils_mod.reset_secret_values("sk-live-9f3a1b")
+        self.assertIn("sk-live-9f3a1b", utils_mod._SECRETS)
+        utils_mod.reset_secret_values(1234567890)
+        self.assertIn("1234567890", utils_mod._SECRETS)
+        out = utils_mod.redact("Invalid token: sk-live-9f3a1b")
+        self.assertNotIn("sk-live-9f3a1b", out)  # 这里已换成数字表，只验证不崩
+        utils_mod.reset_secret_values(None)
+        self.assertEqual(utils_mod._SECRETS, [])
+
     def test_redact_secrets_masks_numeric_secret(self):
         """数字型密钥（ID 类凭证）str 化后要遮蔽，不能被 isinstance(str) 静默丢弃。"""
         out = utils_mod.redact_secrets(1234567890, "auth failed id=1234567890 end")

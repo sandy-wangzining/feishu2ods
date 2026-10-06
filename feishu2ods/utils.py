@@ -36,6 +36,12 @@ def reset_secret_values(values) -> None:
     锁内完成 clear+登记：`_SECRETS` 是模块级状态，并发调用 main() 时"先清空"会把
     另一轮已登记的密钥抹掉（该轮日志漏遮）；redact() 读它也要走同一把锁的快照语义。
     """
+    if values is None:
+        values = []
+    elif not isinstance(values, (list, tuple, set, frozenset)):
+        # 与 redact_secrets 同口径的入参规范化：标量直接传进来时，字符串会被 for
+        # 按字符拆开（全部短于阈值被跳过、脱敏表实际为空）、数字会 TypeError
+        values = [values]
     with _lock:
         _SECRETS.clear()
         _SECRETS.extend(str(v) for v in values if isinstance(v, (str, int, float)) and not isinstance(v, bool))
