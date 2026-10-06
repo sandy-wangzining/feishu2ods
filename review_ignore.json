@@ -1,0 +1,30 @@
+{
+  "//说明": "代码审查抑制名单：这里只放「已人工实证为误报」的条目，命中后不进报告主清单、不进飞书、不进裁判。每条都必须写明实证结论与日期；真实缺陷不要放进来。",
+  "suppress": [
+    {
+      "file": "feishu2ods/notify.py",
+      "title": "打印异常原文",
+      "reason": "误报（2026-10-05 实证）：log() 出口对整行 redact，/hook/<id> 被遮成 /hook/***；notify 现已再显式 redact 一道。"
+    },
+    {
+      "file": "feishu2ods/utils.py",
+      "title": "sys.stdout 为 None",
+      "reason": "误报（2026-10-05 实测）：CPython 在 sys.stdout 为 None 时 print 静默返回（rc=0）；log() 也已补 RuntimeError/AttributeError 兜底。"
+    },
+    {
+      "file": "feishu2ods/mc.py",
+      "title": "作用域",
+      "reason": "误报（2026-10-05 复核）：once() 的 nonlocal 与外层赋值同属 write_partition 函数作用域（mc.py:306/366-368 同层），专项测试 test_retry_after_deleted_final_keeps_unique_copy 直接覆盖该路径且通过。"
+    },
+    {
+      "file": "feishu2ods/wizard.py",
+      "title": "表注释",
+      "reason": "误报（2026-10-05 复核）：注释最终由 mc.build_ddl 统一转义（先 \\ 再 ''，test_ddl_comment_escapes_backslash_and_quote 覆盖），向导存原始文本与手工配置同口径，不会破坏 DDL。"
+    },
+    {
+      "file": "feishu2ods/cli.py",
+      "title": "o.close",
+      "reason": "误报（2026-10-05 对照 pyodps 0.13.2 源码）：ODPS 对象没有 close()（加 finally: o.close() 会 AttributeError）；requests 会话是 RestClient 的进程级共享缓存，不是按连接持有的资源，不存在累积的句柄泄漏。"
+    }
+  ]
+}

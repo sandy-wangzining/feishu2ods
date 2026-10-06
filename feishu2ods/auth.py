@@ -53,6 +53,7 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
                 # 不跟随重定向：把 Location 报出来让用户直接改成最终地址。
                 # 抛 ApiHttpError（确定性错误、不重试），别让它掉进重试的退避里
                 location = redact(str(resp.headers.get("Location") or ""))
+                resp.close()  # 不消费响应体就不归还连接池（与下面 4xx/5xx 分支同口径）
                 raise ApiHttpError(
                     resp.status_code,
                     f"接口返回重定向 HTTP {resp.status_code}（Location: {location}）：本工具不跟随重定向"
@@ -60,18 +61,26 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
                     f"鉴权头也可能被转发到别的地址。请把地址改成最终地址",
                 )
             if resp.status_code >= 500 or resp.status_code == 429:
-                last = requests.RequestException(f"HTTP {resp.status_code}：{resp.text[:200]}")
+                # 重试前先关掉响应：不消费响应体的话连接不会归还连接池，重试多次会占着连接
+                msg = f"HTTP {resp.status_code}：{resp.text[:200]}"
+                resp.close()
+                last = requests.RequestException(msg)
             elif 400 <= resp.status_code < 500:
-                raise ApiHttpError(resp.status_code, resp.text[:300])
+                body = resp.text[:300]
+                resp.close()
+                raise ApiHttpError(resp.status_code, body)
             else:
                 try:
                     return resp.json()
                 except ValueError as exc:
                     last = exc
+                    resp.close()
         if attempt < tries:
             wait = 5 * attempt
             log(f"  [{desc}] 第 {attempt} 次失败：{redact(last)}；{wait}s 后重试")
             time.sleep(wait)
+    if last is None:  # pragma: no cover - tries<=0 时循环体一次都没跑
+        raise SystemExit(f"{desc} 失败：未执行任何请求（tries={tries}）")
     raise SystemExit(f"{desc} 失败（重试 {tries} 次）：{redact(last)}")
 
 

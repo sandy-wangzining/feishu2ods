@@ -10,13 +10,20 @@ import tempfile
 from collections import Counter
 
 from .dates import normalize_date_value
+from .utils import log
 
 BATCH_SIZE = 500  # Tunnel 每批写入行数
 
 
 def dump_record(record: dict) -> str:
     """一条记录 → 单行 JSON（与 api2ods 同款序列化参数：不转义中文、紧凑、拒绝 NaN）。"""
-    return json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    try:
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except ValueError as exc:
+        # allow_nan=False 遇到 NaN/Infinity 抛的是裸 ValueError：给出记录上下文，
+        # 让用户能定位到具体是哪条记录（接口返回了非法浮点）
+        rid = record.get("record_id") if isinstance(record, dict) else None
+        raise ValueError(f"记录（record_id={rid!r}）含 NaN/Infinity，不是合法 JSON：{exc}") from exc
 
 
 class SpoolWriter:
@@ -28,19 +35,30 @@ class SpoolWriter:
     """
 
     def __init__(self, path: pathlib.Path | None = None):
+        created = None
+        self._created_by_us = path is None  # 只有自己 mkstemp 的临时文件才在 close 时删除
         try:
             if path is None:
                 handle, name = tempfile.mkstemp(prefix="feishu2ods-", suffix=".jsonl")
                 os.close(handle)
-                path = pathlib.Path(name)
+                created = pathlib.Path(name)
+                path = created
             self.path = pathlib.Path(path)
             self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
         except OSError as exc:
+            # mkstemp 已经把文件创建出来了：后续 open 失败（句柄用尽/磁盘满）时不能把
+            # 临时文件留在系统 temp 里，best-effort 清掉
+            if created is not None:
+                try:
+                    created.unlink(missing_ok=True)
+                except OSError:
+                    pass
             # 临时目录不可写/磁盘满/路径不存在：转成"带原因的人话"再抛出，由调用方（cli）
             # 记日志并按运行失败（退出码 1）结束——不让裸 OSError/FileNotFoundError 糊在用户脸上
             target = path if path is not None else "系统临时目录"
             raise OSError(f"建不了落盘临时文件（{target}）：{exc}") from exc
         self.count = 0
+        self._closed = False
 
     def write_records(self, records: list[dict]) -> int:
         """把一批记录序列化后写入文件（返回本批条数）。"""
@@ -51,6 +69,10 @@ class SpoolWriter:
 
     def iter_rows(self):
         """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。"""
+        if self._closed:
+            # 关闭后文件可能已被删除（keep=False）：原来会抛没有上下文的 FileNotFoundError，
+            # 与 write_records 的关闭口径也不一致
+            raise RuntimeError(f"落盘文件已关闭，不能再读回：{self.path}")
         self._handle.flush()
         with open(self.path, "r", encoding="utf-8", newline="") as handle:
             for line in handle:
@@ -70,15 +92,36 @@ class SpoolWriter:
             yield batch
 
     def close(self, keep: bool = False) -> None:
-        """关闭并（默认）删除临时文件；keep=True 时保留（排障用）。"""
+        """关闭并（默认）删除临时文件；keep=True 时保留（排障用）。重复调用是空操作。
+
+        关闭失败（磁盘满时缓冲刷盘报 ENOSPC 是典型）改为保留文件：那是本次拉取唯一的
+        落盘副本，删掉连排障线索都没有——不能因为异常路径就跳过"先关闭成功再删除"。
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._handle.close()
-        finally:
-            if not keep:
-                try:
-                    self.path.unlink()
-                except OSError:
-                    pass
+        except BaseException:
+            if self._created_by_us:
+                log(f"  警告：临时数据文件关闭失败，已保留待排查：{self.path}")
+            raise
+        if not keep and self._created_by_us:
+            # 只删"自己创建的临时文件"：调用方显式传入的 path 是它的数据文件，
+            # 不能因为一次 close 就被删掉
+            try:
+                self.path.unlink()
+            except OSError as exc:
+                # 删不掉（被占用/权限）会留下临时数据文件：留一条线索而不是完全静默
+                log(f"  警告：临时数据文件删除失败（{exc}）：{self.path}")
+
+    def __enter__(self) -> SpoolWriter:
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        """异常路径保留文件（排障用），正常退出删除——与 cli 的 keep_spool 语义一致。"""
+        self.close(keep=bool(exc_info and exc_info[0]))
+        return False
 
 
 class FetchStats:
@@ -105,7 +148,10 @@ class FetchStats:
                     self.min_id = record_id
                 if not self.max_id or record_id > self.max_id:
                     self.max_id = record_id
-            if all(value is None for key, value in record.items() if key != "record_id"):
+            values = [value for key, value in record.items() if key != "record_id"]
+            if values and all(value is None for value in values):
+                # all() 对空序列恒为 True：只有 record_id 的记录（字段映射为空/接口没返回字段）
+                # 不该被算成"空白行"，否则 empty_rows 的数据质量提示会失真
                 self.empty_rows += 1
             if self.date_field:
                 day = normalize_date_value(record.get(self.date_field))
