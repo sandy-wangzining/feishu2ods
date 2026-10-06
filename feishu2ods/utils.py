@@ -395,7 +395,11 @@ def redact(text) -> str:
     if not text:
         return text
     out = str(text)  # 宽容度：调用方直接传异常对象/数字也不会炸
-    for secret in sorted({s for s in _SECRETS if isinstance(s, str)}, key=len, reverse=True):
+    with _lock:
+        # 快照必须在锁内取：reset_secret_values 的 clear+extend 与这里并发时，
+        # 直接迭代模块级列表会读到清空/半替换的中间态、漏遮本轮密钥
+        secrets_snapshot = [s for s in _SECRETS if isinstance(s, str)]
+    for secret in sorted(secrets_snapshot, key=len, reverse=True):
         # 长值先替：短值先替会把长密钥切成半截、留下可辨认的碎片
         # 短于 _SECRET_MIN_LEN 的值（`1` / `ok`）出现在普通文本里太常见，值级替换会把报错搅乱
         if not secret or len(secret) < _SECRET_MIN_LEN:

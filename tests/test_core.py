@@ -2037,6 +2037,18 @@ class TestRedact(OfflineTestCase):
         self.assertNotIn("sk-live-abcdef123456", out)
         self.assertIn("***", out)
 
+    def test_log_file_expands_tilde(self):
+        """--log-file "~/logs/x.log" 要写到 HOME 下，而不是 CWD 里字面量 "~" 目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HOME": tmp, "USERPROFILE": tmp}):
+                handle = cli_mod._open_log_file("~/logs/run.log")
+            try:
+                self.assertEqual(
+                    pathlib.Path(handle.name).resolve(), (pathlib.Path(tmp) / "logs" / "run.log").resolve()
+                )
+            finally:
+                handle.close()
+
     def test_redact_secrets_masks_numeric_secret(self):
         """数字型密钥（ID 类凭证）str 化后要遮蔽，不能被 isinstance(str) 静默丢弃。"""
         out = utils_mod.redact_secrets(1234567890, "auth failed id=1234567890 end")
