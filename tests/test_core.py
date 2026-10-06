@@ -3221,10 +3221,9 @@ class TestSecretsResetAcrossRuns(OfflineTestCase):
             raw_b["feishu"]["app_secret"] = second
             job_a.write_text(json.dumps(raw_a), encoding="utf-8")
             job_b.write_text(json.dumps(raw_b), encoding="utf-8")
-            # cli 与 utils 共用同一个 _SECRETS 列表（还原生产里两处是同一对象）
+            # 脱敏表现在只由 utils 持有（cli 经 reset_secret_values 操作它）
             shared: list[str] = []
             with (
-                mock.patch.object(cli_mod, "_SECRETS", shared),
                 mock.patch.object(utils_mod, "_SECRETS", shared),
                 mock.patch.object(cli_mod, "run_sync", return_value=0),
                 mock.patch.object(cli_mod, "lock_path", lambda p: pathlib.Path(tmp) / "x.lock"),

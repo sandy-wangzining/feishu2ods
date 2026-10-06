@@ -26,7 +26,6 @@ from .mc import (
 from .notify import notify
 from .spool import FetchStats, SpoolWriter
 from .utils import (
-    _SECRETS,
     RunLock,
     add_log_sink,
     collect_secret_values,
@@ -36,6 +35,7 @@ from .utils import (
     redact_secrets,
     remove_log_sink,
     reset_lock_warning,
+    reset_secret_values,
     setup_console,
     table_lock_path,
 )
@@ -378,14 +378,12 @@ def _run(args, started: float) -> int:
         return 2
 
     job = load_job(args.job)
-    # 脱敏表是模块级状态：每次运行前先清空再登记，避免同一进程里多次调用 main() 时
-    # 上一轮的密钥值残留（值级替换会一直带着它，且下一轮日志脱敏口径被污染）。
-    _SECRETS.clear()
-    reset_lock_warning()  # 同上："文件系统不支持锁"的告警去重也按每次运行重来
+    # 脱敏表是模块级状态：每次运行前重设（锁内 clear+登记），避免同进程多次调用
+    # main() 时上一轮密钥残留、也避免并发调用时把别的运行已登记的密钥抹掉
+    reset_lock_warning()  # "文件系统不支持锁"的告警去重同样按每次运行重来
     # 先把 job 里疑似密钥的值登记进脱敏表，再校验/打日志：
     # 校验报错会回显非法值，密钥写错形态时也不该出现在日志里
-    for secret in collect_secret_values(job):
-        _SECRETS.append(secret)
+    reset_secret_values(collect_secret_values(job))
 
     for warning in validate_job(job):
         log(f"⚠️ {warning}")

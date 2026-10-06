@@ -28,6 +28,19 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 
 CN_TZ = timezone(timedelta(hours=8))  # 运行日历日基准（固定 +08:00，无夏令时）
 _SECRETS: list[str] = []  # 日志脱敏用（job 里读到的密钥值）
+
+
+def reset_secret_values(values) -> None:
+    """重设值级脱敏表（每次 main() 开头调用）。
+
+    锁内完成 clear+登记：`_SECRETS` 是模块级状态，并发调用 main() 时"先清空"会把
+    另一轮已登记的密钥抹掉（该轮日志漏遮）；redact() 读它也要走同一把锁的快照语义。
+    """
+    with _lock:
+        _SECRETS.clear()
+        _SECRETS.extend(str(v) for v in values if isinstance(v, (str, int, float)) and not isinstance(v, bool))
+
+
 _console_patched = False
 _lock = threading.Lock()
 _sinks: list = []  # 日志文件副本（--log-file）；句柄由调用方负责关闭
@@ -92,8 +105,9 @@ def log(msg: str) -> None:
                 _console_patched = True
     try:
         safe_msg = redact(msg)
-    except Exception:  # noqa: BLE001 - 脱敏失败退化为原文：日志绝不能反过来把业务打挂
-        safe_msg = str(msg)
+    except Exception:  # noqa: BLE001 - 脱敏失败绝不能把日志/业务打挂
+        # 但不能退化为原文：异常消息里很可能就是凭证——只留占位，宁可丢日志内容
+        safe_msg = "[脱敏失败，原文已省略]"
     line = f"[{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {safe_msg}"
     # print 与 sink 写入都放在锁外：慢速目标（管道压满、NFS/满盘上的 --log-file）只会
     # 拖慢这条日志本身，不该把全局 _lock 占住——否则其它线程的 log/add_log_sink/
@@ -381,7 +395,7 @@ def redact(text) -> str:
     if not text:
         return text
     out = str(text)  # 宽容度：调用方直接传异常对象/数字也不会炸
-    for secret in sorted(set(_SECRETS), key=len, reverse=True):
+    for secret in sorted({s for s in _SECRETS if isinstance(s, str)}, key=len, reverse=True):
         # 长值先替：短值先替会把长密钥切成半截、留下可辨认的碎片
         # 短于 _SECRET_MIN_LEN 的值（`1` / `ok`）出现在普通文本里太常见，值级替换会把报错搅乱
         if not secret or len(secret) < _SECRET_MIN_LEN:
