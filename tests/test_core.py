@@ -2028,13 +2028,19 @@ class TestRedact(OfflineTestCase):
         self.assertNotIn(secret, out)
 
     def test_redact_secrets_accepts_bare_scalar_values(self):
-        """values 直接传裸标量（数字/字符串）也不能炸：非 str 值跳过、不误伤文本。"""
+        """values 直接传裸标量（数字/字符串）也不能炸：数字按 ID 类密钥 str 化后遮蔽。"""
         out = utils_mod.redact_secrets(123456, "charge failed id=123456")
-        self.assertEqual(out, "charge failed id=123456")
+        self.assertEqual(out, "charge failed id=***")
 
     def test_redact_secrets_value_first(self):
         out = utils_mod.redact_secrets(["sk-live-abcdef123456"], "error body sk-live-abcdef123456 end")
         self.assertNotIn("sk-live-abcdef123456", out)
+        self.assertIn("***", out)
+
+    def test_redact_secrets_masks_numeric_secret(self):
+        """数字型密钥（ID 类凭证）str 化后要遮蔽，不能被 isinstance(str) 静默丢弃。"""
+        out = utils_mod.redact_secrets(1234567890, "auth failed id=1234567890 end")
+        self.assertNotIn("1234567890", out)
         self.assertIn("***", out)
 
     def test_redact_secrets_skips_short_and_non_str(self):
