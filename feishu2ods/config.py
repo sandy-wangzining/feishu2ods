@@ -179,13 +179,34 @@ def validate_job(job: dict) -> list[str]:
         lag = freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS)
         if isinstance(lag, bool) or not isinstance(lag, int) or lag < 0:
             raise SystemExit(f"freshness.lag_days 必须是非负整数，实际 {lag!r}")
-        if freshness.get("webhook") is not None:
-            webhook = _require_text(freshness.get("webhook"), "freshness.webhook")
-            if not webhook.startswith(("http://", "https://")):
-                raise SystemExit(f"freshness.webhook 必须是 http(s) 开头的地址：{webhook!r}")
-            if webhook.startswith("http://"):
-                warnings.append(
-                    "freshness.webhook 是 http:// 明文地址：告警内容会明文传输，建议改 https（本地调试可忽略）"
-                )
-            freshness["webhook"] = webhook
+        raw_webhook = freshness.get("webhook")
+        if raw_webhook is not None:
+            http_warned = False
+            if isinstance(raw_webhook, str):
+                webhook = _require_text(raw_webhook, "freshness.webhook")
+                if not webhook.startswith(("http://", "https://")):
+                    raise SystemExit(f"freshness.webhook 必须是 http(s) 开头的地址：{webhook!r}")
+                if webhook.startswith("http://"):
+                    warnings.append(
+                        "freshness.webhook 是 http:// 明文地址：告警内容会明文传输，建议改 https（本地调试可忽略）"
+                    )
+                freshness["webhook"] = webhook
+            elif isinstance(raw_webhook, list):
+                cleaned: list[str] = []
+                for index, item in enumerate(raw_webhook, 1):
+                    if not isinstance(item, str) or not item.strip():
+                        raise SystemExit(f"freshness.webhook 数组第 {index} 项必须是非空字符串（飞书群机器人地址）")
+                    item = item.strip()
+                    if not item.startswith(("http://", "https://")):
+                        raise SystemExit(f"freshness.webhook 数组第 {index} 项必须是 http(s) 开头的地址：{item!r}")
+                    if item.startswith("http://") and not http_warned:
+                        warnings.append(
+                            "freshness.webhook 是 http:// 明文地址：告警内容会明文传输，建议改 https（本地调试可忽略）"
+                        )
+                        http_warned = True
+                    if item not in cleaned:
+                        cleaned.append(item)
+                freshness["webhook"] = cleaned
+            else:
+                raise SystemExit("freshness.webhook 必须是字符串或字符串数组（飞书群机器人地址）")
     return warnings

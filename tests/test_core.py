@@ -2127,6 +2127,38 @@ class TestCollectSecretValues(OfflineTestCase):
         self.assertIn("k" * 8, values)
         self.assertIn("abcdef123456", values)  # 裸 hook id（形态脱敏只认 URL）
 
+    def test_collects_every_webhook_in_array(self):
+        job = {
+            "freshness": {
+                "webhook": [
+                    "https://x/hook/hook-one-1111",
+                    "https://x/hook/hook-two-2222",
+                ]
+            }
+        }
+        values = utils_mod.collect_secret_values(job)
+        self.assertIn("hook-one-1111", values)
+        self.assertIn("hook-two-2222", values)
+
+    def test_secret_containers_dict_and_generator(self):
+        """dict/生成器等容器也要登记（此前被当成标量包一层，脱敏表实际为空）。"""
+        utils_mod.reset_secret_values({"a": "secret-one-111", "b": "secret-two-222"})
+        self.assertNotIn("secret-one-111", utils_mod.redact("x secret-one-111 y"))
+        self.assertNotIn("secret-two-222", utils_mod.redact("x secret-two-222 y"))
+        utils_mod.reset_secret_values(item for item in ["secret-three-333"])
+        self.assertNotIn("secret-three-333", utils_mod.redact("x secret-three-333 y"))
+        self.assertNotIn("secret-four-444", utils_mod.redact_secrets({"k": "secret-four-444"}, "x secret-four-444 y"))
+        self.assertNotIn(
+            "secret-five-555", utils_mod.redact_secrets((item for item in ["secret-five-555"]), "x secret-five-555 y")
+        )
+
+    def test_safe_label_escapes_control_and_backticks(self):
+        """外部列名进日志/飞书卡片前转义：换行/控制字符/反引号不能原样拼入。"""
+        self.assertEqual(utils_mod.safe_label("a`b\nc\x00d"), "a'b c d")
+        shown = utils_mod.safe_label("x" * 100)
+        self.assertEqual(len(shown), 81)
+        self.assertTrue(shown.endswith("…"))
+
     def test_non_dict_job_returns_empty(self):
         self.assertEqual(utils_mod.collect_secret_values("nope"), [])
 
@@ -2254,6 +2286,28 @@ class TestLogFile(OfflineTestCase):
         self.assertTrue(handle.closed)
         utils_mod.remove_log_sink(handle)  # 幂等：第二次不该报错
         utils_mod.remove_log_sink(None)
+
+    def test_removed_sink_race_is_not_reported_as_broken(self):
+        """快照取完后句柄被正常摘除并关闭：不能误报"写入失败"（并发收尾场景）。"""
+
+        class ClosingSink:
+            def write(self, _text):
+                utils_mod._sinks.remove(self)  # 模拟 remove_log_sink 在快照之后摘掉
+                raise ValueError("I/O operation on closed file")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        handle = ClosingSink()
+        utils_mod.add_log_sink(handle)
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            utils_mod.log("并发收尾")
+        self.assertNotIn(handle, utils_mod._sinks)
+        self.assertFalse(utils_mod._sink_write_warned)
+        self.assertNotIn("写入失败", err.getvalue())
 
     def test_broken_sink_does_not_break_logging(self):
         class BrokenSink:
@@ -2734,6 +2788,31 @@ class TestValidateJobMore(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
 
+    def test_job_freshness_webhook_list(self):
+        job = make_job()
+        job["freshness"]["webhook"] = [" https://x/hook/1 ", "https://x/hook/2", "https://x/hook/1"]
+        config_mod.validate_job(job)
+        self.assertEqual(job["freshness"]["webhook"], ["https://x/hook/1", "https://x/hook/2"])
+
+    def test_job_freshness_webhook_list_bad_item(self):
+        job = make_job()
+        job["freshness"]["webhook"] = ["https://x/hook/1", "not-a-url"]
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_job_freshness_webhook_list_http_warns(self):
+        job = make_job()
+        job["freshness"]["webhook"] = ["http://x/hook/1"]
+        warnings = config_mod.validate_job(job)
+        self.assertTrue(any("http://" in w for w in warnings))
+
+    def test_job_freshness_webhook_list_http_warns_once(self):
+        """多个 http 地址只提示一次（去重靠标志位，不靠其它告警文本里是否含 http://）。"""
+        job = make_job()
+        job["freshness"]["webhook"] = ["http://x/hook/1", "http://y/hook/2"]
+        warnings = config_mod.validate_job(job)
+        self.assertEqual(sum(1 for w in warnings if "http://" in w), 1)
+
     def test_job_unknown_top_key_warns(self):
         job = make_job()
         job["extra_top"] = 1
@@ -2907,6 +2986,12 @@ class TestNotifyMore(OfflineTestCase):
             cli_mod.notify("", "t", ["l"])
         self.assertTrue(any("未配置" in str(c) for c in logger.call_args_list))
 
+    def test_invalid_webhook_type_warns_and_skips(self):
+        """webhook 写成对象等非法类型时不能静默跳过告警（配置错要能看见）。"""
+        with mock.patch.object(notify_mod, "log") as logger:
+            cli_mod.notify({"url": "https://x/hook/1"}, "t", ["l"])
+        self.assertTrue(any("没有可用地址" in str(c) for c in logger.call_args_list))
+
     def test_requests_missing_skips(self):
         with mock.patch.object(notify_mod, "requests", None), mock.patch.object(notify_mod, "log") as logger:
             notify_mod.notify("https://x/hook/1", "t", ["l"])
@@ -2919,6 +3004,35 @@ class TestNotifyMore(OfflineTestCase):
             mock.patch.object(notify_mod, "log") as logger,
         ):
             cli_mod.notify("https://x/hook/1", "t", ["l"])
+        self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
+
+    @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
+    def test_multiple_webhooks(self):
+        """webhook 写成数组时逐个群发送（多个群同时告警）。"""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"code": 0}
+        hooks = ["https://x/hook/1", "https://x/hook/2"]
+        with mock.patch.object(notify_mod.requests, "post", return_value=resp) as post:
+            cli_mod.notify(hooks, "t", ["l"])
+        self.assertEqual([call.args[0] for call in post.call_args_list], hooks)
+
+    @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
+    def test_multiple_webhooks_partial_failure(self):
+        """单个群失败不影响其它群，失败只记日志（不改主流程退出码）。"""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"code": 0}
+
+        def post(url, **kwargs):
+            if url.endswith("/bad"):
+                raise RuntimeError("down")
+            return resp
+
+        with (
+            mock.patch.object(notify_mod.requests, "post", side_effect=post) as fake_post,
+            mock.patch.object(notify_mod, "log") as logger,
+        ):
+            cli_mod.notify(["https://x/hook/bad", "https://x/hook/ok"], "t", ["l"])
+        self.assertEqual(fake_post.call_count, 2)
         self.assertTrue(any("通知发送失败" in str(c) for c in logger.call_args_list))
 
     @unittest.skipUnless(REQUESTS_AVAILABLE, "没装 requests")
@@ -3176,10 +3290,20 @@ class TestRunLockMore(OfflineTestCase):
             path = cli_mod.lock_path(pathlib.Path("/jobs/demo.json"), root=root)
             self.assertTrue(str(path).startswith(str(root)))
 
+    def test_lock_path_surrogate_bytes_do_not_crash(self):
+        """路径含非 UTF-8 原始字节（surrogateescape）时锁名也要能算出来，不能启动即崩。"""
+        path = cli_mod.lock_path(pathlib.Path("jobs") / "\udcff.json")
+        self.assertTrue(path.name.endswith(".lock"))
+
 
 class TestMainMore(OfflineTestCase):
     def test_no_job_returns_2(self):
         self.assertEqual(cli_mod.main(["--bizdate", "20260928"]), 2)
+
+    def test_bad_cli_identifier_returns_2(self):
+        """纯命令行覆盖值写错按参数问题退出码 2（不是运行失败 1）。"""
+        self.assertEqual(cli_mod.main(["--job", "x", "--table", "2024_sales"]), 2)
+        self.assertEqual(cli_mod.main(["--job", "x", "--project", "bad-name"]), 2)
 
     def test_missing_job_file_returns_1(self):
         self.assertEqual(cli_mod.main(["--job", "/nonexistent/x.json"]), 1)

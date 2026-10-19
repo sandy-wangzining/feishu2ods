@@ -36,6 +36,7 @@ from .utils import (
     remove_log_sink,
     reset_lock_warning,
     reset_secret_values,
+    safe_label,
     setup_console,
     table_lock_path,
 )
@@ -59,6 +60,24 @@ def _sql_timeout_arg(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError(f"不能为负（0 表示不限制），实际 {number}")
     return number
+
+
+def _arg_identifier(label: str):
+    """argparse 的 type 回调：非法标识符按"参数问题"退出码 2（argparse 统一出口）。
+
+    只用于 --project/--table 这类纯命令行覆盖值；作业文件里的标识符仍走 _run 的
+    校验（配置错 → 退出码 1），两者语义不同。
+    """
+
+    def convert(value: str) -> str:
+        if not value.strip():
+            return value
+        try:
+            return _require_identifier(value, label)
+        except SystemExit as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+
+    return convert
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -93,8 +112,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="跳过新鲜度校验（补数/排查用；--no-check 是旧写法，兼容保留）",
     )
     parser.add_argument("--no-notify", action="store_true", help="不发任何飞书通知（缺数据/新增列等只记日志）")
-    parser.add_argument("--project", default="", help="覆盖 target.project（测试用）")
-    parser.add_argument("--table", default="", help="覆盖 target.table（测试用）")
+    parser.add_argument(
+        "--project", default="", type=_arg_identifier("--project"), help="覆盖 target.project（测试用）"
+    )
+    parser.add_argument("--table", default="", type=_arg_identifier("--table"), help="覆盖 target.table（测试用）")
     parser.add_argument(
         "--sql-timeout",
         type=_sql_timeout_arg,
@@ -171,7 +192,7 @@ def run_sync(
         raise SystemExit("freshness 必须是对象（date_field / lag_days / webhook）")
 
     # ---- ① 拉数（流式：记录边拉边落盘，全量不驻留内存）----
-    webhook = str((freshness or {}).get("webhook") or "")
+    webhook = (freshness or {}).get("webhook") or ""
     base_url = str(feishu.get("base_url") or "")
     new_fields: list[str] = []
     date_field = str((freshness or {}).get("date_field") or "")
@@ -202,12 +223,12 @@ def run_sync(
             # 日志无条件打：--no-notify 只关飞书提醒，不关日志——新增列完全不可见会让
             # 用户以为"没出问题"（与 api2ods 的字段漂移提醒口径一致：先 log 再 notify）
             log(
-                f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{name}`' for name in uniq)}（本次忽略其值、其余字段照常同步）"
+                f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{safe_label(name)}`' for name in uniq)}（本次忽略其值、其余字段照常同步）"
             )
             if not args.no_notify:
                 lines = [
                     f"**作业**：{job.get('job')}",
-                    f"**新增列**：{'、'.join(f'`{name}`' for name in uniq)}",
+                    f"**新增列**：{'、'.join(f'`{safe_label(name)}`' for name in uniq)}",
                 ]
                 if base_url:
                     lines.append(f"**数据表**：{base_url}")

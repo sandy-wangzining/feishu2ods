@@ -28,6 +28,33 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 
 CN_TZ = timezone(timedelta(hours=8))  # 运行日历日基准（固定 +08:00，无夏令时）
 _SECRETS: list[str] = []  # 日志脱敏用（job 里读到的密钥值）
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_label(value, limit: int = 80) -> str:
+    """外部字段名进日志/飞书卡片前的转义：去控制字符与反引号、限长。
+
+    字段名来自 Base 列名（不可控）：换行能伪造日志行，反引号会提前闭合
+    飞书卡片里的行内代码。只影响展示，不影响入库的 json 原值。
+    """
+    text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("`", "'")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _secret_items(values) -> list:
+    """密钥容器归一化：字典取 values、生成器等可迭代物化、标量包一层（None → 空）。"""
+    if values is None:
+        return []
+    if isinstance(values, dict):
+        return list(values.values())
+    if isinstance(values, (list, tuple, set, frozenset)):
+        return list(values)
+    if isinstance(values, (str, bytes, int, float, bool)):
+        return [values]
+    try:
+        return list(values)
+    except TypeError:
+        return [values]
 
 
 def reset_secret_values(values) -> None:
@@ -36,12 +63,7 @@ def reset_secret_values(values) -> None:
     锁内完成 clear+登记：`_SECRETS` 是模块级状态，并发调用 main() 时"先清空"会把
     另一轮已登记的密钥抹掉（该轮日志漏遮）；redact() 读它也要走同一把锁的快照语义。
     """
-    if values is None:
-        values = []
-    elif not isinstance(values, (list, tuple, set, frozenset)):
-        # 与 redact_secrets 同口径的入参规范化：标量直接传进来时，字符串会被 for
-        # 按字符拆开（全部短于阈值被跳过、脱敏表实际为空）、数字会 TypeError
-        values = [values]
+    values = _secret_items(values)
     with _lock:
         _SECRETS.clear()
         _SECRETS.extend(str(v) for v in values if isinstance(v, (str, int, float)) and not isinstance(v, bool))
@@ -82,16 +104,18 @@ def remove_log_sink(handle) -> None:
     if handle is None:
         return
     with _lock:
+        # 摘除与关闭放在同一把锁里：log() 的快照在锁内取，缩小"取完快照后句柄被关"
+        # 的竞态窗口；log() 里对"已摘除句柄抛 ValueError"也有静默兜底
         if handle in _sinks:
             _sinks.remove(handle)
-    closer = getattr(handle, "close", None)
-    if not callable(closer):
-        return
-    try:
-        closer()
-    except (OSError, ValueError):
-        # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
-        pass
+        closer = getattr(handle, "close", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except (OSError, ValueError):
+            # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
+            pass
 
 
 def log(msg: str) -> None:
@@ -136,6 +160,12 @@ def log(msg: str) -> None:
             handle.write(line + "\n")
             handle.flush()
         except Exception as exc:  # noqa: BLE001 - 日志失败绝不能打挂业务（见下）
+            with _lock:
+                still_registered = handle in _sinks
+            if isinstance(exc, ValueError) and not still_registered:
+                # 与 remove_log_sink 的并发竞态：快照取完后句柄被正常摘除并关闭。
+                # 这不是"写坏"，不能打误导性的写入失败告警
+                continue
             # 这里必须兜住**所有**异常：sink 是外部句柄，写失败的花样不受控
             # （磁盘满/句柄已关/被塞了 None 之类），而"日志不得打挂业务"是硬约定。
             # 但必须可见一次，且区分"预期内的 I/O 失败"与"看起来是编程错误"
@@ -441,13 +471,10 @@ def redact_secrets(values, text) -> str:
     if not text:
         return text
     out = str(text)
-    if not isinstance(values, (list, tuple, set, frozenset)):
-        # 标量（单个字符串/数字）会让下面的 for 抛 TypeError 或把字符串拆成单字符：
-        # 值与 api2ods/sftp2ods 同口径，按"只有一个密钥"包一层
-        values = [values]
+    values = _secret_items(values)
     # 与 reset_secret_values / _leaf_strings 同口径：数字型密钥（ID 类凭证写起来就是数字）
     # str 化后参与遮蔽，不能按 isinstance(str) 静默丢弃（否则该凭证在报错文本里保持明文）
-    secrets = {str(s) for s in (values or ()) if isinstance(s, (str, int, float)) and not isinstance(s, bool)}
+    secrets = {str(s) for s in values if isinstance(s, (str, int, float)) and not isinstance(s, bool)}
     secrets = {s for s in secrets if len(s) >= _SECRET_MIN_LEN}
     for secret in sorted(secrets, key=len, reverse=True):
         # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
@@ -489,6 +516,28 @@ def _webhook_values(value) -> list[str]:
         match = _WEBHOOK_ID_RE.search(part)
         if match:
             result.append(match.group(1))
+    return result
+
+
+def webhook_targets(value) -> list[str]:
+    """把 freshness.webhook 归一化成地址列表（字符串或字符串数组）。
+
+    运行时口径：去首尾空白、去空、去重保序；非字符串元素忽略——配置校验阶段会先拦，
+    这里再兜一层，保证告警链路不会因为一个写错的目标把主流程带崩。
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
     return result
 
 
@@ -783,7 +832,7 @@ def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathl
     stem = resolved.stem or "job"
     # sha256 截 16 位十六进制：sha1 只取 8 位（32 位）时不同作业有可观的碰撞概率，
     # 撞了会互相阻塞（解锁时还可能删错对方的锁）；与 sftp2ods / api2ods 的锁同口径
-    digest = hashlib.sha256(os.fsencode(str(resolved).encode("utf-8"))).hexdigest()[:16]
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
     return _lock_base_dir(root) / f"{stem}-{digest}.lock"
 
 

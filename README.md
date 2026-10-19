@@ -101,7 +101,7 @@ cd ~/feishu2ods
 | `target.allow_empty` | 可选，默认 `false`：拉到 0 行时拒绝写库；设为 `true` 时允许写空分区，但写前会先查目标分区现有行数，非 0 时仍需加 `--force` 才放行 |
 | `freshness.date_field` | 用哪个英文键判日期（必须是 `fields` 的英文值）；值规范化成 `yyyy-MM-dd` 后比对，支持的形态见「行为说明」第 6 条 |
 | `freshness.lag_days` | 预期日期 = bizdate - N 天，默认 0（即必须有业务日当天的数据） |
-| `freshness.webhook` | 缺失时发飞书群告警的 webhook |
+| `freshness.webhook` | 缺失时发飞书群告警的 webhook；支持字符串或字符串数组（多个群同时告警，单个群失败不影响其它群） |
 
 ## 行为说明
 
