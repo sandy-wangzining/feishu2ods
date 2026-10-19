@@ -7,3 +7,7 @@ include CHANGELOG.md
 recursive-include jobs *.example.json
 
 recursive-include tests *.py
+
+include shared-runtime.json
+recursive-include tools *.py
+recursive-include docs *.md

@@ -31,7 +31,7 @@ class SpoolWriter:
 
     为什么要它：表格可能很大（十几万行 × 大单元格），全量记录放内存既慢又危险。
     拉取阶段边拉边写盘（顺序写很便宜），写 MaxCompute 时再逐批读回送进 Tunnel——
-    峰值内存只与"单页 + 一个批次"的数据量有关，与总行数无关。
+    本类不缓存全部正文；FetchStats 的去重 ID 集合仍随不同记录 ID 数量增长。
     """
 
     def __init__(self, path: pathlib.Path | None = None):
@@ -125,7 +125,7 @@ class SpoolWriter:
 
 
 class FetchStats:
-    """一次流式拉取的统计（内存只与字段数/去重 id 数有关，与总行数无关）。"""
+    """一次流式拉取的统计；ID 集合占用随不同记录 ID 数量增长。"""
 
     def __init__(self, date_field: str = ""):
         self.count = 0

@@ -44,7 +44,7 @@ from .wizard import run_init
 
 
 # =============================================================================
-# 主流程：拉数 → 新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对
+# 主流程：拉数 → 新鲜度校验 → 写 pt 分区（临时分区 + 校验后替换）→ 行数核对
 # =============================================================================
 def _sql_timeout_arg(value: str) -> int:
     """--sql-timeout 参数校验：非负整数。
@@ -83,7 +83,7 @@ def _arg_identifier(label: str):
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="feishu2ods",
-        description="飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，临时分区 + 原子替换）",
+        description="飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，临时分区 + 校验后替换）",
     )
     parser.add_argument("--job", default="", help="job 配置文件（jobs/*.json）；--init 时可不填")
     parser.add_argument("--init", action="store_true", help="交互式生成作业配置（接新表用；生成后先 --check）")
@@ -182,7 +182,7 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
 def run_sync(
     args, job: dict, project: str, table_name: str, column: str, pt: str, bizdate: date, started: float
 ) -> int:
-    """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（临时分区 + 原子替换）→ 行数核对。"""
+    """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（临时分区 + 校验后替换）→ 行数核对。"""
     feishu = job["feishu"]
     maxcompute = job["maxcompute"]
     target_cfg = job["target"]
@@ -300,7 +300,7 @@ def run_sync(
         # ---- ③ 写库（dry-run 跳过）----
         if args.dry_run:
             keep_spool = False
-            log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（写临时分区后原子替换）")
+            log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（写临时分区后校验后替换）")
             return 0
 
         o = connect_odps(maxcompute, project)
@@ -323,7 +323,7 @@ def run_sync(
                 )
                 return 1
 
-        log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后原子替换）...")
+        log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后校验后替换）...")
         write_partition(o, table, project, table_name, column, pt, spool, stats, timeout=args.sql_timeout)
         actual = count_partition(o, project, table_name, pt, timeout=args.sql_timeout)
         if actual != count:
@@ -432,7 +432,7 @@ def _run(args, started: float) -> int:
     log(
         f"作业 {job.get('job') or pathlib.Path(args.job).stem} 启动："
         + (f"{job['description']}；" if job.get("description") else "")
-        + f"目标 {project}.{table_name}（{column}，pt={pt}：写临时分区后原子替换）"
+        + f"目标 {project}.{table_name}（{column}，pt={pt}：写临时分区后校验后替换）"
     )
 
     if args.check:

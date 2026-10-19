@@ -16,6 +16,11 @@ import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, quote_plus, unquote
 
+from ._common import leaf_strings as _leaf_strings
+from ._common import private_lock_dir
+from ._common import safe_label as safe_label
+from ._common import webhook_targets as webhook_targets
+
 try:
     import fcntl  # Linux / macOS：进程级运行锁
 except ImportError:  # pragma: no cover - Windows 没有 fcntl
@@ -28,17 +33,6 @@ except ImportError:  # pragma: no cover - Linux / macOS 没有 msvcrt
 
 CN_TZ = timezone(timedelta(hours=8))  # 运行日历日基准（固定 +08:00，无夏令时）
 _SECRETS: list[str] = []  # 日志脱敏用（job 里读到的密钥值）
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def safe_label(value, limit: int = 80) -> str:
-    """外部字段名进日志/飞书卡片前的转义：去控制字符与反引号、限长。
-
-    字段名来自 Base 列名（不可控）：换行能伪造日志行，反引号会提前闭合
-    飞书卡片里的行内代码。只影响展示，不影响入库的 json 原值。
-    """
-    text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("`", "'")
-    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _secret_items(values) -> list:
@@ -495,19 +489,6 @@ def redact_secrets(values, text) -> str:
     return redact(out)
 
 
-def _leaf_strings(value) -> list[str]:
-    """递归收集 dict/list/tuple/set 里的字符串叶子（数字也按 str 收：ID 类密钥写起来就是数字）。"""
-    if isinstance(value, dict):
-        return [item for sub in value.values() for item in _leaf_strings(sub)]
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [item for sub in value for item in _leaf_strings(sub)]
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return [str(value)]
-    return []
-
-
 def _webhook_values(value) -> list[str]:
     """webhook 除整条 URL 外，再收集裸 hook id（形态脱敏认 URL，裸 id 要靠值级遮）。"""
     result: list[str] = []
@@ -516,28 +497,6 @@ def _webhook_values(value) -> list[str]:
         match = _WEBHOOK_ID_RE.search(part)
         if match:
             result.append(match.group(1))
-    return result
-
-
-def webhook_targets(value) -> list[str]:
-    """把 freshness.webhook 归一化成地址列表（字符串或字符串数组）。
-
-    运行时口径：去首尾空白、去空、去重保序；非字符串元素忽略——配置校验阶段会先拦，
-    这里再兜一层，保证告警链路不会因为一个写错的目标把主流程带崩。
-    """
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, (list, tuple)):
-        return []
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            continue
-        item = item.strip()
-        if item and item not in seen:
-            seen.add(item)
-            result.append(item)
     return result
 
 
@@ -785,18 +744,19 @@ def _lock_base_dir(root: pathlib.Path | None = None) -> pathlib.Path:
             # 显式指定的目录不可用要立刻失败：静默换目录等于互斥失效，正是这个开关要防的事
             raise SystemExit(f"FEISHU2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
         return base
-    candidates = [
-        pathlib.Path(__file__).resolve().parent / ".run-locks",
-        pathlib.Path(tempfile.gettempdir()) / "feishu2ods-locks",
-    ]
-    for index, base in enumerate(candidates):
+    last_error = None
+    for index in range(2):
         try:
+            base = (
+                pathlib.Path(__file__).resolve().parent / ".run-locks" if index == 0 else private_lock_dir("feishu2ods")
+            )
             base.mkdir(parents=True, exist_ok=True)
             # 探测文件名必须唯一（mkstemp）：并发启动时共享的探测文件会被别的进程删掉，
             # 导致"静默"落到下一个候选目录——同一作业的两个实例锁在不同路径上，互斥失效
             handle, probe = tempfile.mkstemp(prefix=".probe-", dir=str(base))
             os.close(handle)
-        except OSError:
+        except OSError as exc:
+            last_error = exc
             continue
         try:
             os.unlink(probe)
@@ -812,14 +772,10 @@ def _lock_base_dir(root: pathlib.Path | None = None) -> pathlib.Path:
                 f"若存在多用户/多环境混跑，请用 FEISHU2ODS_LOCK_DIR 固定同一锁目录"
             )
         return base
-    # 两个候选目录都探测失败（极罕见：工具目录与系统临时目录都不可写）：最后退回系统
-    # 临时目录。路径可能与其它实例的锁目录不一致（互斥可能失效），必须显式提示
-    fallback = pathlib.Path(tempfile.gettempdir())
-    log(
-        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
-        f"请用 FEISHU2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
-    )
-    return fallback
+    # 无安全可写目录时拒绝运行，避免运行锁落到不受保护的公共目录。
+    raise SystemExit(
+        f"无法创建安全运行锁目录（{last_error}）；请用 FEISHU2ODS_LOCK_DIR 指定可写的固定目录"
+    ) from last_error
 
 
 def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathlib.Path:

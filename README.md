@@ -2,8 +2,9 @@
 
 飞书多维表格（Base）→ MaxCompute ODS 通用小工具：每条记录一行 JSON，写进「单列 string +
 `pt` 分区」表：每次运行把全量快照写进 `pt=<业务日>`——先写 `pt=<业务日>__tmp` 临时分区，
-核对行数后再「删旧分区 + rename」原子替换（重复跑幂等；写入期间旧快照完整可读，下游不会
-读到空/半截分区）。JSON 键用 job 里配置的英文映射（Base 中文列名 → 英文键），值原样保留
+核对行数后再「删旧分区 + rename」替换（重复跑幂等；临时分区写入期间旧快照完整可读）。
+替换需要两条 DDL，并非事务原子操作：两条语句之间存在正式分区缺失的窗口；rename 失败时
+会尽力保留完整副本并以非零退出码报错，需要重跑或按日志恢复。JSON 键用 job 里配置的英文映射，值原样保留
 （如 `"$6,079.07"`、日期 ISO 串）；清洗与落表口径由下游 DWD 用 `get_json_object` 自行解析。
 
 `pt`（业务日）取值优先级：`--bizdate` > 环境变量 `bizdate` / `SKYNET_BIZDATE`（DataWorks）>
@@ -30,7 +31,7 @@ python feishu2ods.py --job jobs/xxx.json --check
 ```
 
 > `python feishu2ods.py` 与 `python -m feishu2ods` 等价（前者是保留给既有调度命令的入口壳）。
-> 运行时要求 Python 3.10+（代码用到 `X | None` 类型标注），Windows 上会自动带上 `tzdata` 依赖。
+> 运行时要求 Python 3.10+；日期口径使用固定 UTC+8，不依赖系统时区数据库。
 
 ## 目录
 
@@ -38,13 +39,13 @@ python feishu2ods.py --job jobs/xxx.json --check
   - `cli.py` 命令行入口（--check / 正式同步 / --init 分发）
   - `auth.py` 飞书 HTTP 请求（重试/限流退避）与 tenant_access_token
   - `fetch.py` 多维表格拉取（offset 翻页 + 一致性保护 + 流式落盘）
-  - `mc.py` MaxCompute：建表 / 结构校验 / 写分区（原子替换）/ 写后核对
+  - `mc.py` MaxCompute：建表 / 结构校验 / 写分区（校验后替换）/ 写后核对
   - `spool.py` 流式落盘（SpoolWriter）与拉取统计（FetchStats）
   - `config.py` job 配置读取与校验；`dates.py` 业务日与日期规范化
   - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
 - `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
 - `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_example.example.json`）
-- `tests/` 离线单测：`python -m unittest discover -s tests -v`（349 条，不访问网络、不连 MaxCompute）
+- `tests/` 离线单测：`python -m unittest discover -s tests -v`（不访问网络、不连 MaxCompute）
 - `requirements.txt` 依赖（requests + pyodps）
 
 ## 快速开始（已有作业）
@@ -54,7 +55,7 @@ python feishu2ods.py --job jobs/xxx.json --check
 ```bash
 python feishu2ods.py --job jobs/my_table.json --check       # 体检（不写库、不发告警）
 python feishu2ods.py --job jobs/my_table.json --dry-run     # 试跑：拉数校验，不写库
-python feishu2ods.py --job jobs/my_table.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 原子替换）
+python feishu2ods.py --job jobs/my_table.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 校验后替换）
 python feishu2ods.py --job jobs/my_table.json               # 不传 --bizdate：取环境变量，再默认当天-1
 ```
 
@@ -109,15 +110,15 @@ cd ~/feishu2ods
 2. 拉取：v3 records 接口 `limit=500 + offset` 翻页（接口上限 2000）；接口限流（99991400）自动退避重试；
    翻页中途字段列表变化、或表格版本号（rev）变化都会中止（防 offset 翻页期间被编辑导致静默漏行）；
    记录 ID 重复会立刻中止（防接口忽略 offset 重复写）；**流式落盘**：记录边拉边写本地临时
-   JSONL，写库时逐批读回——峰值内存只与单页数据量有关，与总行数无关（十几万行的大表
-   也不再全量驻留内存）；新鲜度/空行/去重 ID 等统计在拉取过程中逐页累积；
+   JSONL，写库时逐批读回，记录正文不全量驻留内存；去重 ID 集合和日期统计仍会随不同 ID/日期数增长，
+   大表部署需为这些统计预留内存；新鲜度/空行/去重 ID 等统计在拉取过程中逐页累积；
 3. 映射：映射的 Base 列缺失（被改名/删除）→ 直接报错（空表也校验）；未映射的列 → 忽略、
    照常同步其余字段，并发一条飞书提醒（列名 + 处理步骤：要不要加映射由人工决定；`--no-notify` 可关）；
    Base 里「除 record_id 外全为空」的空白行会**原样同步**（日志会提示条数），下游记得按日期字段过滤；
    金额等值原样带格式（如 `"$23.32 "` 尾随空格），下游解析前先 `trim`；
 4. 写入：写库前先校验目标表结构（单列 string + pt 分区），不符直接报错、**绝不先清表**；
    单行超过约 7MB 会在动分区前报错；结构正确才写 `pt=<业务日>__tmp` 临时分区 + Tunnel 分批写入，
-   临时分区核对「行数 + record_id 去重数 + 最小/最大 id」（不一致不替换），再「删旧分区 + rename」原子替换；
+   临时分区核对「行数 + record_id 去重数 + 最小/最大 id」（不一致不替换），再「删旧分区 + rename」校验后替换；
    全程失败自动重试 3 次（重跑幂等；失败后尽力清掉临时分区，若有残留下次运行也会先清理）；
    建表 / 分区增删与清理 / 分区核对 / 写后行数核对 / rename 这些 SQL 都有超时保护（默认 600 秒，`--sql-timeout` 可调，
    0=不限制；超时主动取消，避免云端卡住时调度任务无限挂起、一直占着运行锁把后续调度全挡掉）；
@@ -131,7 +132,7 @@ cd ~/feishu2ods
    文件系统不支持锁（NFS / 只读挂载等）时告警一次后**无锁继续**——这种环境确实没有互斥能力，
    但不该把作业判成"已有任务在运行"而永远跑不起来；
    **锁只在同一台机器内生效**：本地手跑与服务器调度同时跑同一作业没有保护，正式跑请固定一台机器；
-   锁目录默认在工具目录 `.run-locks/`（不可写时退回系统临时目录，退回时日志会提示）；若同一作业
+   锁目录默认在工具目录 `.run-locks/`（不可写时退回当前用户的私有临时目录，退回时日志会提示）；若同一作业
    会以不同身份或不同 TMPDIR 跑（root 手动补数与普通用户调度混用），用环境变量
    `FEISHU2ODS_LOCK_DIR` 把锁目录钉在固定位置，避免两个实例锁在不同文件上、互斥静默失效；
 6. 新鲜度校验（配了 `freshness` 才做）：`date_field` 里必须出现「业务日 - `lag_days`」
@@ -195,3 +196,11 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 - 日志/告警里会不会出现密钥：不会——统一过脱敏（形态规则 + 按配置里的密钥值精确遮蔽，
   含 URL 编码形态），告警卡片同样脱敏后才发出；
 - 接新表拿不准配置：`--init` 生成后先 `--check`，报错信息都会指到具体字段。
+
+## 公共源码维护
+
+默认临时锁目录在 POSIX 上校验属主和写权限，拒绝软链或公共可写目录；无安全可写目录时停止运行。
+多身份或多环境运行同一作业时，请用对应的 `*_LOCK_DIR` 固定同一目录，保持互斥。
+
+三个项目保持独立安装；SQL 等待、告警和部分脱敏工具维护一份源码并同步，详见
+[公共源码说明](docs/shared-runtime.md)。贡献前请运行 `python tools/sync_common.py --check`。
