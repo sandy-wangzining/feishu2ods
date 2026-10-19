@@ -35,6 +35,7 @@
   "freshness": {
     "date_field": "biz_date",
     "lag_days": 0,
+    "//webhook": "字符串或字符串数组（多个群同时告警）；缺失时跳过告警",
     "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
   }
 }
