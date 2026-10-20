@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
   "requests>=2.25",
   "pyodps>=0.11",
+  "tzdata>=2023.3; platform_system == 'Windows'",
 ]
 
 [project.scripts]
