@@ -18,7 +18,7 @@ import tempfile
 import time
 import unittest
 from collections import Counter
-from datetime import date, datetime
+from datetime import date
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -307,13 +307,11 @@ class TestBizdate(OfflineTestCase):
             self.assertEqual(dates_mod.resolve_bizdate(args), date(2026, 2, 2))
 
     def test_resolve_default_yesterday(self):
-        class _FixedDatetime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return cls(2026, 9, 29, 10, 0, tzinfo=utils_mod.CN_TZ).astimezone(tz) if tz else cls(2026, 9, 29, 10, 0)
-
         args = make_args()
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(dates_mod, "datetime", _FixedDatetime):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(dates_mod, "default_bizdate", return_value=date(2026, 9, 28)),
+        ):
             self.assertEqual(dates_mod.resolve_bizdate(args), date(2026, 9, 28))
 
     def test_explicit_empty_bizdate_errors(self):
@@ -2758,15 +2756,10 @@ class TestBizdateMore(OfflineTestCase):
                 dates_mod.resolve_bizdate(args, strict=True)
 
     def test_resolve_bizdate_non_strict_falls_back_to_default(self):
-        class _FixedDatetime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return cls(2026, 9, 29, 10, 0, tzinfo=utils_mod.CN_TZ)
-
         args = make_args()
         with (
             mock.patch.dict(os.environ, {"bizdate": "bad-date"}, clear=True),
-            mock.patch.object(dates_mod, "datetime", _FixedDatetime),
+            mock.patch.object(dates_mod, "default_bizdate", return_value=date(2026, 9, 28)),
         ):
             self.assertEqual(dates_mod.resolve_bizdate(args, strict=False), date(2026, 9, 28))
 

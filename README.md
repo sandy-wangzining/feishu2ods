@@ -8,7 +8,7 @@
 （如 `"$6,079.07"`、日期 ISO 串）；清洗与落表口径由下游 DWD 用 `get_json_object` 自行解析。
 
 `pt`（业务日）取值优先级：`--bizdate` > 环境变量 `bizdate` / `SKYNET_BIZDATE`（DataWorks）>
-当天-1（CN）；格式 `YYYYMMDD` 或 `YYYY-MM-DD`。
+美东时区（America/New_York）的昨天；格式 `YYYYMMDD` 或 `YYYY-MM-DD`。
 
 环境要求：Python 3.10+（代码用到 `X | None` 类型标注），依赖见 `requirements.txt`（requests + pyodps）。
 
@@ -56,7 +56,7 @@ python feishu2ods.py --job jobs/xxx.json --check
 python feishu2ods.py --job jobs/my_table.json --check       # 体检（不写库、不发告警）
 python feishu2ods.py --job jobs/my_table.json --dry-run     # 试跑：拉数校验，不写库
 python feishu2ods.py --job jobs/my_table.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 校验后替换）
-python feishu2ods.py --job jobs/my_table.json               # 不传 --bizdate：取环境变量，再默认当天-1
+python feishu2ods.py --job jobs/my_table.json               # 不传 --bizdate：取环境变量，再默认美东昨天
 ```
 
 部署机（把工具目录同步上去即可）：
@@ -136,7 +136,7 @@ cd ~/feishu2ods
    会以不同身份或不同 TMPDIR 跑（root 手动补数与普通用户调度混用），用环境变量
    `FEISHU2ODS_LOCK_DIR` 把锁目录钉在固定位置，避免两个实例锁在不同文件上、互斥静默失效；
 6. 新鲜度校验（配了 `freshness` 才做）：`date_field` 里必须出现「业务日 - `lag_days`」
-   （业务日 = `--bizdate` / 环境变量 / 当天-1；默认 lag_days=0，即少 bizdate 当天就告警）。
+   （业务日 = `--bizdate` / 环境变量 / 美东昨天；默认 lag_days=0，即少 bizdate 当天就告警）。
    `date_field` 的值会先规范成 `yyyy-MM-dd` 再比对，支持的形态：ISO 串
    （`2026-09-27T00:00:00+08:00`，取前 10 位；未补零的 `2026-9-7` 也认）、`yyyy/MM/dd`、
    epoch 毫秒数字（换算结果须落在 2000~2100，0/14 位 `yyyyMMddHHmmss` 这类会按"认不出"处理）、
@@ -146,7 +146,7 @@ cd ~/feishu2ods
    飞书提醒；**表被清空（0 行）仍按失败处理**（那才是真异常）。日志会提示调 `lag_days`
    或用 `--skip-freshness` 跳过校验；同一天出现多行会打警告（DWD 会落多行）；
 7. `--check` 只体检：配置 + API 连通 + 字段映射 + 目标表结构，不写库、不发告警、不校验新鲜度。
-   它是只读的，环境变量 `bizdate` 格式不对时不会把体检拖垮（按默认当天-1 继续并打警告）；
+    它是只读的，环境变量 `bizdate` 格式不对时不会把体检拖垮（按默认美东昨天继续并打警告）；
    正式同步路径仍严格要求业务日合法（非法的环境变量 `bizdate` 直接报错，不会静默回退）。
 
 8. **脱敏**：日志与异常里的 app_secret、tenant_access_token、AK/SK、webhook 一律脱敏——

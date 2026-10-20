@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
+from ._common import default_bizdate
 from .utils import CN_TZ, log
 
 # 业务日参数白名单：只认紧凑与 ISO 两种写法（与 api2ods 同口径，不用 fromisoformat 防版本差异）
@@ -76,19 +77,19 @@ def env_bizdate(strict: bool = True) -> date | None:
 
 
 def resolve_bizdate(args, strict: bool = True) -> date:
-    """业务日：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > 当天-1（CN）。
+    """业务日：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > 美东昨天。
 
     pt（写入分区）与新鲜度校验都以这个业务日为准：调度传什么 bizdate，就校验数据里有没有这一天。
 
     strict=False 只给只读体检（--check）用：环境变量里的 bizdate 格式不对时按"未设置"处理、
-    退回当天-1，而不是直接报错退出（正式同步路径仍为 strict=True）。
+    退回美东昨天，而不是直接报错退出（正式同步路径仍为 strict=True）。
     """
     if args.bizdate is not None:
         # 显式传参（含空串）都必须走格式校验：调度脚本 `--bizdate "$pt"` 且 $pt 未定义时
         # argv 里就是空串——空串非法要报错，不能按"未指定"静默回退成"昨天"写错分区
         return parse_day_arg(args.bizdate)
     from_env = env_bizdate(strict=strict)
-    return from_env if from_env is not None else datetime.now(CN_TZ).date() - timedelta(days=1)
+    return from_env if from_env is not None else default_bizdate()
 
 
 # =============================================================================
