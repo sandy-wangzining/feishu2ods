@@ -31,7 +31,7 @@ def notify(webhook: str | list[str] | tuple[str, ...], title: str, lines: list[s
     card = feishu_card(title, lines, footer)
     for hook in targets:
         try:
-            resp = requests.post(hook, json=card, timeout=15)
+            resp = requests.post(hook, json=card, timeout=15, allow_redirects=False)
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - 告警失败不该改变主流程的退出码
             # 显式 redact：requests 的异常消息里带完整 URL（末段 hook id 即凭据）。log() 出口
@@ -49,4 +49,4 @@ def notify(webhook: str | list[str] | tuple[str, ...], title: str, lines: list[s
             continue
         # 有 JSON 但没有 code/StatusCode（如误填成其它接口的地址）：不能当成功——
         # 告警通道静默失效比报错更危险
-        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")
+        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data))[:200]}")

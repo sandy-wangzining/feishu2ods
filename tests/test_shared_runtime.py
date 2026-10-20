@@ -64,15 +64,44 @@ class TestSharedRuntime(unittest.TestCase):
 
     def test_default_bizdate_is_us_eastern_yesterday(self):
         now = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)  # 06:00 EDT
-        self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-23")
         boundary = datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)  # 23:00 EDT 前一天
-        self.assertEqual(common.default_bizdate(now=boundary).isoformat(), "2026-09-22")
+        with mock.patch.dict(common.os.environ, {}, clear=True):
+            self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-23")
+            self.assertEqual(common.default_bizdate(now=boundary).isoformat(), "2026-09-22")
+
+    def test_default_bizdate_honors_timezone_env(self):
+        now = datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc)  # 上海 09-25 04:00
+        with mock.patch.dict(common.os.environ, {common.BIZDATE_TZ_ENV: "Asia/Shanghai"}, clear=True):
+            self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-24")
+
+    def test_default_bizdate_strips_timezone_env(self):
+        now = datetime(2026, 9, 24, 20, 0, tzinfo=timezone.utc)  # 上海 09-25 04:00
+        with mock.patch.dict(common.os.environ, {common.BIZDATE_TZ_ENV: " Asia/Shanghai "}, clear=True):
+            self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-24")
+
+    def test_default_bizdate_blank_timezone_env_uses_default(self):
+        now = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)  # 06:00 EDT
+        with mock.patch.dict(common.os.environ, {common.BIZDATE_TZ_ENV: "   "}, clear=True):
+            self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-23")
+
+    def test_default_bizdate_rejects_invalid_timezone_env(self):
+        with mock.patch.dict(common.os.environ, {common.BIZDATE_TZ_ENV: "Not/AZone"}, clear=True):
+            with self.assertRaisesRegex(SystemExit, common.BIZDATE_TZ_ENV):
+                common.default_bizdate()
+
+    def test_default_bizdate_oserror_becomes_clean_error(self):
+        """Windows 上空白/非法路径可能抛 PermissionError；也要转成带变量名的干净提示。"""
+        with mock.patch.object(common, "ZoneInfo", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(SystemExit, common.BIZDATE_TZ_ENV):
+                common.default_bizdate()
 
     def test_nested_secret_values_keep_numeric_ids_and_auth_token(self):
         self.assertEqual(
             common.leaf_strings({"a": ["token", 1234, True, None], "b": ("secret",)}), ["token", "1234", "secret"]
         )
         self.assertEqual(common.with_scheme_bare("Bearer abc"), ["Bearer abc", "abc"])
+        self.assertEqual(common.with_scheme_bare("Bearer\tabc"), ["Bearer\tabc", "abc"])
+        self.assertEqual(common.with_scheme_bare("Bearer abc"), ["Bearer abc", "abc"])
 
     def test_webhook_targets_deduplicate_and_skip_invalid_items(self):
         self.assertEqual(common.webhook_targets([" a ", "", "a", None, 1, "b"]), ["a", "b"])
@@ -80,9 +109,16 @@ class TestSharedRuntime(unittest.TestCase):
 
     def test_label_and_card_keep_data_separate_from_display(self):
         self.assertEqual(common.safe_label("a\n`b`\x00"), "a 'b' ")
+        # C1、Unicode 行分隔符与 bidi 控制符同样会伪造显示行/做视觉伪装
+        self.assertEqual(common.safe_label("a b\u009bc‮d"), "a b c d")
+        # Markdown 链接与 <at> 标签语法被中和（全角字符仍可读）
+        self.assertEqual(common.safe_label("[x](https://phish) <at id=all>"), "［x］(https://phish) ＜at id=all＞")
         self.assertEqual(common.safe_label("abcdef", 3), "abc…")
         card = common.feishu_card("标题", ["第一行", 2], "尾部")
         self.assertEqual(card["card"]["elements"][0]["text"]["content"], "第一行\n2")
+        # 单个字符串不能逐字符拆行；None 也不能让卡片构造抛 TypeError
+        self.assertEqual(common.feishu_card("标题", "abc")["card"]["elements"][0]["text"]["content"], "abc")
+        self.assertEqual(common.feishu_card("标题", None)["card"]["elements"][0]["text"]["content"], "")
         self.assertEqual(card["card"]["elements"][-1]["elements"][0]["content"], "尾部")
 
     def test_sql_polling_error_or_interrupt_cancels_instance(self):
@@ -112,6 +148,23 @@ class TestSharedRuntime(unittest.TestCase):
                 mc.run_sql_with_timeout(SimpleNamespace(run_sql=submit), "select 1", timeout=5)
         instance.stop.assert_called_once()
         clock.sleep.assert_not_called()
+
+    def test_sql_heartbeat_when_timeout_zero(self):
+        """timeout=0（不限制）时仍要按 heartbeat 打进度，而不是全程静默。"""
+        clock = SimpleNamespace(
+            now=0, monotonic=lambda: clock.now, sleep=lambda seconds: setattr(clock, "now", clock.now + seconds)
+        )
+        instance = mock.Mock()
+        instance.is_successful.side_effect = [False, False, True]
+        instance.is_terminated.return_value = False
+        with (
+            mock.patch.object(mc, "time", clock),
+            mock.patch.object(mc, "SQL_HEARTBEAT_SECONDS", 1),
+            mock.patch.object(mc, "log") as log,
+        ):
+            result = mc.run_sql_with_timeout(SimpleNamespace(run_sql=lambda sql: instance), "select 1", timeout=0)
+        self.assertIs(result, instance)
+        self.assertTrue(any("不限制" in str(call) for call in log.call_args_list), log.call_args_list)
 
     def test_sql_success_does_not_cancel(self):
         instance = mock.Mock()

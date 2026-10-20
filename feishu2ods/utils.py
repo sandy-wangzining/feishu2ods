@@ -63,6 +63,22 @@ def reset_secret_values(values) -> None:
         _SECRETS.extend(str(v) for v in values if isinstance(v, (str, int, float)) and not isinstance(v, bool))
 
 
+def add_secret_value(value) -> None:
+    """把运行时才拿到的凭据（如 tenant_access_token）补进值级脱敏表。
+
+    这些值不在作业配置里，collect_secret_values 收不到；网关/接口若在自由文本里
+    裸回显 token，形态规则（Bearer/key=…）不一定覆盖得到。
+    """
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return
+    text = str(value)
+    if len(text) < _SECRET_MIN_LEN:
+        return
+    with _lock:
+        if text not in _SECRETS:
+            _SECRETS.append(text)
+
+
 _console_patched = False
 _lock = threading.Lock()
 _sinks: list = []  # 日志文件副本（--log-file）；句柄由调用方负责关闭
@@ -98,18 +114,17 @@ def remove_log_sink(handle) -> None:
     if handle is None:
         return
     with _lock:
-        # 摘除与关闭放在同一把锁里：log() 的快照在锁内取，缩小"取完快照后句柄被关"
-        # 的竞态窗口；log() 里对"已摘除句柄抛 ValueError"也有静默兜底
+        # 锁内只做摘除：close 可能 flush 到 NFS/管道而阻塞，不能占着全局锁拖死日志
         if handle in _sinks:
             _sinks.remove(handle)
-        closer = getattr(handle, "close", None)
-        if not callable(closer):
-            return
-        try:
-            closer()
-        except (OSError, ValueError):
-            # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
-            pass
+    closer = getattr(handle, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except (OSError, ValueError):
+        # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
+        pass
 
 
 def log(msg: str) -> None:
@@ -642,7 +657,8 @@ def _try_lock(fh) -> bool:
     """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。
 
     三类 OSError 必须分开：忙 = False（真有人持锁）；"文件系统不支持锁"（ENOLCK/ENOTSUP，
-    如 NFS/只读挂载）= 告警一次后按无锁继续；其余上抛，别让它冒充"已有任务在运行"。
+    如 NFS/只读挂载）= 默认抛错拒绝执行，显式设置 FEISHU2ODS_ALLOW_NO_LOCK=1 才告警后无锁继续；
+    其余上抛，别让它冒充"已有任务在运行"。
     """
     if fcntl is not None:
         try:
@@ -797,7 +813,8 @@ def table_lock_path(project: str, table: str, root: pathlib.Path | None = None) 
 
     作业锁只管"同一个作业不重复跑"：jobs/a.json 与 jobs/b.json 写同一张表时互不阻塞，
     一边的 purge 会清掉另一边正在写的临时分区、rename 交叉执行，最终一方数据被静默覆盖
-    （各自的写后核对只校验自己这批行数，发现不了）。锁名直接用「项目.表名」：两者都已过
-    标识符白名单（字母/数字/下划线），做文件名安全；同一张表的任何写法都会撞到同一把锁。
+    （各自的写后核对只校验自己这批行数，发现不了）。锁名用「项目.表名」的小写形式：
+    MaxCompute 标识符不区分大小写并按小写存储，Linux 文件名却区分，`ODS_X_DF` 与
+    `ods_x_df` 必须撞到同一把锁；两者都已过标识符白名单，做文件名安全。
     """
-    return _lock_base_dir(root) / f"table-{project}.{table}.lock"
+    return _lock_base_dir(root) / f"table-{project.lower()}.{table.lower()}.lock"

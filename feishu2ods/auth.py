@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 
-from .utils import _api_err, log, redact
+from .utils import _api_err, add_secret_value, log, redact
 
 try:
     import requests
@@ -62,11 +62,12 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
                 )
             if resp.status_code >= 500 or resp.status_code == 429:
                 # 重试前先关掉响应：不消费响应体的话连接不会归还连接池，重试多次会占着连接
-                msg = f"HTTP {resp.status_code}：{resp.text[:200]}"
+                msg = f"HTTP {resp.status_code}：{redact(resp.text)[:200]}"
                 resp.close()
                 last = requests.RequestException(msg)
             elif 400 <= resp.status_code < 500:
-                body = resp.text[:300]
+                # 先脱敏再截断：反过来会把跨截断边界的密钥切成两半，redact 匹配不到完整值
+                body = redact(resp.text)[:300]
                 resp.close()
                 raise ApiHttpError(resp.status_code, body)
             else:
@@ -97,5 +98,6 @@ def get_tenant_token(app_id: str, app_secret: str) -> str:
     token = str(data.get("tenant_access_token") or "")
     if not token:
         raise SystemExit("tenant_access_token 为空（接口返回异常）")
+    add_secret_value(token)  # 运行时凭据不在作业配置里，补进值级脱敏表
     log(f"已获取 tenant_access_token（有效期 {data.get('expire')} 秒）")
     return token

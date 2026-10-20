@@ -3,6 +3,8 @@
 欢迎提 Issue 和 PR。这个工具的目标很明确：**配置驱动、写入幂等、宁可失败也不静默写坏数据**。
 提改动前请先读一下下面的"设计红线"，很多看似"顺手优化"的改法会踩到它们。
 
+> 只想使用工具？看 [README.md](README.md) 的「快速开始」即可；本文面向改代码、提 PR 的人。
+
 ## 环境准备
 
 ```bash
@@ -18,8 +20,8 @@ python3 -m venv venv
 
 ```bash
 python -m unittest discover -s tests -v   # 全部用例：不访问网络、不连 MaxCompute
-ruff check .                              # 代码检查（配置在 ruff.toml，当前 0 告警）
-ruff format --check .                     # 格式检查
+ruff check .                              # 代码检查（配置在 pyproject.toml，当前 0 告警）
+ruff format .                             # 统一格式（ruff 锁版本；CI 跑 ruff format --check，提交前先格式化）
 ```
 
 - 测试**必须离线可跑**：不许依赖真实飞书接口、真实 MaxCompute、本机特定的文件（CI 会在
@@ -35,7 +37,7 @@ ruff format --check .                     # 格式检查
 
 1. **全量快照写 `pt=<业务日>`**：每次运行把整张表的数据按 `fields` 映射后写进当天的分区，
    不写增量、不写多分区。`pt`（业务日）取值优先级 `--bizdate` > 环境变量
-   `bizdate` / `SKYNET_BIZDATE` > 当天-1（CN）。
+   `bizdate` / `SKYNET_BIZDATE` > 业务日时区（`ODS_BIZDATE_TZ`，默认 America/New_York）的昨天。
 2. **临时分区 + 校验后替换**：写入必须先落到临时分区，核对通过后再「删旧分区 + rename」
    换成正式分区。两条 DDL 之间存在缺分区窗口，不承诺事务原子性；替换失败必须报告失败，
    并尽力保留完整副本供恢复。写前校验（如单行大小）必须在动分区之前完成。
