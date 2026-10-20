@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -60,6 +61,12 @@ class TestSharedRuntime(unittest.TestCase):
                         else:
                             with mock.patch.object(cli, "ROOT", root):
                                 cli._lock_path(Path("job.json"))
+
+    def test_default_bizdate_is_us_eastern_yesterday(self):
+        now = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)  # 06:00 EDT
+        self.assertEqual(common.default_bizdate(now=now).isoformat(), "2026-09-23")
+        boundary = datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)  # 23:00 EDT 前一天
+        self.assertEqual(common.default_bizdate(now=boundary).isoformat(), "2026-09-22")
 
     def test_nested_secret_values_keep_numeric_ids_and_auth_token(self):
         self.assertEqual(

@@ -10,10 +10,29 @@ import os
 import re
 import stat
 import tempfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _AUTH_SCHEMES = frozenset({"basic", "bearer", "token", "digest"})
+DEFAULT_BIZDATE_TZ = "America/New_York"
+
+
+def default_bizdate(now: datetime | None = None) -> date:
+    """没传业务日时的统一默认值：美东时区（America/New_York）的昨天。
+
+    三个 ODS 项目共用这一份；显式 --bizdate 与环境变量 bizdate/SKYNET_BIZDATE
+    仍由各项目优先处理，本函数只负责最后的兜底口径。
+    """
+    tz = ZoneInfo(DEFAULT_BIZDATE_TZ)
+    if now is None:
+        moment = datetime.now(tz)
+    elif now.tzinfo is None:
+        moment = now.replace(tzinfo=tz)
+    else:
+        moment = now.astimezone(tz)
+    return moment.date() - timedelta(days=1)
 
 
 def private_lock_dir(tool: str) -> Path:
