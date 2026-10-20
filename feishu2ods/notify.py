@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from ._common import feishu_card
 from .utils import log, redact, webhook_targets
 
 try:
@@ -27,17 +28,7 @@ def notify(webhook: str | list[str] | tuple[str, ...], title: str, lines: list[s
     if requests is None:
         log("  警告：缺少 requests，跳过飞书告警（pip install requests）")
         return
-    card = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {"template": "red", "title": {"tag": "plain_text", "content": title}},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
-        },
-    }
-    if footer:
-        card["card"]["elements"].append({"tag": "hr"})
-        card["card"]["elements"].append({"tag": "note", "elements": [{"tag": "plain_text", "content": footer}]})
+    card = feishu_card(title, lines, footer)
     for hook in targets:
         try:
             resp = requests.post(hook, json=card, timeout=15)

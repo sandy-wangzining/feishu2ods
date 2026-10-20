@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""feishu2ods 包：飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，临时分区原子替换）。
+"""feishu2ods 包：飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，临时分区校验后替换）。
 
 模块划分：
     cli     命令行入口（--check / 正式同步 / --init 分发）
     auth    飞书 HTTP 请求（重试/限流退避）与 tenant_access_token
     fetch   多维表格拉取（offset 翻页 + 一致性保护 + 流式落盘）
-    mc      MaxCompute：建表 / 结构校验 / 写分区（原子替换）/ 写后核对
+    mc      MaxCompute：建表 / 结构校验 / 写分区（校验后替换）/ 写后核对
     spool   流式落盘（SpoolWriter）与拉取统计（FetchStats）
     config  job 配置读取与校验
     dates   业务日解析与日期值规范化

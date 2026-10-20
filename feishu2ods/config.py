@@ -101,9 +101,7 @@ def validate_job(job: dict) -> list[str]:
         if base_url.startswith("http://"):
             # 允许 http 但必须留痕：tenant_access_token（Authorization 头）与整表数据
             # 会以明文经网络传输，中间代理/网关都能读到
-            warnings.append(
-                "feishu.base_url 是 http:// 明文地址：token 与表格数据会明文传输，建议改 https（本地调试可忽略）"
-            )
+            warnings.append("feishu.base_url 是 http:// 明文链接：告警卡片点击该链接时不受 HTTPS 保护，建议改 https")
         feishu["base_url"] = base_url
 
     maxcompute = job.get("maxcompute")

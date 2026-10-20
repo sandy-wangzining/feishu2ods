@@ -40,7 +40,7 @@ def fetch_records(
     extra_out 传入时收集未映射的新增列名（由 run_sync 发一次飞书提醒用）。
 
     流式模式（sink 与 stats 都给）：每页记录立即写进 sink 落盘、stats 逐页累积，
-    返回 stats——峰值内存只与单页数据量有关，大表不再全量驻留内存（run_sync 用）。
+    返回 stats——正文只保留单页，ID 去重集合仍随记录数增长（run_sync 用）。
     两者都不给：保持旧行为，全量累积后返回记录列表（--check / 小表调用方用）。
     """
     if (sink is None) != (stats is None):
@@ -129,7 +129,10 @@ def fetch_records(
         elif page_fields != fields:
             raise SystemExit("翻页期间字段列表发生变化（表格结构可能刚被改动），已中止，请重跑")
         page_rows = [list(row) for row in (payload.get("data") or [])]
-        page_ids = [str(item) for item in (payload.get("record_id_list") or [])]
+        raw_ids = payload.get("record_id_list") or []
+        if any(item is None or item == "" for item in raw_ids):
+            raise SystemExit(f"第 {page} 页有记录缺少 record_id，接口返回异常，已中止")
+        page_ids = [str(item) for item in raw_ids]
         if len(page_rows) != len(page_ids):
             raise SystemExit(f"第 {page} 页行数与记录 ID 数不一致（{len(page_rows)} ≠ {len(page_ids)}），已中止")
         # 防死循环兜底：接口忽略 offset 时会重复返回同一页（页级指纹命中）；
@@ -148,6 +151,9 @@ def fetch_records(
             page_records = _page_records(fields or [], page_ids, page_rows, mapping)
             sink.write_records(page_records)
             stats.update(page_records)
+            # 复用统计里的全量 ID 集合，补上同页及非相邻页重叠检查。
+            if stats.distinct_ids() != stats.count:
+                raise SystemExit(f"第 {page} 页出现重复或缺失的 record_id，接口返回异常，已中止")
             del page_records
             accumulated = stats.count  # 流式模式 raw_rows 不再累积，累计数只能取 stats
         else:
@@ -225,6 +231,8 @@ def build_records(
         return []
     if len(record_ids) != len(raw_rows):
         raise SystemExit(f"记录数与行数不一致（{len(record_ids)} ≠ {len(raw_rows)}），已中止")
+    if len(set(record_ids)) != len(record_ids):
+        raise SystemExit("接口返回重复的 record_id，本次快照不可信，已中止")
     if not fields:
         raise SystemExit("接口返回了记录但没给字段列表，无法把值映射成英文键，已中止")
     records: list[dict] = []

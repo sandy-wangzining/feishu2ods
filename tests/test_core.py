@@ -548,6 +548,38 @@ class TestNotify(OfflineTestCase):
 
 
 class TestFetchRecords(OfflineTestCase):
+    def test_null_or_empty_record_id_rejected_before_string_conversion(self):
+        for record_id in (None, ""):
+            for stream in (False, True):
+                with self.subTest(record_id=record_id, stream=stream):
+                    page = self._page([["2026-09-27", "$1"]], [record_id], False)
+                    with (
+                        mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+                        mock.patch.object(fetch_mod, "request_json", return_value=page),
+                    ):
+                        sink = mock.Mock()
+                        kwargs = {"sink": sink, "stats": cli_mod.FetchStats()} if stream else {}
+                        with self.assertRaisesRegex(SystemExit, "record_id"):
+                            cli_mod.fetch_records(self.job_feishu, self.mapping, **kwargs)
+                        sink.write_records.assert_not_called()
+
+    def test_duplicate_ids_within_or_across_nonadjacent_pages(self):
+        for ids_by_page in ((["r1", "r1"],), (["r1", "r2"], ["r3"], ["r2", "r4"])):
+            for stream in (False, True):
+                with self.subTest(ids_by_page=ids_by_page, stream=stream):
+                    pages = [
+                        self._page([["a", "b"] for _ in ids], ids, i < len(ids_by_page) - 1)
+                        for i, ids in enumerate(ids_by_page)
+                    ]
+                    with (
+                        cli_mod.SpoolWriter() as sink,
+                        mock.patch.object(fetch_mod, "get_tenant_token", return_value="tok"),
+                        mock.patch.object(fetch_mod, "request_json", side_effect=pages),
+                    ):
+                        kwargs = {"sink": sink, "stats": cli_mod.FetchStats()} if stream else {}
+                        with self.assertRaisesRegex(SystemExit, "重复"):
+                            cli_mod.fetch_records(self.job_feishu, self.mapping, **kwargs)
+
     def setUp(self):
         super().setUp()
         self.mapping = {"日期": "biz_date", "金额": "amount"}
@@ -1044,9 +1076,8 @@ class TestMc(OfflineTestCase):
                 cli_mod.run_sync(args, job, "p", "t", "json", "20260928", date(2026, 9, 28), time.time())
         self.assertIn("allow_empty", str(ctx.exception))
 
-    def test_probe_failure_falls_back_to_rebuild_not_drop_first(self):
-        """tmp 探测失败（不可信）时不能按"还在"处理：快速路径会先 drop 正式分区，
-        万一上一轮 rename 已生效，删掉的就是刚写入的新数据。必须落回常规路径重建。"""
+    def test_probe_failure_preserves_verified_copy(self):
+        """探测失败时既不能删正式分区，也不能销毁可能是唯一完整副本的临时分区。"""
         table = _FakeTable()
         odps = _FakeOdps([self._verify_row(1, mn="r1")])
         messages: list[str] = []
@@ -1057,7 +1088,9 @@ class TestMc(OfflineTestCase):
         ):
             with self.assertRaises(SystemExit):
                 cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", [{"record_id": "r1", "a": 1}])
-        self.assertEqual(table.write_attempts, 3)  # 每趟都走重建，而不是"先删正式分区"的快速路径
+        self.assertEqual(table.write_attempts, 1)
+        tmp_drops = [sql for sql in odps.sqls if "drop if exists" in sql and mc_mod.TMP_PARTITION_SUFFIX in sql]
+        self.assertEqual(len(tmp_drops), 1)  # 仅初次写入前清理，重试不再删完整副本
         self.assertIn("状态未知", "\n".join(messages))
 
     def test_write_partition_cleanup_failure_keeps_error(self):
@@ -1189,6 +1222,16 @@ class TestRunLock(OfflineTestCase):
 # --init 向导
 # ---------------------------------------------------------------------------
 class TestRunInit(OfflineTestCase):
+    def test_fetch_failure_does_not_echo_secret_value(self):
+        secret = "wizard-secret-abcdef"
+
+        def failed(_feishu):
+            raise RuntimeError(f"credential rejected: {secret}")
+
+        code, echoed = self._run(["job", "https://x/base/ICx?table=tblx", "cli_x", secret], failed)
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, "\n".join(echoed))
+
     def _run(self, answers, fetch_fields):
         echoed: list[str] = []
         answers = list(answers)
@@ -1902,6 +1945,55 @@ class TestFreshnessDualMode(OfflineTestCase):
 
 class TestWritePartitionStreaming(OfflineTestCase):
     """write_partition 的流式签名与旧签名兼容分支。"""
+
+    def test_ensure_table_uses_explicit_project(self):
+        odps = mock.Mock()
+        with mock.patch.object(mc_mod, "run_sql_with_timeout"):
+            result = mc_mod.ensure_table(odps, "destination", "t", "json", "comment")
+        odps.get_table.assert_called_once_with("destination.t")
+        self.assertIs(result, odps.get_table.return_value)
+
+    def test_unknown_tmp_probe_can_recover_without_rewriting(self):
+        table = _FakeTable()
+        with (
+            mock.patch.object(mc_mod, "verify_partition", return_value=(1, 1, "r1", "r1")),
+            mock.patch.object(mc_mod, "drop_partition") as drop,
+            mock.patch.object(mc_mod, "add_partition"),
+            mock.patch.object(mc_mod, "rename_partition", side_effect=[TimeoutError("uncertain"), None]) as rename,
+            mock.patch.object(mc_mod, "_partition_exists", side_effect=[None, True]),
+        ):
+            cli_mod.write_partition(mock.Mock(), table, "p", "t", "json", "20260928", [{"record_id": "r1"}])
+        self.assertEqual(table.write_attempts, 1)
+        self.assertEqual(rename.call_count, 2)
+        tmp_drops = [call for call in drop.call_args_list if call.args[3].endswith(mc_mod.TMP_PARTITION_SUFFIX)]
+        self.assertEqual(len(tmp_drops), 1)
+
+    def test_exhausted_write_inside_outer_except_still_raises(self):
+        with mock.patch.object(mc_mod, "drop_partition", side_effect=RuntimeError("DDL failed")):
+            try:
+                raise ValueError("caller is handling another exception")
+            except ValueError:
+                with self.assertRaises(SystemExit):
+                    cli_mod.write_partition(
+                        mock.Mock(), _FakeTable(), "p", "t", "json", "20260928", [{"record_id": "r1"}]
+                    )
+
+    def test_duplicate_or_partly_missing_ids_rejected_before_ddl(self):
+        for ids in (("r1", "r1"), ("r1", "")):
+            for stream in (False, True):
+                with self.subTest(ids=ids, stream=stream):
+                    rows = [{"record_id": rid} for rid in ids]
+                    with cli_mod.SpoolWriter() as spool:
+                        spool.write_records(rows)
+                        stats = cli_mod.FetchStats()
+                        stats.update(rows)
+                        odps = mock.Mock()
+                        table = mock.Mock()
+                        args = (spool, stats) if stream else (rows,)
+                        with self.assertRaisesRegex(SystemExit, "record_id"):
+                            cli_mod.write_partition(odps, table, "p", "t", "json", "20260928", *args)
+                        odps.run_sql.assert_not_called()
+                        table.open_writer.assert_not_called()
 
     def test_new_signature_writes_from_spool(self):
         table = _FakeTable()
@@ -3972,6 +4064,7 @@ class TestReviewHardening(OfflineTestCase):
     @unittest.skipUnless(os.name == "posix", "os.kill(pid, 0) 探测只在 POSIX 有效")
     def test_pid_alive_probe_mapping(self):
         self.assertTrue(mc_mod._pid_alive(os.getpid()))
+        self.assertFalse(mc_mod._pid_alive(10**100))
         with mock.patch.object(mc_mod.os, "kill", side_effect=ProcessLookupError):
             self.assertFalse(mc_mod._pid_alive(1))
         with mock.patch.object(mc_mod.os, "kill", side_effect=PermissionError):

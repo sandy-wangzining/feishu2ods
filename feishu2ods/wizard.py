@@ -20,6 +20,7 @@ from .config import (
 )
 from .fetch import fetch_field_sample
 from .mc import DEFAULT_ENDPOINT
+from .utils import collect_secret_values, redact_secrets
 
 
 # =============================================================================
@@ -67,6 +68,13 @@ def run_init(
     fetch_fields(feishu) -> (fields, samples)：默认走真实接口拉第一页做列名/样例展示；
     ask_secret(prompt) -> str：密钥类输入默认用 getpass（不回显）；单元测试都可注入假实现（离线跑）。
     """
+    raw_echo = echo
+    secret_values: list[str] = []
+
+    def safe_echo(message):
+        raw_echo(redact_secrets(secret_values, str(message)))
+
+    echo = safe_echo
     root = pathlib.Path(workdir) if workdir else pathlib.Path.cwd()
     fetch_fields = fetch_fields or fetch_field_sample
     ask_secret = ask_secret or _default_ask_secret
@@ -140,6 +148,7 @@ def run_init(
     feishu = {"app_id": app_id, "app_secret": app_secret, "base_token": base_token, "table_id": table_id}
     if base_url:
         feishu["base_url"] = base_url  # 告警卡片里带表格链接
+    secret_values.extend(collect_secret_values({"feishu": feishu}))
     echo("   正在拉取表格列名 ...")
     try:
         fields, samples = fetch_fields(feishu)
@@ -207,7 +216,7 @@ def run_init(
     else:
         echo("❌ 表名连续三次无效，已取消。")
         return 1
-    comment = _ask(ask, "   表注释", "飞书多维表格同步（JSON 原样，写临时分区后原子替换 pt=业务日）")
+    comment = _ask(ask, "   表注释", "飞书多维表格同步（JSON 原样，写临时分区后校验后替换 pt=业务日）")
 
     # ⑦ 阿里云凭证
     echo("⑦ MaxCompute 凭证（与其它作业相同即可）")
@@ -262,7 +271,7 @@ def run_init(
 
     job = {
         "job": job_name,
-        "description": f"飞书多维表格 {base_token}/{table_id} → {project}.{table_name}（json + pt 分区，临时分区 + 原子替换）",
+        "description": f"飞书多维表格 {base_token}/{table_id} → {project}.{table_name}（json + pt 分区，临时分区 + 校验后替换）",
         "feishu": feishu,
         "maxcompute": {"project": project, "endpoint": endpoint, "access_key_id": ak, "access_key_secret": sk},
         "fields": mapping,
@@ -276,6 +285,7 @@ def run_init(
     }
     if freshness:
         job["freshness"] = freshness
+    secret_values.extend(collect_secret_values(job))
 
     # 先按校验器过一遍（就地规范化：去空白等），避免生成一份跑不起来的配置；
     # 未知键/明文 http 端点等告警也要展示——静默写进生成的配置会让人以为一切正常
