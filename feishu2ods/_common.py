@@ -12,20 +12,30 @@ import stat
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# 终端/日志控制字符：C0/C1、Unicode 行分隔符、零宽与 bidi 控制符都能伪造显示行
+# 或做视觉伪装，外部文本展示前必须清掉
+_CONTROL_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f​-‏  ‪-‮⁦-⁩]")
 _AUTH_SCHEMES = frozenset({"basic", "bearer", "token", "digest"})
 DEFAULT_BIZDATE_TZ = "America/New_York"
+BIZDATE_TZ_ENV = "ODS_BIZDATE_TZ"
 
 
 def default_bizdate(now: datetime | None = None) -> date:
-    """没传业务日时的统一默认值：美东时区（America/New_York）的昨天。
+    """没传业务日时的统一默认值：业务日时区的昨天。
 
-    三个 ODS 项目共用这一份；显式 --bizdate 与环境变量 bizdate/SKYNET_BIZDATE
-    仍由各项目优先处理，本函数只负责最后的兜底口径。
+    时区取环境变量 ODS_BIZDATE_TZ，未设置时用 America/New_York。
+    显式 --bizdate 与环境变量 bizdate/SKYNET_BIZDATE 仍由各项目优先处理。
     """
-    tz = ZoneInfo(DEFAULT_BIZDATE_TZ)
+    name = (os.environ.get(BIZDATE_TZ_ENV) or "").strip() or DEFAULT_BIZDATE_TZ
+    try:
+        tz = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+        raise SystemExit(
+            f"{BIZDATE_TZ_ENV} 时区不可用：{name!r}。请检查拼写；若名称正确，请安装时区数据库"
+            f"（Windows/Linux 均可 pip install tzdata；Linux 也可装系统 tzdata 包）"
+        ) from exc
     if now is None:
         moment = datetime.now(tz)
     elif now.tzinfo is None:
@@ -50,8 +60,11 @@ def private_lock_dir(tool: str) -> Path:
 
 
 def safe_label(value, limit: int = 80) -> str:
-    """外部文本展示前去控制字符、转义反引号并限长；不改变入库数据。"""
+    """外部文本展示前去控制字符、转义反引号/Markdown 结构符并限长；不改变入库数据。"""
     text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("`", "'")
+    # 外部值会被拼进 lark_md/日志：中和 Markdown 链接与 <at> 标签语法，避免
+    # 告警卡片里出现可点击的钓鱼链接或 @所有人（全角字符仍可读，不影响数据）
+    text = text.replace("[", "［").replace("]", "］").replace("<", "＜").replace(">", "＞")
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -70,9 +83,11 @@ def leaf_strings(value) -> list[str]:
 
 def with_scheme_bare(value: str) -> list[str]:
     """收集带认证方案的完整凭证及裸值，防止接口只回显裸 token 时漏遮。"""
-    head, sep, tail = value.partition(" ")
-    if sep and head.lower() in _AUTH_SCHEMES and tail.strip():
-        return [value, tail.strip()]
+    # split(None, 1) 按任意空白（tab、NBSP 等）切分；只认 ASCII 空格会漏掉
+    # "Bearer\tabc123" 这类回显
+    parts = value.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() in _AUTH_SCHEMES and parts[1].strip():
+        return [value, parts[1].strip()]
     return [value]
 
 
@@ -96,6 +111,13 @@ def webhook_targets(value) -> list[str]:
 
 def feishu_card(title: str, lines, footer: str = "") -> dict:
     """构造三个项目共用的飞书卡片；发送和失败策略由调用方保留。"""
+    # 单个字符串不能被 join 拆成逐字符行；None 也不能让告警构造直接 TypeError
+    if lines is None:
+        lines = []
+    elif isinstance(lines, str):
+        lines = [lines]
+    elif not isinstance(lines, (list, tuple)):
+        lines = [lines]
     card = {
         "msg_type": "interactive",
         "card": {
@@ -131,8 +153,9 @@ def run_sql_with_timeout(o, sql: str, timeout, desc: str, *, clock, log, heartbe
             now = clock.monotonic()
             if timeout and timeout > 0 and now - started > timeout:
                 raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已请求停止")
-            if timeout and timeout > 0 and now - last_log >= heartbeat:
-                log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
+            if heartbeat and now - last_log >= heartbeat:
+                limit = f"{timeout} 秒" if timeout and timeout > 0 else "不限制"
+                log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {limit}）...")
                 last_log = now
             clock.sleep(1)
     except BaseException:

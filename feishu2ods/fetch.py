@@ -8,7 +8,7 @@ import time
 
 from .auth import FEISHU_HOST, ApiHttpError, get_tenant_token, request_json
 from .spool import FetchStats, SpoolWriter
-from .utils import _api_err, log, redact
+from .utils import _api_err, log, redact, safe_label
 
 PAGE_SIZE = 500  # 单页行数（接口上限 2000，超了报 800004006；500 兼顾请求数与单页体积）
 MAX_PAGES = 10000  # 防死循环的翻页上限（10000 页 × 500 行 = 500 万行，够用）
@@ -123,7 +123,11 @@ def fetch_records(
                     )
                 extra = [name for name in fields if name and name not in mapping]
                 if extra and stream:
-                    log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
+                    # 列名来自外部 Base：换行/反引号/ESC 会伪造日志行，进日志前先清理
+                    log(
+                        f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略："
+                        f"{'、'.join(safe_label(name) for name in extra)}"
+                    )
                     if extra_out is not None:
                         extra_out.extend(extra)
         elif page_fields != fields:
@@ -224,7 +228,7 @@ def build_records(
             raise SystemExit("Base 里找不到 fields 映射的列：" + "、".join(missing) + "（列名可能被改名/删除，请核对）")
         extra = [name for name in fields if name and name not in mapping]
         if extra:
-            log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(extra)}")
+            log(f"  警告：Base 里有 {len(extra)} 个列未映射、已忽略：{'、'.join(safe_label(name) for name in extra)}")
             if extra_out is not None:
                 extra_out.extend(extra)
     if not raw_rows and not record_ids:

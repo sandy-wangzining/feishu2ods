@@ -46,3 +46,18 @@ dev = ["ruff==0.16.9"]
 
 [tool.setuptools]
 packages = ["feishu2ods"]
+
+[tool.ruff]
+line-length = 120
+exclude = ["venv", ".venv", "build", "dist", "__pycache__", ".run-locks"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP"]
+ignore = [
+  "E501",    # 长行：中文说明/日志字符串多，120 列仍可能超
+  "UP009",   # 保留文件头的 # -*- coding: utf-8 -*-（团队习惯，便于跨工具查看）
+  "UP015",   # open(mode="r") 显式写法保留（可读性）
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]   # 测试先插 sys.path 再 import

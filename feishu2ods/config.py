@@ -48,9 +48,11 @@ def _warn_unknown_keys(obj: dict, allowed: set, where: str, warnings: list) -> N
 
 
 def _require_text(value, where: str) -> str:
-    """必填字符串：空/非字符串直接报错（带字段路径）。"""
-    if not isinstance(value, str) or not value.strip():
-        raise SystemExit(f"{where} 必须是非空字符串，实际 {value!r}")
+    """必填字符串：空/非字符串直接报错（带字段路径，不回显取值——可能是密钥）。"""
+    if not isinstance(value, str):
+        raise SystemExit(f"{where} 必须是字符串，实际 {type(value).__name__}")
+    if not value.strip():
+        raise SystemExit(f"{where} 不能是空白字符串")
     return value.strip()
 
 
@@ -149,6 +151,9 @@ def validate_job(job: dict) -> list[str]:
     target_cfg["table"] = _require_identifier(target_cfg.get("table"), "target.table")
     if target_cfg.get("column") is not None:
         target_cfg["column"] = _require_identifier(target_cfg.get("column"), "target.column")
+        if target_cfg["column"].lower() == "pt":
+            # pt 是分区列：同名数据列 + partitioned by (pt) 会让建表直接失败
+            raise SystemExit("target.column 不能是 pt：pt 是分区列，不能同时作为数据列")
     if target_cfg.get("project") is not None:
         target_cfg["project"] = _require_identifier(target_cfg.get("project"), "target.project")
     if not (target_cfg.get("project") or maxcompute.get("project")):
@@ -175,8 +180,9 @@ def validate_job(job: dict) -> list[str]:
         if date_field not in seen:
             raise SystemExit(f"freshness.date_field={date_field!r} 不在 fields 的英文键里：{sorted(seen)}")
         lag = freshness.get("lag_days", DEFAULT_FRESHNESS_LAG_DAYS)
-        if isinstance(lag, bool) or not isinstance(lag, int) or lag < 0:
-            raise SystemExit(f"freshness.lag_days 必须是非负整数，实际 {lag!r}")
+        if isinstance(lag, bool) or not isinstance(lag, int) or lag < 0 or lag > 36500:
+            # 上限 100 年：再大 date - timedelta 会 OverflowError，变成未预期错误+traceback
+            raise SystemExit(f"freshness.lag_days 必须是 0~36500 的整数，实际 {lag!r}")
         raw_webhook = freshness.get("webhook")
         if raw_webhook is not None:
             http_warned = False

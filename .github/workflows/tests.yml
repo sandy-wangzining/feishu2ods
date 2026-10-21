@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: 安装依赖
+      - name: 安装依赖（含开发依赖）
         run: |
           python -m pip install -U pip
           python -m pip install -e ".[dev]"
@@ -33,7 +33,7 @@ jobs:
       - name: 格式检查（ruff format）
         run: ruff format --check .
 
-      - name: 单元测试（离线，不依赖网络/数据库）
+      - name: 单元测试（离线，不访问网络/数仓）
         run: python -m unittest discover -s tests -v
 
       - name: wheel 独立安装检查

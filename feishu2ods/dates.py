@@ -12,9 +12,11 @@ from .utils import CN_TZ, log
 
 # 业务日参数白名单：只认紧凑与 ISO 两种写法（与 api2ods 同口径，不用 fromisoformat 防版本差异）
 _DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z", re.ASCII)  # 只认 ASCII 数字：全角数字不该被当成业务日
-_DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
-DATE_RE = re.compile(r"\A(\d{4})-(\d{1,2})-(\d{1,2})")  # 允许未补零（2026-9-7）：与 SLASH 同口径
-SLASH_DATE_RE = re.compile(r"\A(\d{4})/(\d{1,2})/(\d{1,2})")
+_DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
+# 允许未补零（2026-9-7）：与 SLASH 同口径。右边界必须锚住：2026-09-270 / 2026-09-27abc
+# 这类脏值不能被当成 2026-09-27（否则新鲜度校验会误判已包含预期日期）。
+DATE_RE = re.compile(r"\A(\d{4})-(\d{1,2})-(\d{1,2})(?=\Z|T|\s)", re.ASCII)
+SLASH_DATE_RE = re.compile(r"\A(\d{4})/(\d{1,2})/(\d{1,2})(?=\Z|T|\s)", re.ASCII)
 # epoch 换算的合理区间：超出的一律按"认不出"处理（0 → 1970、14 位 yyyyMMddHHmmss 当毫秒
 # → 26xx 年，这类假日期不该先进 date_values 再去污染新鲜度判断）
 _EPOCH_MIN = date(2000, 1, 1)
@@ -77,12 +79,13 @@ def env_bizdate(strict: bool = True) -> date | None:
 
 
 def resolve_bizdate(args, strict: bool = True) -> date:
-    """业务日：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > 美东昨天。
+    """业务日：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > 业务日时区的昨天。
 
+    时区取环境变量 ODS_BIZDATE_TZ，未设置时用 America/New_York。
     pt（写入分区）与新鲜度校验都以这个业务日为准：调度传什么 bizdate，就校验数据里有没有这一天。
 
     strict=False 只给只读体检（--check）用：环境变量里的 bizdate 格式不对时按"未设置"处理、
-    退回美东昨天，而不是直接报错退出（正式同步路径仍为 strict=True）。
+    退回业务日时区的昨天，而不是直接报错退出（正式同步路径仍为 strict=True）。
     """
     if args.bizdate is not None:
         # 显式传参（含空串）都必须走格式校验：调度脚本 `--bizdate "$pt"` 且 $pt 未定义时
@@ -126,6 +129,8 @@ def normalize_date_value(value) -> str | None:
                 text = str(int(value))
                 return _in_reasonable_range(date(int(text[:4]), int(text[4:6]), int(text[6:8])))
             seconds = value / 1000 if abs(value) >= 1e11 else value
+            # ISO 串按字符串里写的日期取前 10 位（不换算偏移）；epoch 无时区信息，按 +08:00 解释。
+            # 缺省业务日时区不参与这里的换算。
             return _in_reasonable_range(datetime.fromtimestamp(seconds, CN_TZ).date())
         except (OverflowError, OSError, ValueError):
             return None
@@ -165,13 +170,13 @@ def freshness_problem(records, date_field: str, expected: str) -> tuple[str, str
     elif not isinstance(records, (list, tuple, set, frozenset)):
         records = list(records)
     # 按元素类型统一收集（只看首元素会在混合输入下选错分支：TypeError 或把一类元素
-    # 整体丢一边）。dict 取 date_field、str 直接按日期值归一化，None/其它类型跳过——
-    # 两种来源合并成一个 seen，不二选一
+    # 整体丢一边）。dict 取 date_field、其它非空值直接按日期值归一化（str/date/datetime/
+    # epoch 都认），None 跳过——两种来源合并成一个 seen，不二选一
     seen = set()
     for record in records:
         if isinstance(record, dict):
             seen.add(normalize_date_value(record.get(date_field)))
-        elif isinstance(record, str):
+        elif record is not None:
             seen.add(normalize_date_value(record))
     seen.discard(None)
     # expected 与 seen 两侧同口径归一化：调用方可能传 date 对象或紧凑串（库调用方），

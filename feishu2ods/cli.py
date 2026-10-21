@@ -70,8 +70,10 @@ def _arg_identifier(label: str):
     """
 
     def convert(value: str) -> str:
+        if value == "":
+            return value  # argparse 默认空串 = 未提供
         if not value.strip():
-            return value
+            raise argparse.ArgumentTypeError(f"{label} 不能是空白字符串")
         try:
             return _require_identifier(value, label)
         except SystemExit as exc:
@@ -96,7 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
         # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退成"昨天"
-        help="业务日 pt（YYYYMMDD 或 YYYY-MM-DD）；默认取环境变量 bizdate/SKYNET_BIZDATE，再默认当天-1",
+        help="业务日 pt（YYYYMMDD/YYYY-MM-DD）；优先级：--bizdate > 环境变量 bizdate/SKYNET_BIZDATE > ODS_BIZDATE_TZ 时区的昨天（默认美东）",
     )
     parser.add_argument("--dry-run", action="store_true", help="只拉数并打印统计，不写 MaxCompute")
     parser.add_argument(
@@ -218,31 +220,18 @@ def run_sync(
         fetch_records(feishu, job["fields"], extra_out=new_fields, sink=spool, stats=stats)
         count = stats.count
         log(f"拉取完成：{count:,} 条记录，映射 {len(job['fields'])} 个字段")
-        if new_fields:
-            uniq = sorted(set(new_fields))
+        uniq_new_fields = sorted(set(new_fields))
+        if uniq_new_fields:
             # 日志无条件打：--no-notify 只关飞书提醒，不关日志——新增列完全不可见会让
-            # 用户以为"没出问题"（与 api2ods 的字段漂移提醒口径一致：先 log 再 notify）
+            # 用户以为"没出问题"（与 api2ods 的字段漂移提醒口径一致：先 log 再 notify）。
+            # 飞书卡片要等写库成功后再发：dry-run / 写失败时不能声称"已同步"。
             log(
-                f"⚠️ Base 出现 {len(uniq)} 个未映射的新增列：{'、'.join(f'`{safe_label(name)}`' for name in uniq)}（本次忽略其值、其余字段照常同步）"
+                f"⚠️ Base 出现 {len(uniq_new_fields)} 个未映射的新增列："
+                f"{'、'.join(f'`{safe_label(name)}`' for name in uniq_new_fields)}（本次忽略其值、其余字段照常处理）"
             )
-            if not args.no_notify:
-                lines = [
-                    f"**作业**：{job.get('job')}",
-                    f"**新增列**：{'、'.join(f'`{safe_label(name)}`' for name in uniq)}",
-                ]
-                if base_url:
-                    lines.append(f"**数据表**：{base_url}")
-                lines += [
-                    "本次已忽略新增列、其余字段照常同步（新增列数据暂未采集）。如需入库，请手动处理：",
-                    "① 作业 `fields` 补映射（Base 列名 → 英文键）；",
-                    "② 重跑本节点（写入幂等）。",
-                ]
-                notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
         empty_rows = stats.empty_rows
         if empty_rows:
-            log(
-                f"  警告：{empty_rows:,} 条记录除 record_id 外全为空（Base 里的空白行），已原样同步；下游按日期字段过滤"
-            )
+            log(f"  警告：{empty_rows:,} 条记录除 record_id 外全为空（Base 里的空白行），原样写入；下游按日期字段过滤")
 
         # ---- ② 空表 / 新鲜度校验（缺失 → 告警 + 非 0 退出，不写库）----
         allow_empty = target_cfg.get("allow_empty", False)
@@ -258,6 +247,7 @@ def run_sync(
                     lines.append(f"**数据表**：{base_url}")
                 notify(webhook, "飞书多维表格同步：0 条记录", lines, footer=f"目标表 {project}.{table_name}")
             return 1
+        freshness_alert = None
         if freshness and not args.skip_freshness:
             expected = (bizdate - timedelta(days=lag_days)).isoformat()
             problem = freshness_problem(stats.date_values, date_field, expected)
@@ -267,35 +257,21 @@ def run_sync(
                 # 缺的那天只是没有数据行），下游任务照常跑。真异常（表被清空=0 行）
                 # 仍由上面的 0 行保护拦截。
                 expected, latest = problem
-                log(f"⚠️ 缺少 {expected} 的数据（当前最新 {latest or '无'}），照常写入并告警")
+                action = "dry-run 不写库、不发告警" if args.dry_run else "照常写入并告警"
+                log(f"⚠️ 缺少 {expected} 的数据（当前最新 {latest or '无'}），{action}")
                 if lag_days:
                     log(f"   预期日期 = 业务日 - {lag_days} 天；如表格出数节奏不同，请调整 freshness.lag_days")
                 else:
                     log("   若表格本来就晚一天出数，可在 job 里把 freshness.lag_days 调成 1；补数可加 --skip-freshness")
-                if not args.no_notify:
-                    lines = [
-                        f"**作业**：{job.get('job')}",
-                        f"**预期已有**：{expected}（{date_field}）",
-                        f"**当前最新**：{latest or '无'}",
-                        f"**当前条数**：{count:,}",
-                        "本次已照常写入快照（缺的那天只是没有数据行），下游任务不受影响；",
-                        "请人工确认表格是否还需要更新，更新后重跑即可。",
-                    ]
-                    if base_url:
-                        lines.append(f"**数据表**：{base_url}")
-                    notify(
-                        webhook,
-                        f"飞书表格同步缺少 {expected} 数据（已照常写入）",
-                        lines,
-                        footer=f"目标表 {project}.{table_name}",
-                    )
+                # 飞书卡片要等写库成功后再发：dry-run / 写失败时不能声称"已照常写入"
+                freshness_alert = (expected, latest)
             else:
                 dup_dates = [day for day, dup_count in stats.date_counter.items() if day and dup_count > 1]
                 if dup_dates:
                     log(
                         f"  警告：以下日期在 Base 里出现多行：{'、'.join(sorted(dup_dates)[:10])}（DWD 同一天会落多行）"
                     )
-                log(f"新鲜度校验通过：{date_field} 已包含业务日 {expected}")
+                log(f"新鲜度校验通过：{date_field} 已包含预期日期 {expected}")
 
         # ---- ③ 写库（dry-run 跳过）----
         if args.dry_run:
@@ -329,6 +305,38 @@ def run_sync(
         if actual != count:
             log(f"❌ 写后校验不一致：计划 {count:,} 行，实际 {actual:,} 行（重跑即可，写入幂等）")
             return 1
+        # 写库并核对成功后才发卡片：dry-run / 写失败时不能声称"已同步/已写入"
+        if uniq_new_fields and not args.no_notify:
+            lines = [
+                f"**作业**：{job.get('job')}",
+                f"**新增列**：{'、'.join(f'`{safe_label(name)}`' for name in uniq_new_fields)}",
+            ]
+            if base_url:
+                lines.append(f"**数据表**：{base_url}")
+            lines += [
+                "本次已忽略新增列、其余字段已同步（新增列数据暂未采集）。如需入库，请手动处理：",
+                "① 作业 `fields` 补映射（Base 列名 → 英文键）；",
+                "② 重跑本节点（写入幂等）。",
+            ]
+            notify(webhook, "飞书多维表格出现新增列", lines, footer=f"目标表 {project}.{table_name}")
+        if freshness_alert is not None and not args.no_notify:
+            expected, latest = freshness_alert
+            lines = [
+                f"**作业**：{job.get('job')}",
+                f"**预期已有**：{expected}（{date_field}）",
+                f"**当前最新**：{latest or '无'}",
+                f"**当前条数**：{count:,}",
+                "本次已照常写入快照（缺的那天只是没有数据行），下游任务不受影响；",
+                "请人工确认表格是否还需要更新，更新后重跑即可。",
+            ]
+            if base_url:
+                lines.append(f"**数据表**：{base_url}")
+            notify(
+                webhook,
+                f"飞书表格同步缺少 {expected} 数据（已照常写入）",
+                lines,
+                footer=f"目标表 {project}.{table_name}",
+            )
         keep_spool = False
         log(f"完成：{project}.{table_name} pt={pt} 共 {actual:,} 行，耗时 {(time.time() - started) / 60:.1f} 分钟")
         return 0

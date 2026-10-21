@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 
+from .auth import ApiHttpError
 from .config import (
     DEFAULT_COLUMN,
     DEFAULT_FRESHNESS_LAG_DAYS,
@@ -20,7 +21,7 @@ from .config import (
 )
 from .fetch import fetch_field_sample
 from .mc import DEFAULT_ENDPOINT
-from .utils import collect_secret_values, redact_secrets
+from .utils import collect_secret_values, redact_secrets, safe_label
 
 
 # =============================================================================
@@ -49,10 +50,17 @@ def _default_ask_secret(prompt: str = "") -> str:
     """密钥输入：不回显；环境不支持隐藏输入时退回普通 input（照常可用）。"""
     try:
         return getpass.getpass(prompt)
+    except EOFError:
+        # Ctrl+D / stdin 已关闭：与 cli 的 _wizard_ask 同口径按用户中断处理（退出码 130）；
+        # 吞掉后回退 input() 会在已到 EOF 的 stdin 上再抛一次，被当成"未预期错误"
+        raise KeyboardInterrupt from None
     except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
         # 退回 input() 时输入会明文回显，而提示语里写着"输入不回显"——必须显式纠正预期
         print("（警告：当前环境无法隐藏输入，接下来输入的密钥会明文回显）", file=sys.stderr)
-        return input(prompt)
+        try:
+            return input(prompt)
+        except EOFError:
+            raise KeyboardInterrupt from None
 
 
 def run_init(
@@ -87,7 +95,7 @@ def run_init(
     if safe_name != job_name:
         echo(f"   提示：特殊字符已替换为下划线，文件名用 {safe_name}")
     job_name = safe_name
-    out = pathlib.Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
+    out = pathlib.Path(out_path).expanduser() if out_path else root / "jobs" / f"{job_name}.json"
     if out.exists():
         # 防手滑覆盖生产作业（里面有密钥）：默认不覆盖，想覆盖要显式答 y
         answer = _ask(ask, f"⚠️ {out} 已存在，覆盖吗？（y/n）", "n").lower()
@@ -156,6 +164,12 @@ def run_init(
         echo(f"❌ 拉取失败：{exc}")
         echo("   请确认：应用已加为协作者、app_id/app_secret 正确、table_id 正确；然后重新运行 --init")
         return 1
+    except ApiHttpError as exc:
+        # 4xx（应用没加协作者、表 id 写错等）要走向导的友好提示，不能落到 main 的
+        # "未预期错误 + traceback"；body 里可能有网关回显，过 safe_label/脱敏
+        echo(f"❌ 拉取失败：HTTP {exc.status}：{safe_label(exc.body, 300)}")
+        echo("   请确认：应用已加为协作者、app_id/app_secret 正确、table_id 正确；然后重新运行 --init")
+        return 1
     except (OSError, RuntimeError) as exc:
         # 只接预期的连接/接口类错误（与 sftp2ods 向导同口径）：TypeError/AttributeError
         # 这类代码缺陷继续上抛，不能被"给一条人话"掩盖成"拉取失败"
@@ -165,7 +179,11 @@ def run_init(
     if not fields:
         echo("❌ 表格没有列（或接口没返回字段列表），请检查后重试。")
         return 1
-    echo(f"   共 {len(fields)} 列：" + "、".join(fields[:10]) + ("……" if len(fields) > 10 else ""))
+    echo(
+        f"   共 {len(fields)} 列："
+        + "、".join(safe_label(name) for name in fields[:10])
+        + ("……" if len(fields) > 10 else "")
+    )
 
     # ⑤ 列名 → 英文键
     echo("")
@@ -174,10 +192,11 @@ def run_init(
     used: set[str] = set()
     for field in fields:
         sample = samples.get(field, "")
+        # 列名与样例都来自外部 Base：换行/ESC 会伪造日志行，样例还会把表格内容写进 --log-file
         if sample:
-            echo(f"   「{field}」样例：{sample}")
+            echo(f"   「{safe_label(field)}」样例：{safe_label(sample)}")
         for _ in range(3):
-            key = _ask(ask, f"   「{field}」的英文键（回车跳过）")
+            key = _ask(ask, f"   「{safe_label(field)}」的英文键（回车跳过）")
             if not key:
                 break
             if not IDENT_RE.match(key):
@@ -296,7 +315,7 @@ def run_init(
         echo(f"❌ 生成的配置没过校验（{exc}）；请重新运行 --init")
         return 1
 
-    out = pathlib.Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
+    out = pathlib.Path(out_path).expanduser() if out_path else root / "jobs" / f"{job_name}.json"
     tmp_name = None
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +331,10 @@ def run_init(
         tmp_name = None
         if os.name != "nt":
             try:
-                os.chmod(out, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
+                # 跳过软链：chmod 会跟随链接改到共享目录里另一用户指向的真实文件
+                # （replace 后到 chmod 之间的极小窗口）
+                if not out.is_symlink():
+                    os.chmod(out, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
             except OSError:
                 # 文件已经写好：最后一步收紧失败（不支持 chmod 的文件系统）只跳过，
                 # 不能把"已生成成功"误报成"写文件失败"

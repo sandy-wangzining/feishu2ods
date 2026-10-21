@@ -3,6 +3,9 @@ include LICENSE
 include requirements.txt
 include CHANGELOG.md
 
+# 源码直接跑的兼容入口（wheel 里由 console script 代替）
+include feishu2ods.py
+
 # 只打包 .example.json 模板；真实作业配置（jobs/*.json）含密钥，绝不进包
 recursive-include jobs *.example.json
 
