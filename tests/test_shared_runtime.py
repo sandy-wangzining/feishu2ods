@@ -22,6 +22,42 @@ mc = importlib.import_module(f"{PACKAGE}.mc")
 
 
 class TestSharedRuntime(unittest.TestCase):
+    def test_target_lock_is_shared_across_installations(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(common.os.environ, {"ODS_TARGET_LOCK_DIR": tmp}):
+            spec = importlib.util.spec_from_file_location("another_install", common.__file__)
+            other = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(other)
+            first = common.target_lock_path("Project", "ODS_DATA")
+            second = other.target_lock_path("project", "ods_data")
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, common.target_lock_path("project", "other_table"))
+            with utils.RunLock(first):
+                with self.assertRaises(SystemExit):
+                    with utils.RunLock(second):
+                        self.fail("同一张表取得了两把锁")
+            with utils.RunLock(second):
+                pass
+
+    def test_cli_blocks_different_job_file_for_busy_target(self):
+        import _helpers
+
+        cli = importlib.import_module(f"{PACKAGE}.cli")
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        job = _helpers.make_job() if PACKAGE == "feishu2ods" else _helpers.minimal_job()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {"ODS_TARGET_LOCK_DIR": str(root / "targets"), f"{PACKAGE.upper()}_LOCK_DIR": str(root / "jobs")}
+            path = root / "another-job.json"
+            path.write_text(json.dumps(job), encoding="utf-8")
+            with mock.patch.dict(common.os.environ, env), mock.patch.object(cli, "run_sync", return_value=0) as run:
+                target = common.target_lock_path(job["target"]["project"], job["target"]["table"])
+                with utils.RunLock(target):
+                    self.assertEqual(cli.main(["--job", str(path), "--bizdate", "20261026"]), 1)
+                    run.assert_not_called()
+                self.assertEqual(cli.main(["--job", str(path), "--bizdate", "20261026"]), 0)
+                run.assert_called_once()
+
     @unittest.skipUnless(hasattr(common.os, "getuid"), "POSIX 目录权限检查")
     def test_private_lock_dir_rejects_shared_writable_directory(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(common.tempfile, "gettempdir", return_value=tmp):

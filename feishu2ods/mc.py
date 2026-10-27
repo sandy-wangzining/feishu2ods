@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MaxCompute：建表 / 结构校验 / 写分区（临时分区 + 校验后替换）/ 写后核对。"""
+"""MaxCompute：建表 / 结构校验 / 独立暂存与原子发布/ 写后核对。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import time
+import uuid
 
 from . import _common
 from .config import IDENT_RE
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - 离线测试环境可以不带 pyodps
     ODPS = None
 
 PARTITION_COLUMN = "pt"  # 分区字段：业务日 yyyyMMdd（该分区 = 当天抽取的全量快照）
-WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（重试会清掉临时分区重写）
+WRITE_ATTEMPTS = 3  # 写分区的最大尝试次数（发布重试复用已核对暂存数据）
 WRITE_RETRY_DELAY = 10  # 写入重试间隔秒数
 
 
@@ -38,7 +39,7 @@ TMP_PARTITION_SUFFIX = f"__tmp_{TMP_RUN_ID}"  # 写库用临时分区后缀（�
 # 后续运行的残留清理（purge）会显式跳过它，唯一完整副本不会被下一次运行清掉
 KEEP_PARTITION_SUFFIX = "__keep"
 MAX_ROW_BYTES = 7_000_000  # 单行 JSON 上限（MaxCompute string 8MB，留余量）
-SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表 / 校验 / 分区增删 / rename）最长等待秒数，0 = 不限制
+SQL_TIMEOUT_SECONDS = 600  # 单条 SQL（建表 / 校验 / 暂存 / 发布 / 清理）最长等待秒数，0 = 不限制
 SQL_HEARTBEAT_SECONDS = 30  # 长 SQL 的"还在执行"心跳日志间隔
 # https：作业没写 endpoint 时 AK/SK 签名与查询结果不能走明文 HTTP
 DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
@@ -85,7 +86,7 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
 
 
 # =============================================================================
-# MaxCompute：建表 / 结构校验 / 写分区（临时分区 + 校验后替换）/ 写后校验
+# MaxCompute：建表 / 结构校验 / 独立暂存与原子发布/ 写后校验
 # =============================================================================
 def build_ddl(project: str, table: str, column: str, comment: str) -> str:
     """目标表 DDL：单列 string + pt 分区 + 表注释（标识符入口再校验，不依赖调用方）。"""
@@ -94,7 +95,7 @@ def build_ddl(project: str, table: str, column: str, comment: str) -> str:
     column = _require_identifier(column, "target.column")
     # comment 来自作业配置（用户可任意编辑）：反斜杠是 MaxCompute 字符串字面量里的转义符，
     # 只替换单引号不够——结尾的 "\" 会吃掉收尾引号、把后续内容当 SQL 解析。先转义反斜杠
-    table_comment = comment or "飞书多维表格记录 JSON 原样落库（写临时分区后校验后替换 pt=<业务日>）"
+    table_comment = comment or "飞书多维表格记录 JSON 原样落库（独立暂存表校验后原子发布 pt=<业务日>）"
     table_comment = table_comment.replace("\\", "\\\\").replace("'", "''")
     return (
         f"create table if not exists {project}.{table} (\n"
@@ -201,25 +202,6 @@ def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQ
     )
 
 
-def rename_partition(
-    o, project: str, table_name: str, old_spec: str, new_spec: str, timeout: int = SQL_TIMEOUT_SECONDS
-) -> None:
-    """把临时分区改名为正式分区（MaxCompute DDL 元数据操作；目标分区必须不存在）。
-
-    「删旧分区 + rename」之间只有两条 DDL 的空窗，远比「先删再填」整段写入短；
-    写入期间旧快照一直可读，下游不会读到空/半截分区。
-    """
-    project = _require_identifier(project, "target.project")
-    table_name = _require_identifier(table_name, "target.table")
-    run_sql_with_timeout(
-        o,
-        f"alter table {project}.{table_name} "
-        f"partition ({_sql_spec(old_spec)}) rename to partition ({_sql_spec(new_spec)})",
-        timeout=timeout,
-        desc=f"替换分区 {table_name}",
-    )
-
-
 def write_partition(
     o,
     table,
@@ -231,18 +213,15 @@ def write_partition(
     stats: FetchStats | None = None,
     timeout: int = SQL_TIMEOUT_SECONDS,
 ) -> None:
-    """写一个分区：先写 <pt>__tmp 临时分区并核对内容，再删旧分区 + rename 校验后替换。
+    """独立暂存表 → 内容核对 → 单条 INSERT OVERWRITE 原子发布一个分区。
 
-    - 可见窗口只剩两条 DDL 之间：写入期间旧快照完整可读；
-    - 数据从 spool（流式落盘的临时 JSONL）逐批读回，不要求全量记录驻留内存；
-    - 写前先通读检查单行大小（不保存）：超长记录永远写不进去，必须在动分区之前报错；
-    - 写后核对：行数 + record_id 去重数 + 最小/最大 id（与拉取阶段的 stats 对比，
-      不一致就不替换，重试同上）；
-    - 重试会从「清临时分区」重新开始；失败后尽力清掉临时分区，残留（如进程被强杀）下次运行也会先清；
-    - 空快照（target.allow_empty=true）走同样的替换流程（清空正式分区）；否则上游已拦下空表。
-    - 兼容旧调用方：第 7 参传记录列表、stats 不给时，就地装进临时 spool + stats。
+    兼容记录列表旧签名；重试复用已核对的暂存数据。失败保留暂存表一天，
+    成功尽力清理；正式表中仅新增/覆盖业务日分区，不暴露临时分区。
     """
-    pt = _require_pt(pt)  # 最终分区名直接由它派生（pt / pt__tmp），先过形态白名单
+    project = _require_identifier(project, "target.project")
+    table_name = _require_identifier(table_name, "target.table")
+    column = _require_identifier(column, "target.column")
+    pt = _require_pt(pt)
     _temp_spool = None
     if stats is None:
         if not isinstance(spool, (list, tuple)):
@@ -275,153 +254,70 @@ def write_partition(
                     f"检查 Base 里是否有超大单元格（如附件/长文本）"
                 )
 
-        final_deleted = False
-
-        def once() -> None:
-            nonlocal final_deleted, tmp_complete, final_gone
-            if final_deleted and tmp_complete:
-                # 上一轮已完成"写入 + 核对"，只差校验后替换（drop 正式分区 → rename 顶上）。
-                # 绝不能按常规路径清掉 tmp 重建（重建中途再失败 = 唯一完整副本丢失）。
-                # final_deleted 是在 drop **之前**置位的（删除请求可能已到服务端才报错），
-                # 正式分区未必真的让位；rename 又要求"目标分区必须不存在"。按分区现状三态收尾：
-                #  · tmp 确证还在 → 补一次 drop（IF EXISTS 幂等）再补 rename；
-                #  · tmp 确证不在 + 正式分区确证就位 → 上一轮 rename 实际已在服务端成功，按完成处理；
-                #  · 其它（探测失败/两者都不在）→ 状态不可信：绝不在这里 drop 正式分区
-                #    （万一 rename 已生效，删掉的就是刚写入的新数据），也绝不假报成功，
-                #    落回常规路径用 spool 重建后收尾。
-                tmp_state = _partition_exists(table, tmp_spec)
-                if tmp_state is None:
-                    raise RuntimeError("临时分区状态未知，保留已核对的完整副本，等待重试确认")
-                if tmp_state is True:
-                    drop_partition(o, project, table_name, final_spec, timeout=timeout)
-                    final_gone = True
-                    rename_partition(o, project, table_name, tmp_spec, final_spec, timeout=timeout)
-                    _drop_stale_keep(o, table, project, table_name, pt, timeout)
-                    return
-                if tmp_state is False and _partition_exists(table, final_spec) is True:
-                    log("  提示：临时分区已不在、正式分区已就位（上一轮 rename 已在服务端生效），本轮按完成处理")
-                    _drop_stale_keep(o, table, project, table_name, pt, timeout)
-                    return
-                log("  警告：无法确认上一轮校验后替换是否完成（状态未知），按常规路径重建后收尾，不假报成功")
-            # 每趟重试开头 tmp 都会被清掉重建：先撤销"完整"标记，只有本轮 verify 通过后
-            # 才会重新置位（否则重试删掉 tmp 之后，finally 还会谎称"已保留"）
-            tmp_complete = False
-            # 分区增删都走 run_sql_with_timeout（DDL）：pyodps 的 table.delete_partition /
-            # create_partition 是同步不限时的，云端卡住会把整轮任务连同运行锁一起挂死
-            drop_partition(o, project, table_name, tmp_spec, timeout=timeout)  # 清掉上次失败留下的临时分区
-            add_partition(o, project, table_name, tmp_spec, timeout=timeout)
-            with table.open_writer(partition=tmp_spec, reopen=True) as writer:
-                for batch in spool.iter_batches(BATCH_SIZE):
-                    writer.write([[row] for row in batch])
-            actual, distinct, smallest, largest = verify_partition(
-                o, project, table_name, column, f"{pt}{TMP_PARTITION_SUFFIX}", timeout=timeout
-            )
-            if actual != stats.count:
-                raise RuntimeError(f"临时分区行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
-            if stats.count:
-                # 空快照没有 id 可核：只校验行数，去重/范围检查跳过
-                if distinct != stats.distinct_ids():
-                    raise RuntimeError(f"临时分区 record_id 重复：{actual:,} 行里去重后只剩 {distinct:,} 个")
-                if (smallest, largest) != (stats.min_id, stats.max_id):
-                    raise RuntimeError(
-                        f"临时分区 record_id 范围不一致：实际 [{smallest}, {largest}]，"
-                        f"预期 [{stats.min_id}, {stats.max_id}]"
-                    )
-            # 校验后替换：旧分区先让位，临时分区立刻改名顶上（中间空窗只有一条 DDL 的执行时间）。
-            # final_deleted 置位放在删之前（删除请求可能已发到服务端才报错，措辞保守）；
-            # final_gone 只在 drop 返回成功后置位——报错文案与重试收尾按它区分"确认让位/未知"
-            final_deleted = True
-            tmp_complete = True  # 此刻 tmp 已核对完整：此后失败时它值得保留（可手工恢复）
-            drop_partition(o, project, table_name, final_spec, timeout=timeout)
-            final_gone = True
-            rename_partition(o, project, table_name, tmp_spec, final_spec, timeout=timeout)
-            # 正式分区已就位：清掉同 pt 的 __keep（上一轮失败留下的旧快照）。
-            # 它的字符串序大于正式分区，max_pt() 会选中它；不清理会让下游一直读旧数据。
-            _drop_stale_keep(o, table, project, table_name, pt, timeout)
-
-        last: Exception | None = None
-        success = False
-        tmp_cleaned = True
-        final_deleted = False  # 是否尝试过删正式分区（在 drop 前置位，措辞保守用）
-        final_gone = False  # 正式分区是否"确认已让位"（drop 返回成功后才置位）
-        tmp_complete = False  # 本轮 tmp 是否处于"完整且已核对"状态（保留判定用）
+        # 独立暂存表不参与正式表的 MAX_PT / 全分区扫描；生命周期兜底回收强杀残留。
+        stage_name = f"tmp_feishu2ods_{uuid.uuid4().hex}"
+        run_sql_with_timeout(
+            o,
+            build_ddl(project, stage_name, column, "feishu2ods 暂存数据，校验后发布") + "\nlifecycle 1",
+            timeout=timeout,
+            desc=f"建暂存表 {stage_name}",
+        )
+        stage = o.get_table(f"{project}.{stage_name}")
+        verify_schema(stage, stage_name, column)
+        verified = False
+        published = False
         try:
             for attempt in range(1, WRITE_ATTEMPTS + 1):
                 try:
-                    once()
-                    success = True
-                    return
-                except Exception as exc:  # noqa: BLE001 - 统一重试并给出「重跑可修复」的结论
-                    last = exc
-                    if attempt < WRITE_ATTEMPTS:
-                        log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
-                        time.sleep(WRITE_RETRY_DELAY)
-        finally:
-            # 失败（含 verify 抛 SystemExit / KeyboardInterrupt）都尽力收尾临时分区：
-            # 只捕 Exception 会把 SystemExit 漏掉，tmp 分区留在表里、下游 max_pt() 可能读到半成品。
-            # 例外：本轮 tmp 是**已核对完整**的（tmp_complete）且正式分区已被删过——保留它，
-            # 继续删才是真的把这一分区弄丢；留着可手工 rename 恢复。
-            if not success:
-                if tmp_complete and final_deleted:
-                    # 先把保留副本改名成带 __keep 标记的分区：purge 与 max_pt 的语义都建立在
-                    # 「__tmp* 是半成品」之上——不改名的话它只是"这一轮碰巧没删的 __tmp"，
-                    # 下一次任何作业运行都会把它当残留清掉（唯一完整副本随之消失）。
-                    # __keep 排在正式分区之后（max_pt 读到的是已核对的完整数据，正好用于恢复），
-                    # purge 显式跳过并以日志提示它存在。
-                    keep_spec = f"{PARTITION_COLUMN}={pt}{KEEP_PARTITION_SUFFIX}"
-                    try:
-                        rename_partition(o, project, table_name, tmp_spec, keep_spec, timeout=timeout)
-                        log(
-                            f"  提示：分区 {keep_spec}（内容已核对）予以保留；"
-                            f"可手工执行 rename 到 {final_spec} 恢复该分区，或重跑本作业"
-                            f"（__keep 分区不会被后续运行的残留清理误删）"
+                    if not verified:
+                        drop_partition(o, project, stage_name, tmp_spec, timeout=timeout)
+                        add_partition(o, project, stage_name, tmp_spec, timeout=timeout)
+                        with stage.open_writer(partition=tmp_spec, reopen=True) as writer:
+                            for batch in spool.iter_batches(BATCH_SIZE):
+                                writer.write([[row] for row in batch])
+                        actual, distinct, smallest, largest = verify_partition(
+                            o, project, stage_name, column, f"{pt}{TMP_PARTITION_SUFFIX}", timeout=timeout
                         )
-                        leftover = f"分区 {keep_spec} 已保留（内容已核对），"
-                    except Exception as exc:  # noqa: BLE001 - 改名失败按原样保留，仍好过删掉
-                        if _partition_exists(table, keep_spec) is True:
-                            # 上一轮已留下同 pt 的 __keep（那份完整副本继续受 purge 跳过保护）：
-                            # 本轮 tmp 只是冗余副本，稍后会被残留清理回收——数据安全性不受影响，
-                            # 但不能对外承诺"不会被误删"（那是对 __keep 说的话）
-                            log(
-                                f"  提示：保留分区 {keep_spec} 已存在（上一轮保留的完整副本），"
-                                f"本轮临时分区 {tmp_spec} 稍后会被当作残留回收；"
-                                f"需要恢复时请用 {keep_spec}"
-                            )
-                            leftover = f"分区 {keep_spec} 已保留（内容已核对），"
-                        else:
-                            # 改名失败且没有现成的 __keep：完整副本暂为 __tmp 形态，下一次任何
-                            # 运行的 purge 都会把它当残留删掉——必须说清而不是沿用"不会被误删"
-                            log(
-                                f"  警告：保留分区改名失败（{redact(exc)}）：完整副本暂为临时分区 "
-                                f"{tmp_spec}，后续任何运行都会把它当残留清理删掉；"
-                                f"请立即手工 rename 到 {final_spec} 恢复"
-                            )
-                            leftover = f"临时分区 {tmp_spec} 暂存（会被后续残留清理删除），"
-                else:
-                    try:
-                        drop_partition(o, project, table_name, tmp_spec, timeout=timeout)
-                    except Exception as exc:  # noqa: BLE001 - 清理是尽力而为
-                        tmp_cleaned = False
-                        log(f"  警告：清理临时分区 {tmp_spec} 失败：{redact(exc)}")
-                    leftover = "" if tmp_cleaned else f"临时分区 {tmp_spec} 残留，"
-        if last is not None:
-            if tmp_complete and final_deleted:
-                # tmp 完整保留；正式分区是否确认让位看 drop 有没有返回过成功
-                state = "正式分区已被删掉" if final_gone else "正式分区可能已被删掉（删除请求是否生效未知）"
-                raise SystemExit(
-                    f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；{state}，"
-                    f"{leftover}重跑本作业即可恢复）：{redact(last)}"
-                ) from last
-            if final_deleted:
-                # 重试里 tmp 已被清掉重建过：正式分区是否还在只能保守描述
-                raise SystemExit(
-                    f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区可能已被删掉，"
-                    f"{leftover}重跑本作业即可恢复）：{redact(last)}"
-                ) from last
-            raise SystemExit(
-                f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次；正式分区未动，"
-                f"{leftover}重跑本作业即可修复）：{redact(last)}"
-            ) from last
+                        if actual != stats.count:
+                            raise RuntimeError(f"暂存行数不一致：计划 {stats.count:,} 行，实际 {actual:,} 行")
+                        if stats.count and (distinct, smallest, largest) != (
+                            stats.distinct_ids(),
+                            stats.min_id,
+                            stats.max_id,
+                        ):
+                            raise RuntimeError("暂存 record_id 去重数或范围与拉取结果不一致")
+                        verified = True
+                    # 单分区 OVERWRITE 原子提交；失败重试复用同一份已核对数据，不先删正式分区。
+                    run_sql_with_timeout(
+                        o,
+                        f"insert overwrite table {project}.{table_name} partition ({_sql_spec(final_spec)}) "
+                        f"select {column} from {project}.{stage_name} "
+                        f"where {_partition_clause(f'{pt}{TMP_PARTITION_SUFFIX}')}",
+                        timeout=timeout,
+                        desc=f"发布分区 {table_name} pt={pt}",
+                    )
+                    published = True
+                    _drop_stale_keep(o, table, project, table_name, pt, timeout)
+                    return
+                except Exception as exc:
+                    if attempt == WRITE_ATTEMPTS:
+                        raise SystemExit(
+                            f"{table_name} {final_spec} 写入失败（已尝试 {WRITE_ATTEMPTS} 次）；"
+                            f"正式分区未执行删除，发布由单条 OVERWRITE 提交；"
+                            f"暂存表 {project}.{stage_name} 已保留（生命周期 1 天），重跑可幂等恢复：{redact(exc)}"
+                        ) from exc
+                    log(f"  分区 {final_spec} 写入第 {attempt} 次失败：{redact(exc)}；{WRITE_RETRY_DELAY}s 后重试")
+                    time.sleep(WRITE_RETRY_DELAY)
+        finally:
+            if published:
+                try:
+                    run_sql_with_timeout(
+                        o, f"drop table if exists {project}.{stage_name}", timeout=timeout, desc="清理暂存表"
+                    )
+                except Exception as exc:
+                    log(f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact(exc)}")
+            else:
+                log(f"  提示：暂存表 {project}.{stage_name} 已保留（生命周期 1 天）；正式表未创建临时分区")
     finally:
         if _temp_spool is not None:
             _temp_spool.close()
@@ -461,13 +357,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _partition_exists(table, spec: str) -> bool | None:
-    """分区是否还在：True/False 是确证的结论，None = 探测失败（不可信，按未知处理）。
-
-    调用方只在拿到 True/False 的具体一侧才做动作——把"探测失败"折叠成任何一侧都会
-    引入危险默认（折叠成"在"会让重试收尾先删正式分区，万一上一轮 rename 已生效，
-    删掉的就是刚写入的新数据；折叠成"不在"会假报成功）。pyodps 的 exist_partition
-    每次访问都在服务端重新查（不是缓存），返回 False 是可信的"分区不存在"。
-    """
+    """查询旧版保留分区是否存在；探测失败返回 None，调用方不得据此删除唯一副本。"""
     try:
         return bool(table.exist_partition(_sql_spec(spec)))
     except Exception:  # noqa: BLE001 - 探测不了就交给调用方按未知处理
@@ -511,18 +401,7 @@ def _tmp_writer_alive(value: str) -> bool:
 
 
 def purge_stale_tmp_partitions(o, table, project: str, table_name: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
-    """清掉历史失败残留的临时分区（正式写入之前调用）。
-
-    残留的 tmp 分区值（如 20260927__tmp_iZxxx_123，旧版则是 20260927__tmp）在字符串序上
-    大于同日期正式分区，会让下游用 max_pt() 时读到半成品；每次正式运行前统一清一遍。
-    含其它机器的历史残留：运行锁只保证单机互斥、正式调度固定跑一台机器（见 README），
-    跨机并发不受支持。但同机另一个 job（两份配置指向同一张表）可以在写：它的 tmp 分区
-    名字里带着本机还活着的 pid，清掉会把在途写入连同"正式分区已删"的窗口一起打死
-    （见 _tmp_writer_alive），这类显式跳过；pid 已死的同机残留照旧清理。
-    __keep 保留分区在"正式分区已恢复"后就地清理（见下）；正式分区还没回来的照旧跳过并提示。
-    本进程自己的后缀在此时不可能存在（它在写库阶段才创建），显式排除以防万一。
-    删除同样走带超时的 DDL（pyodps 的 table.delete_partition 不限时，卡住会挂死整个任务）。
-    """
+    """升级时处理旧版本遗留分区；只清理已有正式副本的残留，保留可能的唯一副本。"""
     # pyodps 的 table.partitions 每次访问都发一次全量分区元数据请求：先取一份列表复用
     partitions = list(table.partitions)
     present = {str(part.name).split("=", 1)[-1].strip().strip("'\"") for part in partitions}
@@ -544,10 +423,15 @@ def purge_stale_tmp_partitions(o, table, project: str, table_name: str, timeout:
         # 「是不是本进程的」用后缀结尾判断（endswith），不用子串包含：
         # pid 前缀相同时（本机 456 与 4567），子串判断会把别人的分区误认成自己的而跳过，
         # 残留永远清不掉。endswith 只放行与本进程后缀完全一致的分区。
-        if "__tmp" in value and not value.endswith(TMP_PARTITION_SUFFIX):
+        if "__tmp" in value:
             if _tmp_writer_alive(value):
                 log(f"  跳过在途临时分区（本机另一进程正在写，清掉会毁掉它的校验后替换）：{spec}")
                 continue
+            if value.split("__tmp", 1)[0] not in present:
+                raise SystemExit(
+                    f"发现旧版本临时分区 {table_name} {spec}，对应正式分区不存在；"
+                    "为保留可能的唯一副本，未删除。请先核对内容并手工恢复或删除，再重跑"
+                )
             log(f"  清理残留临时分区：{table_name} {spec}")
             drop_partition(o, project, table_name, spec, timeout=timeout)
 

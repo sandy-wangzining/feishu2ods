@@ -6,8 +6,10 @@ from __future__ import annotations
 import os
 import re
 from datetime import date, datetime
+from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ._common import default_bizdate
+from ._common import DEFAULT_BIZDATE_TZ, default_bizdate
 from .utils import CN_TZ, log
 
 # 业务日参数白名单：只认紧凑与 ISO 两种写法（与 api2ods 同口径，不用 fromisoformat 防版本差异）
@@ -111,7 +113,20 @@ def _in_reasonable_range(moment: date) -> str | None:
     return moment.isoformat()
 
 
-def normalize_date_value(value) -> str | None:
+def freshness_zone(freshness: dict) -> ZoneInfo:
+    """新鲜度按作业时区判日；未配置时沿用业务日时区。"""
+    if "timezone" in freshness and (not isinstance(freshness["timezone"], str) or not freshness["timezone"].strip()):
+        raise SystemExit("freshness.timezone 必须是非空的 IANA 时区名，如 Asia/Shanghai")
+    name = freshness.get("timezone") or os.environ.get("ODS_BIZDATE_TZ", "").strip() or DEFAULT_BIZDATE_TZ
+    if not isinstance(name, str) or not name.strip():
+        raise SystemExit("freshness.timezone 必须是非空的 IANA 时区名，如 Asia/Shanghai")
+    try:
+        return ZoneInfo(name.strip())
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+        raise SystemExit(f"freshness.timezone 时区不可用：{name!r}；请检查名称并安装 tzdata") from exc
+
+
+def normalize_date_value(value, tz=CN_TZ) -> str | None:
     """日期值 → yyyy-MM-dd；认不出返回 None。
 
     支持：ISO 串（'2026-09-27T00:00:00.000+08:00' 取前 10 位）、'yyyy/MM/dd'、紧凑串
@@ -120,7 +135,7 @@ def normalize_date_value(value) -> str | None:
     """
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float, Decimal)):
         try:
             # 秒级时间戳不能除以 1000——那会静默解析成 1970 年（而不是认不出）。阈值 1e11：
             # 毫秒要到 1973 年、秒要到 5138 年才越过，两段时间戳区间互不重叠
@@ -131,10 +146,19 @@ def normalize_date_value(value) -> str | None:
             seconds = value / 1000 if abs(value) >= 1e11 else value
             # ISO 串按字符串里写的日期取前 10 位（不换算偏移）；epoch 无时区信息，按 +08:00 解释。
             # 缺省业务日时区不参与这里的换算。
-            return _in_reasonable_range(datetime.fromtimestamp(seconds, CN_TZ).date())
-        except (OverflowError, OSError, ValueError):
+            return _in_reasonable_range(datetime.fromtimestamp(float(seconds), tz).date())
+        except (ArithmeticError, OSError, ValueError):
             return None
     text = str(value or "").strip()
+    # 带时区的 ISO 与 epoch 必须按同一时区取日；纯日期和无时区的文本保持源侧日期。
+    if "T" in text or " " in text:
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            if moment.tzinfo is not None:
+                return _in_reasonable_range(moment.astimezone(tz).date())
     if re.fullmatch(r"\d{8}", text, re.ASCII):
         # 文本形态的 yyyymmdd（源表把业务日期存成文本列很常见）：与数字分支同口径，
         # 不能被 DATE_RE/SLASH 的"带分隔符"要求漏掉而返回 None（那会让新鲜度校验天天误报缺数据）

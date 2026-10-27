@@ -7,11 +7,13 @@ import json
 import pathlib
 import re
 
+from .dates import freshness_zone
+
 JOB_KEYS = {"job", "description", "feishu", "maxcompute", "fields", "target", "freshness"}
 FEISHU_KEYS = {"app_id", "app_secret", "base_token", "table_id", "base_url"}
 MC_KEYS = {"project", "endpoint", "access_key_id", "access_key_secret"}
 TARGET_KEYS = {"project", "table", "column", "comment", "allow_empty"}
-FRESHNESS_KEYS = {"date_field", "lag_days", "webhook"}
+FRESHNESS_KEYS = {"date_field", "lag_days", "webhook", "timezone"}
 DEFAULT_COLUMN = "json"
 DEFAULT_FRESHNESS_LAG_DAYS = 0  # 预期日期 = bizdate - N 天（0 = 必须有 bizdate 当天数据）
 IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -175,6 +177,7 @@ def validate_job(job: dict) -> list[str]:
         if not isinstance(freshness, dict):
             raise SystemExit("freshness 必须是对象（date_field / lag_days / webhook）")
         _warn_unknown_keys(freshness, FRESHNESS_KEYS, "freshness", warnings)
+        freshness_zone(freshness)
         date_field = _require_text(freshness.get("date_field"), "freshness.date_field")
         freshness["date_field"] = date_field
         if date_field not in seen:

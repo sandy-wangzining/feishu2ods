@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "feishu2ods"
 version = "1.5.0"
-description = "飞书多维表格（Base）→ MaxCompute ODS 同步工具（json + pt 分区，临时分区 + 校验后替换）"
+description = "飞书多维表格（Base）→ MaxCompute ODS 同步工具（json + pt 分区，独立暂存表校验后原子发布）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -26,6 +26,7 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
+  "simplejson>=4.2",
   "requests>=2.25",
   "pyodps>=0.11",
   "tzdata>=2023.3; platform_system == 'Windows'",

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -57,6 +58,25 @@ def private_lock_dir(tool: str) -> Path:
     if uid is not None and (info.st_uid != uid or info.st_mode & 0o022):
         raise PermissionError(f"运行锁目录属主或权限不安全：{path}")
     return path
+
+
+def target_lock_path(project: str, table: str, root: Path | None = None) -> Path:
+    """同一用户的三个工具、不同安装目录共用目标表锁；跨用户可显式配置共享目录。"""
+    override = os.environ.get("ODS_TARGET_LOCK_DIR", "").strip()
+    try:
+        base = (
+            Path(root)
+            if root is not None
+            else Path(override).expanduser()
+            if override
+            else private_lock_dir("ods-target")
+        )
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"目标表锁目录不可用：{exc}；请用 ODS_TARGET_LOCK_DIR 指定可写的固定目录") from exc
+    # 不含 endpoint：同一项目的公网/内网入口也必须互斥；摘要避免长表名超过文件系统限制。
+    key = f"{project.strip().lower()}.{table.strip().lower()}"
+    return base / f"target-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]}.lock"
 
 
 def safe_label(value, limit: int = 80) -> str:

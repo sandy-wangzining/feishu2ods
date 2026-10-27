@@ -145,6 +145,8 @@ class _FakeTable:
     """记录 delete/create/write 调用序列的假表。"""
 
     def __init__(self, fail_first_write=False):
+        self.table_schema = _Schema([_Col("json", "string")], [_Col("pt", "string")])
+        self.is_virtual_view = self.is_materialized_view = self.is_transactional = False
         self.calls = []
         self.rows = []
         self.partitions = []
@@ -180,7 +182,7 @@ class _FakeResponse:
         self.headers = headers if headers is not None else {}
         self.closed = False
 
-    def json(self):
+    def json(self, **kwargs):
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
@@ -235,9 +237,17 @@ class _FakeOdps:
     def __init__(self, rows):
         self._rows = rows
         self.sqls = []
+        self.stage = _FakeTable()
+
+    def get_table(self, name):
+        if ".tmp_feishu2ods_" not in name:
+            raise AssertionError(f"不应读取其它表：{name}")
+        return self.stage
 
     def run_sql(self, sql):
         self.sqls.append(sql)
+        if ".tmp_feishu2ods_" in sql and "drop if exists partition" in sql:
+            self.stage.rows.clear()
         return _FakeInstance(self._rows)
 
     def execute_sql(self, sql):

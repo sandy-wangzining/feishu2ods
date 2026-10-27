@@ -160,7 +160,7 @@ class TestRunLockMore(OfflineTestCase):
             self.assertEqual(a, b)
             self.assertEqual(a, utils_mod.table_lock_path("P", "ODS_X", root=base))  # 大小写不敏感
             self.assertNotEqual(a, c)
-            self.assertIn("ods_x", a.name)
+            self.assertLess(len(a.name), 80)
             with utils_mod.RunLock(a):
                 with self.assertRaises(SystemExit):
                     utils_mod.RunLock(a).__enter__()

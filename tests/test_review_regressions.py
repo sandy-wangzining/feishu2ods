@@ -91,7 +91,7 @@ class TestReviewHardening(OfflineTestCase):
             lambda: mc_mod.ensure_table(o, bad, "t", "json", "c"),
             lambda: mc_mod.drop_partition(o, bad, "t", "pt=20260928"),
             lambda: mc_mod.add_partition(o, "p", "t-1", "pt=20260928"),
-            lambda: mc_mod.rename_partition(o, "p", "t;x", "pt=20260928__tmp", "pt=20260928"),
+            lambda: mc_mod.write_partition(o, mock.Mock(), "p", "t;x", "json", "20260928", []),
         ):
             with self.assertRaises(SystemExit):
                 fn()
@@ -532,7 +532,7 @@ class TestReviewHardening(OfflineTestCase):
         table = _FakeTable()
         inflight = f"pt='20260927__tmp_{mc_mod._TMP_HOST}_424242'"
         stale = "pt='20260926__tmp_otherhost_1'"
-        table.partitions = [_Part(inflight), _Part(stale)]
+        table.partitions = [_Part(inflight), _Part(stale), _Part("pt='20260926'")]
         odps = _FakeOdps([])
         messages: list[str] = []
         with (
