@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -57,6 +58,47 @@ def private_lock_dir(tool: str) -> Path:
     if uid is not None and (info.st_uid != uid or info.st_mode & 0o022):
         raise PermissionError(f"运行锁目录属主或权限不安全：{path}")
     return path
+
+
+def target_lock_path(project: str, table: str, root: Path | None = None) -> Path:
+    """同一用户的三个工具、不同安装目录共用目标表锁；跨用户可显式配置共享目录。"""
+    override = os.environ.get("ODS_TARGET_LOCK_DIR", "").strip()
+    try:
+        base = (
+            Path(root)
+            if root is not None
+            else Path(override).expanduser()
+            if override
+            else private_lock_dir("ods-target")
+        )
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"目标表锁目录不可用：{exc}；请用 ODS_TARGET_LOCK_DIR 指定可写的固定目录") from exc
+    # 不含 endpoint：同一项目的公网/内网入口也必须互斥；摘要避免长表名超过文件系统限制。
+    key = f"{project.strip().lower()}.{table.strip().lower()}"
+    return base / f"target-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]}.lock"
+
+
+def open_run_lock(path: Path):
+    """打开运行锁；POSIX 的 setgid 目录显式启用组共享，其余目录保持 0600。"""
+
+    def opener(name, flags):
+        shared = bool(Path(name).parent.stat().st_mode & stat.S_ISGID)
+        mode = 0o660 if shared else 0o600
+        fd = os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise PermissionError(f"运行锁不是普通文件：{name}")
+            if shared and info.st_uid == os.geteuid():
+                # 不改全局 umask；兼容严格 umask，并由属主迁移遗留的 0600 锁。
+                os.fchmod(fd, mode)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    return open(path, "a+", encoding="utf-8", errors="replace", opener=opener if os.name == "posix" else None)
 
 
 def safe_label(value, limit: int = 80) -> str:

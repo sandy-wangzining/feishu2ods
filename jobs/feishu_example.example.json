@@ -1,6 +1,6 @@
 {
   "job": "feishu_example",
-  "description": "飞书多维表格「示例数据表」→ my_project.ods_example_json_df（json + pt 分区，临时分区 + 原子替换）",
+  "description": "飞书多维表格「示例数据表」→ my_project.ods_example_json_df（json + pt 分区，独立暂存表 + 原子发布）",
 
   "feishu": {
     "app_id": "cli_xxxxxxxxxxxxxxxx",
@@ -28,12 +28,13 @@
     "project": "my_project",
     "table": "ods_example_json_df",
     "column": "json",
-    "comment": "示例数据表（飞书多维表格同步，JSON 原样，写临时分区后原子替换 pt=业务日）",
+    "comment": "示例数据表（飞书多维表格同步，JSON 原样，独立暂存表校验后原子发布 pt=业务日）",
     "allow_empty": false
   },
 
   "freshness": {
     "date_field": "biz_date",
+    "timezone": "Asia/Shanghai",
     "lag_days": 0,
     "//webhook": "字符串或字符串数组（多个群同时告警）；缺失时跳过告警",
     "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"

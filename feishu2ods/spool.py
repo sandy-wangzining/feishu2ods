@@ -3,22 +3,24 @@
 
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import tempfile
 from collections import Counter
 
+import simplejson as json
+
 from .dates import normalize_date_value
-from .utils import log
+from .utils import CN_TZ, log
 
 BATCH_SIZE = 500  # Tunnel 每批写入行数
+MAX_BATCH_BYTES = 8_000_000
 
 
 def dump_record(record: dict) -> str:
     """一条记录 → 单行 JSON（与 api2ods 同款序列化参数：不转义中文、紧凑、拒绝 NaN）。"""
     try:
-        return json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        return json.dumps(record, use_decimal=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except ValueError as exc:
         # allow_nan=False 遇到 NaN/Infinity 抛的是裸 ValueError：给出记录上下文，
         # 让用户能定位到具体是哪条记录（接口返回了非法浮点）
@@ -80,14 +82,17 @@ class SpoolWriter:
                 if line:
                     yield line
 
-    def iter_batches(self, batch_size: int = BATCH_SIZE):
-        """按批读回（写 MaxCompute 用）。"""
+    def iter_batches(self, batch_size: int = BATCH_SIZE, max_bytes: int = MAX_BATCH_BYTES):
+        """同时按行数和 UTF-8 字节数切批；超过字节预算的单行独立成批。"""
         batch: list[str] = []
+        size = 0
         for row in self.iter_rows():
-            batch.append(row)
-            if len(batch) >= batch_size:
+            row_bytes = len(row.encode("utf-8"))
+            if batch and (len(batch) >= batch_size or size + row_bytes > max_bytes):
                 yield batch
-                batch = []
+                batch, size = [], 0
+            batch.append(row)
+            size += row_bytes
         if batch:
             yield batch
 
@@ -127,7 +132,7 @@ class SpoolWriter:
 class FetchStats:
     """一次流式拉取的统计；ID 集合占用随不同记录 ID 数量增长。"""
 
-    def __init__(self, date_field: str = ""):
+    def __init__(self, date_field: str = "", date_tz=CN_TZ):
         self.count = 0
         self.empty_rows = 0
         self.ids: set[str] = set()
@@ -136,6 +141,7 @@ class FetchStats:
         self.date_values: set[str] = set()
         self.date_counter: Counter = Counter()
         self.date_field = date_field
+        self.date_tz = date_tz
 
     def update(self, records: list[dict]) -> None:
         """拿一页记录更新统计。"""
@@ -154,7 +160,7 @@ class FetchStats:
                 # 不该被算成"空白行"，否则 empty_rows 的数据质量提示会失真
                 self.empty_rows += 1
             if self.date_field:
-                day = normalize_date_value(record.get(self.date_field))
+                day = normalize_date_value(record.get(self.date_field), self.date_tz)
                 if day:
                     self.date_values.add(day)
                     self.date_counter[day] += 1

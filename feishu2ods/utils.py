@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, quote_plus, unquote
 
 from ._common import leaf_strings as _leaf_strings
-from ._common import private_lock_dir
+from ._common import open_run_lock, private_lock_dir, target_lock_path
 from ._common import safe_label as safe_label
 from ._common import webhook_targets as webhook_targets
 
@@ -578,18 +578,12 @@ class RunLock:
     def __enter__(self):
         """拿锁；已被别人持有就抛 SystemExit（不等待），拿不到直接让本次运行退出。"""
         if fcntl is None and msvcrt is None:
-            return self
+            if os.environ.get("FEISHU2ODS_ALLOW_NO_LOCK", "").strip() == "1":
+                log("  警告：当前平台没有 fcntl/msvcrt；已显式接受无互斥风险，本次不加锁继续")
+                return self
+            raise SystemExit("当前平台不支持运行锁，拒绝无锁执行；仅确认无并发时可设 FEISHU2ODS_ALLOW_NO_LOCK=1")
         try:
-            # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
-            # encoding + errors=replace：locale 非 UTF-8 时读写中文主机名不会抛 UnicodeError
-            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接，拒绝跟随（避免锁到别人的文件上）
-            open_kwargs = {"encoding": "utf-8", "errors": "replace"}
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                # 显式传 mode：io.open 的 opener 约定只有 (path, flags)，os.open 缺省 mode=0o777
-                # （umask 决定最终权限，umask=0 时锁文件 0777）；锁文件按 0600 创建
-                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
-            self.fh = open(self.path, "a+", **open_kwargs)
+            self.fh = open_run_lock(self.path)
         except (OSError, UnicodeError) as exc:
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
@@ -809,12 +803,5 @@ def lock_path(job_path: pathlib.Path, root: pathlib.Path | None = None) -> pathl
 
 
 def table_lock_path(project: str, table: str, root: pathlib.Path | None = None) -> pathlib.Path:
-    """目标表级运行锁：不同作业（两份配置）指向同一张表时也要串行。
-
-    作业锁只管"同一个作业不重复跑"：jobs/a.json 与 jobs/b.json 写同一张表时互不阻塞，
-    一边的 purge 会清掉另一边正在写的临时分区、rename 交叉执行，最终一方数据被静默覆盖
-    （各自的写后核对只校验自己这批行数，发现不了）。锁名用「项目.表名」的小写形式：
-    MaxCompute 标识符不区分大小写并按小写存储，Linux 文件名却区分，`ODS_X_DF` 与
-    `ods_x_df` 必须撞到同一把锁；两者都已过标识符白名单，做文件名安全。
-    """
-    return _lock_base_dir(root) / f"table-{project.lower()}.{table.lower()}.lock"
+    """目标表锁入口；不同配置、安装目录和三个 ODS 工具共用同一键及默认目录。"""
+    return target_lock_path(project, table, root=root)

@@ -1,248 +1,136 @@
 # feishu2ods
 
 [![tests](https://github.com/sandy-wangzining/feishu2ods/actions/workflows/tests.yml/badge.svg)](https://github.com/sandy-wangzining/feishu2ods/actions/workflows/tests.yml)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/sandy-wangzining/feishu2ods/blob/main/pyproject.toml)
-[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/sandy-wangzining/feishu2ods/blob/main/LICENSE)
 
-**飞书多维表格（Base）→ MaxCompute ODS 同步工具**：每次把表格全量快照写成“一行一条 JSON”，
-写进 `pt=<业务日>` 分区。接一张新表 ≈ 跑一次 `--init` 生成配置。
+飞书多维表格（Base）→ MaxCompute ODS。把整表记录按字段映射写成单行 JSON，存入 `pt=<业务日>` 分区；每次运行生成一份全量快照。
 
-> Feishu Bitable → MaxCompute ODS sync tool. 同系列：[api2ods](https://github.com/sandy-wangzining/api2ods)（REST API） · [sftp2ods](https://github.com/sandy-wangzining/sftp2ods)（SFTP 文件）
+Feishu Base → MaxCompute snapshot ingestion. Standalone CLI for Windows, macOS and Linux. Requires Python 3.10+, a Feishu app with read access, and MaxCompute credentials. No other ODS project or company service is required.
 
-**最短路径：** 安装 → `--init` 生成配置 → `--check` 体检 → `--dry-run` 试跑 → 正式同步。
+同系列：[api2ods](https://github.com/sandy-wangzining/api2ods)（REST API）· [sftp2ods](https://github.com/sandy-wangzining/sftp2ods)（SFTP 文件）。本工具适合定时快照，不提供增量、实时同步。
 
-**导航：** [快速开始](#快速开始) · [它是怎么工作的](#它是怎么工作的) · [配置参考](#配置参考) · [行为与保护](#行为与保护) · [常见问题](#常见问题)
+## 安装与准备
 
-适合按天/按次把整表快照落到 MaxCompute ODS；不适合增量、实时同步（每次都是全量快照）。
-
-注意：分区替换是「删旧分区 + rename」两条 DDL，不是事务原子操作——两条语句之间正式分区会短暂缺失；
-rename 失败时会尽力保留已核对的完整副本（`__keep`）并以非零码退出，需要重跑或按日志恢复。
-
-`pt`（业务日）取值优先级：`--bizdate` > 环境变量 `bizdate` / `SKYNET_BIZDATE`（DataWorks）>
-业务日时区的昨天（默认 `America/New_York`，可用环境变量 `ODS_BIZDATE_TZ` 覆盖）；格式 `YYYYMMDD` 或 `YYYY-MM-DD`。
-
-环境要求：Python 3.10+（代码用到 `X | None` 类型标注），依赖见 `requirements.txt`（requests + pyodps）。
-
-## 安装
+需要 Python 3.10+，飞书自建应用的 App ID / App Secret，以及目标 MaxCompute 项目的凭证。应用应已发布，并被加入目标 Base 的可阅读协作者。
 
 ```bash
-# 方式一：pip（建议放虚拟环境；在源码目录执行）
-python3 -m venv venv && ./venv/bin/pip install .    # macOS / Linux
-py -3 -m venv venv; .\venv\Scripts\pip install .    # Windows（PowerShell）
-feishu2ods --version
-
-# 方式二：pipx（全局命令行工具，隔离环境；Windows / macOS / Linux 通用）
-pipx install .
-
-# 方式三：直接从 GitHub 安装
-pipx install "git+https://github.com/sandy-wangzining/feishu2ods.git"
-
-# 方式四：源码直接跑（不安装；Windows 把 python 换成 py -3 即可）
-python feishu2ods.py --job jobs/xxx.json --check
+git clone https://github.com/sandy-wangzining/feishu2ods.git
+cd feishu2ods
+python -m venv .venv
+# macOS / Linux
+.venv/bin/python -m pip install .
+# Windows PowerShell
+.\.venv\Scripts\python.exe -m pip install .
 ```
 
-> `python feishu2ods.py` 与 `python -m feishu2ods` 等价（前者是保留给既有调度命令的入口壳）。
-> 运行时要求 Python 3.10+；缺省业务日按 `ODS_BIZDATE_TZ`（默认 `America/New_York`）计算（Windows 需 `tzdata`，安装依赖时自动带上）。
+也可用 `pipx install "git+https://github.com/sandy-wangzining/feishu2ods.git"` 独立安装命令行工具。
+运行依赖为 requests、pyodps、simplejson（无损十进制 JSON），Windows 会自动安装 tzdata。
+源码运行请先 `python -m pip install -r requirements.txt`；`python feishu2ods.py`、`python -m feishu2ods` 与安装后的 `feishu2ods` 命令等价。
 
-## 快速开始
+地域和时区都可配置。请把 `maxcompute.endpoint` 设置为项目实际地域的 HTTPS 地址；默认 us-west-1 仅适用于该地域。不要直接沿用示例的项目、凭证或数据表 token。
 
-### 1) 准备作业配置
-
-新表先跑 `--init`（会拉列名和样例，逐列起英文键）；已有作业直接用 `jobs/xxx.json`。
-
-### 2) 体检 / 试跑 / 正式运行
-
-本地：
+## 第一次接表
 
 ```bash
-feishu2ods --job jobs/my_table.json --check       # 体检（不写库、不发告警）
-feishu2ods --job jobs/my_table.json --dry-run     # 试跑：拉数校验，不写库
-feishu2ods --job jobs/my_table.json --bizdate 20260928   # 正式：写 pt=20260928（临时分区 + 校验后替换）
-feishu2ods --job jobs/my_table.json               # 不传 --bizdate：取环境变量，再默认业务日时区昨天（ODS_BIZDATE_TZ，默认美东）
+feishu2ods --init
+feishu2ods --job jobs/my_table.json --check
+feishu2ods --job jobs/my_table.json --bizdate 20261026 --dry-run
+feishu2ods --job jobs/my_table.json --bizdate 20261026
 ```
 
-部署机（把工具目录同步上去即可）：
+`--init` 读取列名和样例，交互生成字段映射与作业配置，密钥输入不回显；`--init-out` 可指定输出路径。
+也可复制 `jobs/feishu_example.example.json` 后手工填写。真实作业含密钥，已通过 `.gitignore` 排除，勿提交到 Git。
+
+`--check` 只检查配置、API 连通、字段映射与目标表结构，不写库、不发通知。`--dry-run` 拉取并校验全部数据，不连接 MaxCompute。
+
+## 数据如何发布
+
+1. 用 App ID / App Secret 获取 tenant_access_token。
+2. 按 `limit=500 + offset` 拉取，记录逐页落到本地临时 JSONL。
+3. 将 Base 列名按 `fields` 映射成 JSON 键，保留 `record_id` 与字段原始值。
+4. 在目标项目创建独立的 `tmp_feishu2ods_<随机 ID>` 暂存表（生命周期 1 天，开启 `lifecycle.deletemeta=true`），通过 Tunnel 分批上传。
+5. 核对暂存的行数、record_id 去重数及 ID 范围；通过后以单条 `INSERT OVERWRITE` 发布正式业务日分区。
+6. 成功后尽力删除暂存表，再核对正式分区行数；失败残留由 MaxCompute 生命周期任务异步回收分区及空表元数据，日志给出暂存表名。
+
+正式表不会创建新版本的 `__tmp` / `__keep` 分区。暂存和校验期间旧快照保持可读；单分区 OVERWRITE 按 MaxCompute 的原子提交语义完成，不再执行「先删旧分区 + rename」。接口返回失败或响应丢失时，命令会报告失败；以云端实例及正式分区核对结果确认是否提交，重跑为幂等覆盖。
+
+该流程需要目标项目的建表、暂存表读写和删除、目标分区写入及查询权限，并会产生暂存存储和发布 SQL 的费用。请按项目权限与计费规则授权、预算。
+
+## 配置
+
+完整示例见 `jobs/feishu_example.example.json`，主要字段如下：
+
+- `feishu.app_id`、`app_secret`：飞书自建应用凭证。
+- `feishu.base_token`、`table_id`：Base 和数据表标识；`base_url` 可选，用于通知链接。
+- `maxcompute.project`、`endpoint`、`access_key_id`、`access_key_secret`：目标连接配置。
+- `fields`：Base 列名 → JSON 英文键，至少一项；英文键唯一，不能使用保留键 `record_id`。
+- `target.project`：可选，覆盖 maxcompute.project；`table` 必填，`column` 默认 json；`comment` 可选。
+- `target.allow_empty`：默认 false。显式允许空快照时，若正式分区已有数据，仍需 `--force` 才会清空。
+- `freshness.date_field`：用于判日期的英文键，必须包含在映射中；不配置 freshness 就不做新鲜度检查。
+- `freshness.lag_days`：预期日期 = 业务日减 N 天，默认 0。
+- `freshness.timezone`：IANA 时区名，例如 Asia/Shanghai、America/New_York、UTC。未配置时使用 ODS_BIZDATE_TZ，后者默认 America/New_York。
+- `freshness.webhook`：可选，飞书群机器人地址或地址数组；某个群通知失败不影响其它群和同步退出码。
+
+### 业务日与新鲜度
+
+业务日优先级：`--bizdate` > 环境变量 `bizdate` / `SKYNET_BIZDATE` > `ODS_BIZDATE_TZ` 时区的昨天。接受 YYYYMMDD 或 YYYY-MM-DD，正式运行不会把非法值静默回退。
+
+新鲜度支持日期文本（2026-10-26、2026/10/26、20261026）、紧凑数字日期、epoch 秒/毫秒及 ISO 时间。带偏移的 ISO 与 epoch 都转换到 `freshness.timezone` 后取日；无时区的日期文本保留源侧日期。时间戳结果需落在 2000～2100 年，避免把普通数字误认作日期。
+
+例如 `2026-10-26T20:00:00-04:00` 与 `1793059200000` 是同一时刻；在 America/New_York 下都归 26 日，在 Asia/Shanghai 下都归 27 日。按源业务口径选择时区，IANA 时区可自动处理夏令时。
+
+缺少预期日期只告警，快照仍发布；零行默认失败。缺数据和新增列的通知在发布并核对成功后才发送，试跑或写失败不会声称已同步。通知失败只记录警告，调度应依靠进程退出码监控同步结果。
+
+## 完整性与内存边界
+
+- 翻页期间字段列表或表格版本 rev 变化、record_id 重复、映射列缺失，一律中止。
+- 新增未映射列不阻塞，同步其余字段并提醒；空白行原样保留，下游按业务字段过滤。
+- JSON 小数按 Decimal 解析，simplejson 将其保留为 JSON 数字，避免金额先转 float 丢失精度；非有限数 NaN / Infinity 拒绝写入。
+- 正文逐页落盘，写入批次同时限制 500 行与约 8MB；单条约 7MB 上限在远端写入前检查。去重 ID 和日期统计仍随数据量增长，整个进程并非恒定 8MB 内存。
+- 失败时本地 spool 保留并打印路径，排查后可删除；成功及正常试跑会清理。
+- 目标表必须为单列 string + 单级 pt string 分区的普通表；宽表、视图、事务表会拒绝写入。
+- SQL 默认超时 600 秒，超时或中断会请求取消云端实例；网络响应丢失时不能仅凭本地退出码断言云端已取消。
+- 日志与告警对凭证做形态和值级脱敏；密钥仍应由操作者妥善保管。
+
+下游按明确的八位业务日分区读取。`MAX_PT()` 只返回有数据的最大分区；允许写空分区时，它可能返回上一天，请勿用它判断某个业务日是否成功发布。
+
+## 并发与部署
+
+每个作业有运行锁，另有按 `project.table` 归一化的目标表锁。不同作业、安装目录、虚拟环境和三个 ODS 工具写同一目标表时互斥；不同表可并行。争用锁时后启动的任务以失败退出，调度可稍后重试。
+
+目标锁默认在系统临时目录的 `ods-target-locks[-UID]`。多用户或不同 TMPDIR / 容器运行时，用 `ODS_TARGET_LOCK_DIR` 指向同一固定目录。`FEISHU2ODS_LOCK_DIR` 继续控制作业锁。操作系统退出会释放锁，不需要手工删除锁文件。
+
+POSIX 跨用户部署需将共享目录设为共用组所有的 `2770` setgid 目录，运行锁会继承组并以 `0660` 供组内账号复用；默认私有目录仍使用 `0600`。Windows 需配置继承的读写 ACL。完整示例和旧锁权限迁移步骤见[多用户共享锁目录](docs/shared-runtime.md#多用户共享锁目录)。
+
+跨机器只有共享文件系统确实支持跨主机文件锁时才可能互斥；仅指定共享路径不提供分布式保证，推荐固定调度机器。不支持文件锁时默认拒绝运行；仅确认无人并发时，才用 FEISHU2ODS_ALLOW_NO_LOCK=1 显式接受无锁风险。
+
+## 从旧版本升级
+
+先停掉所有旧进程，再安装更新并一起更新会写同一目标的工具。目标表结构和原有作业 JSON 保持可用，无需修改下游八位业务日分区口径。
+
+- 新流程需要独立暂存表及发布 SQL 的权限和费用预算。
+- 旧数据按北京时间核新鲜度的作业，请显式增加 `freshness.timezone: "Asia/Shanghai"`；未配置时现在与业务日时区一致。
+- 旧版本遗留 `__keep`：正式分区已存在时清理冗余副本，否则保留并提示恢复。
+- 旧版本遗留 `__tmp`：若对应正式分区不存在，程序停止并保留这份可能的唯一副本。先核对内容，恢复到正式分区或确认无用后删除，再重跑；不会自动毁掉唯一副本。
+- 新版本失败的暂存表可按日志定位；推荐直接重跑，未经核对不要手工把半成品发布。
+
+## 命令行与退出码
+
+常用选项：`--job`、`--bizdate`、`--check`、`--dry-run`、`--init` / `--init-out`、`--project` / `--table`（测试覆盖目标）、`--force`（空分区覆盖确认）、`--skip-freshness`（兼容 `--no-check`）、`--no-notify`、`--sql-timeout`（0 表示不限时）、`--log-file`（追加 UTF-8 日志）、`--version`。完整参数见 `feishu2ods --help`。
+
+退出码：0 成功（含体检/试跑）；1 配置、源端、校验或写入失败；2 命令行参数错误；130 用户中断。`--check` 无远端修改，正式运行以非零码向调度报告失败。
+
+## 开发与验证
 
 ```bash
-cd ~/feishu2ods
-./venv/bin/python feishu2ods.py --job jobs/my_table.json --bizdate "${bizdate}"
+python -m pip install -e ".[dev]"
+python -m unittest discover -s tests
+python tools/sync_common.py --check
+ruff check .
+ruff format --check .
 ```
 
-常用参数：`--check`（体检）、`--init`（交互式生成作业，接新表用；密钥输入不回显，`--init-out` 可指定
-输出路径）、`--bizdate`（业务日 pt）、
-`--dry-run`（不写库；校验与告警仍按正式逻辑执行，不想发告警加 `--no-notify`）、
-`--skip-freshness`（跳过新鲜度校验，兼容旧写法 `--no-check`）、`--no-notify`（不发告警）、
-`--force`（0 行写空分区前的保护放行开关，见下）、`--project` / `--table`（覆盖目标，测试用）、
-`--sql-timeout`（单条 MaxCompute SQL 超时秒数，默认 600，0=不限制；建表 / 分区增删与清理 /
-分区核对 / 写后行数核对 / rename 都受保护）、`--log-file`（日志同时写一份到该文件：追加、UTF-8、
-父目录自动创建——Linux 上跑 cron/调度时 stdout 会被截断，落盘是事后翻查的唯一途径）。
-
-## 它是怎么工作的
-
-1. 用 `app_id` / `app_secret` 换 `tenant_access_token`；
-2. 按 `limit=500 + offset` 翻页拉整表，记录边拉边写本地临时 JSONL；
-3. 按 `fields` 映射把每行变成 `{record_id, 英文键: 原值}`；
-4. 写 `pt=<业务日>__tmp` 临时分区，核对行数/record_id 后替换正式分区；
-5. 下游 DWD 用 `get_json_object` 解析 JSON，按源数据里的日期字段重新分区。
-
-## 配置参考
-
-一般不用手写（`--init` 生成后核对即可）：
-
-| 字段 | 说明 |
-| --- | --- |
-| `feishu.app_id` / `feishu.app_secret` | 飞书自建应用（需先被加为目标表格的「可阅读」协作者） |
-| `feishu.base_token` / `feishu.table_id` | 多维表格 token / 数据表 ID |
-| `feishu.base_url` | 可选，告警卡片里带表格链接 |
-| `maxcompute.project` | 默认项目（`target.project` 未给时用它） |
-| `maxcompute.endpoint` | 可选，默认美国硅谷接入地址（https） |
-| `maxcompute.access_key_id` / `access_key_secret` | 阿里云凭证 |
-| `fields` | Base 列名 → JSON 英文键（必填；英文键须是字母/数字/下划线，唯一） |
-| `target.project` / `target.table` / `target.column` | 目标表（column 默认 `json`；表会自动建） |
-| `target.comment` | 可选，表注释 |
-| `target.allow_empty` | 可选，默认 `false`：拉到 0 行时拒绝写库；设为 `true` 时允许写空分区，但写前会先查目标分区现有行数，非 0 时仍需加 `--force` 才放行 |
-| `freshness.date_field` | 用哪个英文键判日期（必须是 `fields` 的英文值）；值规范化成 `yyyy-MM-dd` 后比对，支持的形态见「行为与保护」第 6 条 |
-| `freshness.lag_days` | 预期日期 = bizdate - N 天，默认 0（即必须有业务日当天的数据） |
-| `freshness.webhook` | 缺失时发飞书群告警的 webhook；支持字符串或字符串数组（多个群同时告警，单个群失败不影响其它群） |
-
-## 接入一张新表（复用流程）
-
-1. 把飞书自建应用加为该表格的「可阅读」协作者（表格 → 分享/协作者 → 添加应用）；
-2. `feishu2ods --init`：按提示生成 `jobs/<作业名>.json`——自动拉列名和样例，
-   逐列起英文键（不需要的列回车跳过）；项目、表名、注释、新鲜度告警都可回车用默认值，
-   填错会当场提示重填（wiki 知识库链接里不是 base_token，会提示换 /base/ 链接）；
-3. `feishu2ods --job jobs/<作业名>.json --check` 体检（配置 + API 连通 + 映射 + 目标表）；
-4. `--dry-run` 试跑，条数/日期没问题后正式跑；调度命令同 my_table（换 --job 即可）。
-
-## 行为与保护
-
-1. 鉴权：`app_secret` 换 `tenant_access_token`（有效期 2 小时，翻页中途失效会自动重取一次）；
-2. 拉取：v3 records 接口 `limit=500 + offset` 翻页（接口上限 2000）；接口限流（99991400）自动退避重试；
-   翻页中途字段列表变化、或表格版本号（rev）变化都会中止（防 offset 翻页期间被编辑导致静默漏行）；
-   记录 ID 重复会立刻中止（防接口忽略 offset 重复写）；**流式落盘**：记录边拉边写本地临时
-   JSONL，写库时逐批读回，记录正文不全量驻留内存；去重 ID 集合和日期统计仍会随不同 ID/日期数增长，
-   大表部署需为这些统计预留内存；新鲜度/空行/去重 ID 等统计在拉取过程中逐页累积；
-3. 映射：映射的 Base 列缺失（被改名/删除）→ 直接报错（空表也校验）；未映射的列 → 忽略、
-   照常同步其余字段，并发一条飞书提醒（列名 + 处理步骤：要不要加映射由人工决定；`--no-notify` 可关）；
-   Base 里「除 record_id 外全为空」的空白行会**原样同步**（日志会提示条数），下游记得按日期字段过滤；
-   金额等值原样带格式（如 `"$23.32 "` 尾随空格），下游解析前先 `trim`；
-4. 写入：写库前先校验目标表结构（单列 string + pt 分区），不符直接报错、**绝不先清表**；
-   单行超过约 7MB 会在动分区前报错；结构正确才写 `pt=<业务日>__tmp` 临时分区 + Tunnel 分批写入，
-   临时分区核对「行数 + record_id 去重数 + 最小/最大 id」（不一致不替换），再「删旧分区 + rename」校验后替换；
-   全程失败自动重试 3 次（重跑幂等；失败后尽力清掉临时分区，若有残留下次运行也会先清理）；
-   建表 / 分区增删与清理 / 分区核对 / 写后行数核对 / rename 这些 SQL 都有超时保护（默认 600 秒，`--sql-timeout` 可调，
-   0=不限制；超时主动取消，避免云端卡住时调度任务无限挂起、一直占着运行锁把后续调度全挡掉）；
-   **0 行保护**：`target.allow_empty=true` 且本次拉到 0 行时，写空分区前会先查目标分区现有行数——
-   非 0 则拒绝写库（退出码 1）并提示加 `--force`，防止源端被截断/清空时把好数据抹掉；现有行数本来就是
-   0 则正常写空分区；
-5. 并发保护：同一作业有运行锁（Linux flock / Windows msvcrt，进程退出自动释放，不会残留死锁）；
-   定时任务与手动重跑重叠时，后启动的一边主动退出（报错里带持有者 pid/机器/时间）；不同作业互不影响；
-   写库阶段还有按「项目.表名」的表级锁：两份配置指向同一张表（迁移期新旧作业并存）时同机串行，
-   不会互删临时分区、互相覆盖；
-   文件系统不支持锁（NFS / 只读挂载等）时默认**拒绝执行**（fail-closed，避免两个实例并发写同一作业/表）；
-   确认当前无人并发、接受无互斥风险时，用 `FEISHU2ODS_ALLOW_NO_LOCK=1` 显式放行；
-   **锁只在同一台机器内生效**：本地手跑与服务器调度同时跑同一作业没有保护，正式跑请固定一台机器；
-   锁目录默认在工具目录 `.run-locks/`（不可写时退回当前用户的私有临时目录，退回时日志会提示）；若同一作业
-   会以不同身份或不同 TMPDIR 跑（root 手动补数与普通用户调度混用），用环境变量
-   `FEISHU2ODS_LOCK_DIR` 把锁目录钉在固定位置，避免两个实例锁在不同文件上、互斥静默失效；
-6. 新鲜度校验（配了 `freshness` 才做）：`date_field` 里必须出现「业务日 - `lag_days`」
-   （业务日 = `--bizdate` / 环境变量 / 业务日时区（`ODS_BIZDATE_TZ`，默认美东）的昨天；默认 lag_days=0，即少 bizdate 当天就告警）。
-   `date_field` 的值会先规范成 `yyyy-MM-dd` 再比对，支持的形态：ISO 串
-   （`2026-09-27T00:00:00+08:00`，取前 10 位；未补零的 `2026-9-7` 也认）、`yyyy/MM/dd`、
-   epoch 毫秒数字（换算结果须落在 2000~2100，0/14 位 `yyyyMMddHHmmss` 这类会按"认不出"处理）、
-   8 位紧凑日期（数字 `20260927` 或文本 `"20260927"` 都认）。
-   **缺数据只告警不失败**：很多表是人填的（节假日/休假没人填是常态），快照照常写入——
-   缺的那天只是没有数据行（DWD 按源数据日期字段重新分区，下游任务不受影响），并发一条
-   飞书提醒；**表被清空（0 行）仍按失败处理**（那才是真异常）。日志会提示调 `lag_days`
-   或用 `--skip-freshness` 跳过校验；同一天出现多行会打警告（DWD 会落多行）；
-7. `--check` 只体检：配置 + API 连通 + 字段映射 + 目标表结构，不写库、不发告警、不校验新鲜度。
-   它是只读的，环境变量 `bizdate` 格式不对时不会把体检拖垮（按默认业务日 `ODS_BIZDATE_TZ`，默认美东，继续并打警告）；
-   正式同步路径仍严格要求业务日合法（非法的环境变量 `bizdate` 直接报错，不会静默回退）。
-
-8. **脱敏**：日志与异常里的 app_secret、tenant_access_token、AK/SK、webhook 一律脱敏——
-   形态规则（`Bearer …`、`"key": "value"`、`app_secret=…`）之外，还按配置里的密钥值精确遮蔽，
-   包括其 URL 编码形态（`quote` / `quote_plus`，以及把 `-` 也编码的激进编码器形态；含中文的
-   密钥同样覆盖）：接口把凭证写进自由文本报错时也不会漏；飞书告警卡片走同一套脱敏。
-
-### 退出码（调度侧判断成败）
-
-| 码 | 含义 |
-|---|---|
-| 0 | 成功（含 `--dry-run`；`--check` 体检通过；`--init` 生成配置成功；0 行且 `allow_empty=true` 时，目标分区本来就空、或显式加了 `--force`，也会写空分区并返回 0） |
-| 1 | 运行失败：鉴权/拉取失败、映射的列缺失、翻页中途字段列表或表格版本号（rev）变化、写库失败、写后行数对不上、0 行保护触发、`--check` 未通过、`--init` 取消；作业文件不存在、业务日格式不对等配置类问题也归这里 |
-| 2 | 命令行参数问题（缺 `--job`、`--sql-timeout` 为负等 argparse 层），**没有发起任何远端操作** |
-| 130 | 用户中断（Ctrl+C），正式同步与 `--init` 一致 |
-
-配置类错误统一以 `SystemExit` 抛出，退出码同为 1：凡是"重跑结果一样"的问题都归到 1，
-调度直接告警即可，不必按码分流重试。
-
-## 部署到服务器（一次性）
-
-```bash
-# 本机打包上传到部署机（scp/rsync 均可）
-# 服务器上：
-mkdir -p ~/feishu2ods/jobs
-cd ~/feishu2ods
-python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-# 把 feishu2ods.py、feishu2ods/ 包目录、requirements.txt、jobs/my_table.json 放好即可
-# （v1.5.0 起代码拆成 feishu2ods/ 包，feishu2ods.py 只是入口壳，缺了包目录会 ImportError）
-```
-
-## 常见问题
-
-- `获取 tenant_access_token 失败`：`app_id`/`app_secret` 不对，或应用未发布版本；
-- `拉取记录失败：code=91403`：应用没被加为表格协作者（在表格「分享/协作者」里把应用加为可阅读）；
-- `已有任务在运行（锁文件 ...）`：同一台机器上同一作业还有一个实例在跑（报错里会显示持有者 pid/机器/启动时间）；
-  锁随进程退出自动释放，确认没有实例在跑时**不需要**手动删锁文件；跨机并发（本地与服务器同时跑）不受此锁保护；
-- `表结构与工具要求不一致，拒绝写入`：目标表已有别的结构，人工核对后再处理（工具不会动不符合结构的表）；
-- `本次拉到 0 行，但该分区现有 N 行`：`target.allow_empty=true` 下的空分区保护触发——源端可能被
-  截断/清空，为保住已有数据工具拒绝写库。确认表格确实变成 0 行后，重跑时加 `--force` 即可覆盖成空分区；
-- 日期校验失败但表里其实有数据：查 `freshness.date_field` 是否指对字段、`lag_days` 是否要调；
-  也看日期列的形态——只认 ISO（`2026-09-27T…` 取前 10 位）、`yyyy/MM/dd`、epoch 毫秒数字，
-  **紧凑数字串 `20260927` 不被识别**（会被误判缺数），需在 Base 侧改成可识别格式；
-- 下游解析报错/行数为 0：表格里可能有空白行（日志会提示「全为空」）、或值带尾随空格（如 `"$23.32 "`），
-  用 `get_json_object(...) is not null` 过滤空白行、`trim` 后再转数值；
-- 看到 `pt=...__tmp` 分区：某次写入中断留下的临时分区，重跑该作业会自动清掉并重建；正常失败不影响正式分区。
-  若强杀恰发生在「删旧分区 + rename」之间、正式分区已缺失，先按日志把这份 `__tmp` rename 回正式分区再重跑；
-- 日志/告警里会不会出现密钥：不会——统一过脱敏（形态规则 + 按配置里的密钥值精确遮蔽，
-  含 URL 编码形态），告警卡片同样脱敏后才发出；
-- 接新表拿不准配置：`--init` 生成后先 `--check`，报错信息都会指到具体字段。
-
-## 开发与测试
-
-```bash
-python -m pip install -e ".[dev]"          # 开发依赖（ruff）
-python -m unittest discover -s tests -v    # 离线用例：不访问网络、不连 MaxCompute
-ruff check .                               # 代码检查
-ruff format --check .                      # 格式检查（需要时先跑 ruff format .）
-```
-
-`review_ignore.json` 是代码审查工具的误报抑制名单，不参与运行。测试按模块拆分（`tests/test_*.py`），公共替身在 `tests/_helpers.py`。
-
-### 目录结构
-
-- `feishu2ods/` 代码包（v1.5.0 起从单文件拆出，按职责分模块）：
-  - `cli.py` 命令行入口（--check / 正式同步 / --init 分发）
-  - `auth.py` 飞书 HTTP 请求（重试/限流退避）与 tenant_access_token
-  - `fetch.py` 多维表格拉取（offset 翻页 + 一致性保护 + 流式落盘）
-  - `mc.py` MaxCompute：建表 / 结构校验 / 写分区（校验后替换）/ 写后核对
-  - `spool.py` 流式落盘（SpoolWriter）与拉取统计（FetchStats）
-  - `config.py` job 配置读取与校验；`dates.py` 业务日与日期规范化
-  - `notify.py` 飞书群告警；`utils.py` 日志 / 脱敏 / 运行锁；`wizard.py` --init 向导
-- `feishu2ods.py` 兼容入口（等价 `python -m feishu2ods`，保留给既有调度命令）
-- `jobs/*.json` 作业配置（含密钥，已 gitignore；格式参考 `jobs/feishu_example.example.json`）
-- `tests/` 离线单测；`requirements.txt` 依赖（requests + pyodps）
-
-贡献流程、代码风格和设计红线见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+测试离线执行，不使用真实凭证、飞书或数仓。CI 覆盖 Windows / macOS / Linux 和项目支持的 Python 版本，并检查 wheel 独立安装。公共源码随包携带，维护说明见 [docs/shared-runtime.md](docs/shared-runtime.md)；贡献约束见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## License
 
-MIT（见 [LICENSE](LICENSE)）。
-
-## 公共源码维护
-
-默认临时锁目录在 POSIX 上校验属主和写权限，拒绝软链或公共可写目录；无安全可写目录时停止运行。
-多身份或多环境运行同一作业时，请用对应的 `*_LOCK_DIR` 固定同一目录，保持互斥。
-
-三个项目保持独立安装；SQL 等待、告警和部分脱敏工具维护一份源码并同步，详见
-[公共源码说明](docs/shared-runtime.md)。贡献前请运行 `python tools/sync_common.py --check`。
+MIT，见 [LICENSE](LICENSE)。

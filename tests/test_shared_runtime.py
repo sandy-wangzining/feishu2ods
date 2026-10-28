@@ -7,6 +7,11 @@ import importlib
 import importlib.util
 import io
 import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -22,6 +27,144 @@ mc = importlib.import_module(f"{PACKAGE}.mc")
 
 
 class TestSharedRuntime(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX 文件权限检查")
+    def test_private_run_lock_stays_private_with_permissive_umask(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "private.lock"
+            previous = os.umask(0)
+            try:
+                with utils.RunLock(path):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            finally:
+                os.umask(previous)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX 组共享检查")
+    def test_setgid_run_lock_is_group_writable_with_strict_umask(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.chmod(0o2770)
+            path = root / "shared.lock"
+            previous = os.umask(0o077)
+            try:
+                for legacy in (False, True):
+                    if legacy:
+                        path.chmod(0o600)
+                    with utils.RunLock(path):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o660)
+                        self.assertEqual(path.stat().st_gid, root.stat().st_gid)
+            finally:
+                os.umask(previous)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "POSIX 软链检查")
+    def test_shared_run_lock_rejects_symlink_without_touching_destination(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.chmod(0o2770)
+            destination = root / "data"
+            destination.write_text("original", encoding="utf-8")
+            path = root / "link.lock"
+            path.symlink_to(destination)
+            with self.assertRaises(SystemExit):
+                with utils.RunLock(path):
+                    self.fail("软链被用作锁文件")
+            self.assertEqual(destination.read_text(encoding="utf-8"), "original")
+
+    @unittest.skipUnless(sys.platform == "linux" and os.geteuid() == 0, "需 Linux root 切换不同 UID；CI 单独执行")
+    def test_shared_run_lock_across_different_uids(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.chmod(0o755)
+            # CI checkout 的父目录可能仅 runner 可读；降权子进程使用同一源码的隔离副本。
+            package_root = root / PACKAGE
+            shutil.copytree(ROOT / PACKAGE, package_root, ignore=shutil.ignore_patterns("__pycache__"))
+            for path in [package_root, *package_root.rglob("*")]:
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            shared = root / "locks"
+            shared.mkdir()
+            os.chown(shared, 0, 65534)
+            shared.chmod(0o2770)
+            script = (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(root)!r})\n"
+                f"from {PACKAGE}.utils import RunLock\n"
+                "with RunLock(Path(sys.argv[1])):\n"
+                "    print(os.geteuid())\n"
+            )
+
+            def acquire_as(uid, path):
+                def demote():
+                    os.setgroups([])
+                    os.setgid(65534)
+                    os.setuid(uid)
+                    os.umask(0o077)
+
+                return subprocess.run(
+                    [sys.executable, "-c", script, str(path)],
+                    preexec_fn=demote,
+                    cwd=root,
+                    capture_output=True,
+                    encoding="utf-8",
+                    timeout=20,
+                )
+
+            for path in (shared / "job.lock", common.target_lock_path("p", "t", root=shared)):
+                with self.subTest(path=path.name):
+                    for uid in (65534, 65533):
+                        result = acquire_as(uid, path)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), str(uid))
+                    inode = path.stat().st_ino
+                    with utils.RunLock(path):
+                        holder = path.read_text(encoding="utf-8")
+                        result = acquire_as(65533, path)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("已有任务在运行", result.stderr)
+                        self.assertEqual(path.read_text(encoding="utf-8"), holder)
+                    result = acquire_as(65533, path)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(path.stat().st_ino, inode)
+
+    def test_target_lock_is_shared_across_installations(self):
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(common.os.environ, {"ODS_TARGET_LOCK_DIR": tmp}):
+            spec = importlib.util.spec_from_file_location("another_install", common.__file__)
+            other = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(other)
+            first = common.target_lock_path("Project", "ODS_DATA")
+            second = other.target_lock_path("project", "ods_data")
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, common.target_lock_path("project", "other_table"))
+            with utils.RunLock(first):
+                with self.assertRaises(SystemExit):
+                    with utils.RunLock(second):
+                        self.fail("同一张表取得了两把锁")
+            with utils.RunLock(second):
+                pass
+
+    def test_cli_blocks_different_job_file_for_busy_target(self):
+        import _helpers
+
+        cli = importlib.import_module(f"{PACKAGE}.cli")
+        utils = importlib.import_module(f"{PACKAGE}.utils")
+        job = _helpers.make_job() if PACKAGE == "feishu2ods" else _helpers.minimal_job()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {"ODS_TARGET_LOCK_DIR": str(root / "targets"), f"{PACKAGE.upper()}_LOCK_DIR": str(root / "jobs")}
+            path = root / "another-job.json"
+            path.write_text(json.dumps(job), encoding="utf-8")
+            with mock.patch.dict(common.os.environ, env), mock.patch.object(cli, "run_sync", return_value=0) as run:
+                target = common.target_lock_path(job["target"]["project"], job["target"]["table"])
+                with utils.RunLock(target):
+                    self.assertEqual(cli.main(["--job", str(path), "--bizdate", "20261026"]), 1)
+                    run.assert_not_called()
+                self.assertEqual(cli.main(["--job", str(path), "--bizdate", "20261026"]), 0)
+                run.assert_called_once()
+
     @unittest.skipUnless(hasattr(common.os, "getuid"), "POSIX 目录权限检查")
     def test_private_lock_dir_rejects_shared_writable_directory(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(common.tempfile, "gettempdir", return_value=tmp):

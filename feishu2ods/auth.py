@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 
 from .utils import _api_err, add_secret_value, log, redact
 
@@ -72,7 +73,7 @@ def request_json(method: str, url: str, desc: str, *, params=None, body=None, he
                 raise ApiHttpError(resp.status_code, body)
             else:
                 try:
-                    return resp.json()
+                    return resp.json(parse_float=Decimal)
                 except ValueError as exc:
                     last = exc
                     resp.close()

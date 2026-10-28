@@ -12,7 +12,7 @@ from datetime import date, timedelta
 
 from . import VERSION
 from .config import DEFAULT_COLUMN, DEFAULT_FRESHNESS_LAG_DAYS, _require_identifier, load_job, validate_job
-from .dates import freshness_problem, resolve_bizdate
+from .dates import freshness_problem, freshness_zone, resolve_bizdate
 from .fetch import fetch_records
 from .mc import (
     SQL_TIMEOUT_SECONDS,
@@ -44,7 +44,7 @@ from .wizard import run_init
 
 
 # =============================================================================
-# 主流程：拉数 → 新鲜度校验 → 写 pt 分区（临时分区 + 校验后替换）→ 行数核对
+# 主流程：拉数 → 新鲜度校验 → 写 pt 分区（独立暂存表 + 原子发布）→ 行数核对
 # =============================================================================
 def _sql_timeout_arg(value: str) -> int:
     """--sql-timeout 参数校验：非负整数。
@@ -85,7 +85,7 @@ def _arg_identifier(label: str):
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="feishu2ods",
-        description="飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，临时分区 + 校验后替换）",
+        description="飞书多维表格 → MaxCompute ODS（JSON 原样落库，json + pt 分区，独立暂存表 + 原子发布）",
     )
     parser.add_argument("--job", default="", help="job 配置文件（jobs/*.json）；--init 时可不填")
     parser.add_argument("--init", action="store_true", help="交互式生成作业配置（接新表用；生成后先 --check）")
@@ -184,7 +184,7 @@ def run_check(job: dict, project: str, table_name: str, column: str, pt: str) ->
 def run_sync(
     args, job: dict, project: str, table_name: str, column: str, pt: str, bizdate: date, started: float
 ) -> int:
-    """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（临时分区 + 校验后替换）→ 行数核对。"""
+    """正式流程：拉数（流式落盘）→ 空表/新鲜度校验 → 写 pt 分区（独立暂存表 + 原子发布）→ 行数核对。"""
     feishu = job["feishu"]
     maxcompute = job["maxcompute"]
     target_cfg = job["target"]
@@ -214,7 +214,7 @@ def run_sync(
         # 临时目录不可写/磁盘满：给一句人话而不是裸 traceback（否则 --log-file 里一个字都没有）
         log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{_redact_job(job, exc)}")
         return 1
-    stats = FetchStats(date_field=date_field)
+    stats = FetchStats(date_field=date_field, date_tz=freshness_zone(freshness or {}))
     keep_spool = True
     try:
         fetch_records(feishu, job["fields"], extra_out=new_fields, sink=spool, stats=stats)
@@ -276,7 +276,7 @@ def run_sync(
         # ---- ③ 写库（dry-run 跳过）----
         if args.dry_run:
             keep_spool = False
-            log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（写临时分区后校验后替换）")
+            log(f"--dry-run：不写库；将把 {count:,} 行写进 {project}.{table_name} pt={pt}（独立暂存表校验后原子发布）")
             return 0
 
         o = connect_odps(maxcompute, project)
@@ -286,7 +286,7 @@ def run_sync(
         verify_schema(table, table_name, column)
         purge_stale_tmp_partitions(o, table, project, table_name, timeout=args.sql_timeout)
 
-        # 0 行 + allow_empty=true（否则上面已拦截）→ 写空分区会清空已有分区：「删旧分区 + rename」
+        # 0 行 + allow_empty=true（否则上面已拦截）→ 写空分区会清空已有分区：「单条 OVERWRITE」
         # 不可逆，而"源端被截断成 0 行"几乎总是异常。写前先查现有分区行数，非 0 则拒绝写库，
         # 只有显式 --force 才放行（与 sftp2ods 同款保护）。
         if count == 0 and not args.force:
@@ -299,7 +299,7 @@ def run_sync(
                 )
                 return 1
 
-        log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写临时分区，核对后校验后替换）...")
+        log(f"写入 {project}.{table_name} pt={pt}（{count:,} 行：先写独立暂存表，核对后原子发布）...")
         write_partition(o, table, project, table_name, column, pt, spool, stats, timeout=args.sql_timeout)
         actual = count_partition(o, project, table_name, pt, timeout=args.sql_timeout)
         if actual != count:
@@ -383,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"❌ {redact(exc)}")
         return 1
     except KeyboardInterrupt:
-        log("已中断（若在写入阶段中断，正式分区可能还没替换、临时分区可能残留；重跑同一命令即可，写入幂等）")
+        log("已中断（若在写入阶段中断，正式分区以云端发布结果为准、暂存表可能保留一天；重跑同一命令即可，写入幂等）")
         return 130
     except Exception as exc:  # noqa: BLE001 - 未预期错误也给干净结论（附堆栈便于排查）
         log(f"❌ 运行失败（未预期错误）：{type(exc).__name__}: {redact(exc)}")
@@ -440,7 +440,7 @@ def _run(args, started: float) -> int:
     log(
         f"作业 {job.get('job') or pathlib.Path(args.job).stem} 启动："
         + (f"{job['description']}；" if job.get("description") else "")
-        + f"目标 {project}.{table_name}（{column}，pt={pt}：写临时分区后校验后替换）"
+        + f"目标 {project}.{table_name}（{column}，pt={pt}：独立暂存表校验后原子发布）"
     )
 
     if args.check:
@@ -448,7 +448,7 @@ def _run(args, started: float) -> int:
 
     with RunLock(lock_path(pathlib.Path(args.job).resolve())):  # 同机同一作业互斥；不同作业可并行
         # 表级锁再兜一层：不同作业（两份配置）指向同一张表时，上面的作业锁互不阻塞，
-        # purge/rename 会互相拆台、一方数据被静默覆盖——同机同表也必须串行
+        # 不同配置/工具可能写入同一目标；目标表锁覆盖拉取、发布与写后校验
         with RunLock(table_lock_path(project, table_name)):
             return run_sync(args, job, project, table_name, column, pt, bizdate, started)
 

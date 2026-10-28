@@ -14,7 +14,7 @@ python3 -m venv venv
 ./venv/bin/pip install -e ".[dev]"        # Windows: .\venv\Scripts\pip install -e ".[dev]"
 ```
 
-只需要 Python 3.10+，核心依赖只有 `requests` + `pyodps`，没有系统级依赖。
+只需要 Python 3.10+，核心依赖为 `requests` + `pyodps` + `simplejson`，没有系统级依赖。
 
 ## 跑测试与代码检查
 
@@ -38,9 +38,9 @@ ruff format .                             # 统一格式（ruff 锁版本；CI �
 1. **全量快照写 `pt=<业务日>`**：每次运行把整张表的数据按 `fields` 映射后写进当天的分区，
    不写增量、不写多分区。`pt`（业务日）取值优先级 `--bizdate` > 环境变量
    `bizdate` / `SKYNET_BIZDATE` > 业务日时区（`ODS_BIZDATE_TZ`，默认 America/New_York）的昨天。
-2. **临时分区 + 校验后替换**：写入必须先落到临时分区，核对通过后再「删旧分区 + rename」
-   换成正式分区。两条 DDL 之间存在缺分区窗口，不承诺事务原子性；替换失败必须报告失败，
-   并尽力保留完整副本供恢复。写前校验（如单行大小）必须在动分区之前完成。
+2. **独立暂存 + 原子发布**：先写生命周期暂存表并核对，再通过单条 INSERT OVERWRITE 发布正式分区；
+   正式表中不能出现新临时分区，不能先删正式分区。重试复用已核对的输入，失败时保留暂存供排查。
+   写前大小校验仍在任何远端写入之前；旧版本可能的唯一副本不能自动删除。
 3. **宁可失败，不可静默丢数**：翻页中途字段列表/版本号（rev）变化、record_id 重复、映射的列
    缺失、写后行数或去重 id 对不上——一律抛错并以非 0 退出码结束（调度系统靠它告警）。
    需要放宽的情况（如 `target.allow_empty=true`、`--skip-freshness`）必须**打警告日志留痕**，
@@ -61,7 +61,7 @@ ruff format .                             # 统一格式（ruff 锁版本；CI �
 - 每个模块头部写清职责；对外函数写 docstring，说明参数含义与失败行为。
 - 行宽 120；`ruff` 配置只选"能发现真问题"的规则（`E4/E7/E9/F/W/I/UP`），
   风格类规则故意没开——不用为了对齐风格改代码。
-- 不引入新依赖：核心只用 `requests` + `pyodps`。确有必要的依赖请先在 Issue 里讨论。
+- 依赖保持精简：核心使用 `requests` + `pyodps` + `simplejson`（无损 Decimal 编码）。确有必要的依赖请先在 Issue 里讨论。
 
 ## 提交 PR
 

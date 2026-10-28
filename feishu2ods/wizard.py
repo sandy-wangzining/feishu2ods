@@ -235,7 +235,7 @@ def run_init(
     else:
         echo("❌ 表名连续三次无效，已取消。")
         return 1
-    comment = _ask(ask, "   表注释", "飞书多维表格同步（JSON 原样，写临时分区后校验后替换 pt=业务日）")
+    comment = _ask(ask, "   表注释", "飞书多维表格同步（JSON 原样，独立暂存表校验后原子发布 pt=业务日）")
 
     # ⑦ 阿里云凭证
     echo("⑦ MaxCompute 凭证（与其它作业相同即可）")
@@ -290,7 +290,7 @@ def run_init(
 
     job = {
         "job": job_name,
-        "description": f"飞书多维表格 {base_token}/{table_id} → {project}.{table_name}（json + pt 分区，临时分区 + 校验后替换）",
+        "description": f"飞书多维表格 {base_token}/{table_id} → {project}.{table_name}（json + pt 分区，独立暂存表 + 原子发布）",
         "feishu": feishu,
         "maxcompute": {"project": project, "endpoint": endpoint, "access_key_id": ak, "access_key_secret": sk},
         "fields": mapping,
