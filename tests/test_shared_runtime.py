@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -77,6 +78,11 @@ class TestSharedRuntime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             root.chmod(0o755)
+            # CI checkout 的父目录可能仅 runner 可读；降权子进程使用同一源码的隔离副本。
+            package_root = root / PACKAGE
+            shutil.copytree(ROOT / PACKAGE, package_root, ignore=shutil.ignore_patterns("__pycache__"))
+            for path in [package_root, *package_root.rglob("*")]:
+                path.chmod(0o755 if path.is_dir() else 0o644)
             shared = root / "locks"
             shared.mkdir()
             os.chown(shared, 0, 65534)
@@ -84,7 +90,7 @@ class TestSharedRuntime(unittest.TestCase):
             script = (
                 "import os, sys\n"
                 "from pathlib import Path\n"
-                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                f"sys.path.insert(0, {str(root)!r})\n"
                 f"from {PACKAGE}.utils import RunLock\n"
                 "with RunLock(Path(sys.argv[1])):\n"
                 "    print(os.geteuid())\n"
@@ -100,6 +106,7 @@ class TestSharedRuntime(unittest.TestCase):
                 return subprocess.run(
                     [sys.executable, "-c", script, str(path)],
                     preexec_fn=demote,
+                    cwd=root,
                     capture_output=True,
                     encoding="utf-8",
                     timeout=20,
