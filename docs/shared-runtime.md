@@ -20,8 +20,8 @@
 `platform_system == "Windows"` 声明，无需手工安装。Linux 读取系统 `/usr/share/zoneinfo`；
 精简镜像若没有该目录，需安装系统 `tzdata` 包或 `pip install tzdata`。
 
-分页、SFTP 解析、凭证加载和分区写入策略由各自项目维护。feishu2ods 使用独立暂存表核对后
-以单条 INSERT OVERWRITE 发布；另外两个项目仍直接覆盖分区，不应混淆两者的失败恢复方式。
+分页、SFTP 解析、凭证加载和分区发布由各自项目维护。三个工具均先写独立生命周期暂存表，
+核对后以单条 INSERT OVERWRITE 发布正式分区，不提前删除正式分区；feishu2ods 额外核对 record_id。
 
 锁通过操作系统文件锁实现。同一台机器、同一锁目录可以互斥；跨主机只有在共享文件系统确实
 支持跨主机文件锁时才有效，不能仅凭配置了共享路径就承诺分布式互斥。正式运行应固定调度机器。

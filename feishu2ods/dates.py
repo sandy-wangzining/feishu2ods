@@ -17,8 +17,8 @@ _DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z", re.ASCII)  # 只认 ASCII 数字：�
 _DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
 # 允许未补零（2026-9-7）：与 SLASH 同口径。右边界必须锚住：2026-09-270 / 2026-09-27abc
 # 这类脏值不能被当成 2026-09-27（否则新鲜度校验会误判已包含预期日期）。
-DATE_RE = re.compile(r"\A(\d{4})-(\d{1,2})-(\d{1,2})(?=\Z|T|\s)", re.ASCII)
-SLASH_DATE_RE = re.compile(r"\A(\d{4})/(\d{1,2})/(\d{1,2})(?=\Z|T|\s)", re.ASCII)
+DATE_RE = re.compile(r"\A(\d{4})-(\d{1,2})-(\d{1,2})\Z", re.ASCII)
+SLASH_DATE_RE = re.compile(r"\A(\d{4})/(\d{1,2})/(\d{1,2})\Z", re.ASCII)
 # epoch 换算的合理区间：超出的一律按"认不出"处理（0 → 1970、14 位 yyyyMMddHHmmss 当毫秒
 # → 26xx 年，这类假日期不该先进 date_values 再去污染新鲜度判断）
 _EPOCH_MIN = date(2000, 1, 1)
@@ -154,13 +154,13 @@ def normalize_date_value(value, tz=CN_TZ) -> str | None:
         try:
             moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
         except ValueError:
-            pass
-        else:
+            return None
+        try:
             if moment.tzinfo is not None:
-                try:
-                    return _in_reasonable_range(moment.astimezone(tz).date())
-                except (OverflowError, ValueError):
-                    return None
+                moment = moment.astimezone(tz)
+            return _in_reasonable_range(moment.date())
+        except (OverflowError, ValueError):
+            return None
     if re.fullmatch(r"\d{8}", text, re.ASCII):
         # 文本形态的 yyyymmdd（源表把业务日期存成文本列很常见）：与数字分支同口径，
         # 不能被 DATE_RE/SLASH 的"带分隔符"要求漏掉而返回 None（那会让新鲜度校验天天误报缺数据）
