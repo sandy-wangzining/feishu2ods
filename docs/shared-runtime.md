@@ -28,6 +28,27 @@
 不支持文件锁时默认失败；各工具已有的 `*_ALLOW_NO_LOCK=1` 是显式接受并发风险的逃生开关。
 升级前先停止旧进程，再更新所有会写同一目标的工具，避免旧版本仍使用旧锁位置。
 
+## 多用户共享锁目录
+
+POSIX 默认锁文件仍为 `0600`。跨用户运行时，管理员应先建立共用组、将所有调度账号加入组，
+并为目标锁和需要共享的作业锁准备固定的 **setgid 目录**（`2770`）。例如 Linux 上，`ods-sync`
+组已存在且当前登录已取得该组权限时：
+
+```bash
+sudo install -d -o root -g ods-sync -m 2770 /var/lock/ods-target-locks
+export ODS_TARGET_LOCK_DIR=/var/lock/ods-target-locks
+```
+
+所有写同一目标的进程都必须使用该目录。作业锁需要跨用户共用时，为相应工具另建同样权限的
+固定目录并设置 `API2ODS_LOCK_DIR` / `SFTP2ODS_LOCK_DIR` / `FEISHU2ODS_LOCK_DIR`。
+setgid 让新文件继承目录组；运行锁在该目录中以 `0660` 打开，不受调用者严格 `umask` 影响，
+其余目录新建锁仍为 `0600`。锁文件不含凭证，只保存进程标记；共享组应仅包含可信的调度账号。
+
+迁移既有目录时，先停止所有相关进程，由属主或管理员将目录及已有 `.lock` 文件的组改为共用组，
+目录设为 `2770`、锁文件设为 `0660`。属主再次运行也会修正 setgid 目录中遗留锁文件的读写权限；
+不要删除锁文件来迁移权限，否则可能破坏仍在使用的 inode 锁。Windows 使用目录继承的 ACL，
+需给所有运行账号授予该目录及锁文件的读写权限。
+
 ## 修改与同步
 
 不要直接修改包内 `_common.py`、`tests/test_shared_runtime.py`、`tools/sync_common.py`

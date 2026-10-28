@@ -47,9 +47,9 @@ feishu2ods --job jobs/my_table.json --bizdate 20261026
 1. 用 App ID / App Secret 获取 tenant_access_token。
 2. 按 `limit=500 + offset` 拉取，记录逐页落到本地临时 JSONL。
 3. 将 Base 列名按 `fields` 映射成 JSON 键，保留 `record_id` 与字段原始值。
-4. 在目标项目创建独立的 `tmp_feishu2ods_<随机 ID>` 暂存表（生命周期 1 天），通过 Tunnel 分批上传。
+4. 在目标项目创建独立的 `tmp_feishu2ods_<随机 ID>` 暂存表（生命周期 1 天，开启 `lifecycle.deletemeta=true`），通过 Tunnel 分批上传。
 5. 核对暂存的行数、record_id 去重数及 ID 范围；通过后以单条 `INSERT OVERWRITE` 发布正式业务日分区。
-6. 成功后尽力删除暂存表，再核对正式分区行数；失败残留由生命周期回收，日志给出暂存表名。
+6. 成功后尽力删除暂存表，再核对正式分区行数；失败残留由 MaxCompute 生命周期任务异步回收分区及空表元数据，日志给出暂存表名。
 
 正式表不会创建新版本的 `__tmp` / `__keep` 分区。暂存和校验期间旧快照保持可读；单分区 OVERWRITE 按 MaxCompute 的原子提交语义完成，不再执行「先删旧分区 + rename」。接口返回失败或响应丢失时，命令会报告失败；以云端实例及正式分区核对结果确认是否提交，重跑为幂等覆盖。
 
@@ -98,6 +98,8 @@ feishu2ods --job jobs/my_table.json --bizdate 20261026
 每个作业有运行锁，另有按 `project.table` 归一化的目标表锁。不同作业、安装目录、虚拟环境和三个 ODS 工具写同一目标表时互斥；不同表可并行。争用锁时后启动的任务以失败退出，调度可稍后重试。
 
 目标锁默认在系统临时目录的 `ods-target-locks[-UID]`。多用户或不同 TMPDIR / 容器运行时，用 `ODS_TARGET_LOCK_DIR` 指向同一固定目录。`FEISHU2ODS_LOCK_DIR` 继续控制作业锁。操作系统退出会释放锁，不需要手工删除锁文件。
+
+POSIX 跨用户部署需将共享目录设为共用组所有的 `2770` setgid 目录，运行锁会继承组并以 `0660` 供组内账号复用；默认私有目录仍使用 `0600`。Windows 需配置继承的读写 ACL。完整示例和旧锁权限迁移步骤见[多用户共享锁目录](docs/shared-runtime.md#多用户共享锁目录)。
 
 跨机器只有共享文件系统确实支持跨主机文件锁时才可能互斥；仅指定共享路径不提供分布式保证，推荐固定调度机器。不支持文件锁时默认拒绝运行；仅确认无人并发时，才用 FEISHU2ODS_ALLOW_NO_LOCK=1 显式接受无锁风险。
 

@@ -129,7 +129,7 @@ def freshness_zone(freshness: dict) -> ZoneInfo:
 def normalize_date_value(value, tz=CN_TZ) -> str | None:
     """日期值 → yyyy-MM-dd；认不出返回 None。
 
-    支持：ISO 串（'2026-09-27T00:00:00.000+08:00' 取前 10 位）、'yyyy/MM/dd'、紧凑串
+    支持：ISO 串（带时区时换算到 tz 判日）、'yyyy/MM/dd'、紧凑串
     'yyyymmdd'、epoch 时间戳（秒或毫秒，按量级自动识别）、8 位整数 yyyymmdd。
     认不出返回 None（由调用方按"缺数据"处理）。
     """
@@ -144,8 +144,7 @@ def normalize_date_value(value, tz=CN_TZ) -> str | None:
                 text = str(int(value))
                 return _in_reasonable_range(date(int(text[:4]), int(text[4:6]), int(text[6:8])))
             seconds = value / 1000 if abs(value) >= 1e11 else value
-            # ISO 串按字符串里写的日期取前 10 位（不换算偏移）；epoch 无时区信息，按 +08:00 解释。
-            # 缺省业务日时区不参与这里的换算。
+            # 与带时区的 ISO 文本使用相同的判日时区。
             return _in_reasonable_range(datetime.fromtimestamp(float(seconds), tz).date())
         except (ArithmeticError, OSError, ValueError):
             return None
@@ -158,7 +157,10 @@ def normalize_date_value(value, tz=CN_TZ) -> str | None:
             pass
         else:
             if moment.tzinfo is not None:
-                return _in_reasonable_range(moment.astimezone(tz).date())
+                try:
+                    return _in_reasonable_range(moment.astimezone(tz).date())
+                except (OverflowError, ValueError):
+                    return None
     if re.fullmatch(r"\d{8}", text, re.ASCII):
         # 文本形态的 yyyymmdd（源表把业务日期存成文本列很常见）：与数字分支同口径，
         # 不能被 DATE_RE/SLASH 的"带分隔符"要求漏掉而返回 None（那会让新鲜度校验天天误报缺数据）

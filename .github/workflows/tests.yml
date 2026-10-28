@@ -36,6 +36,10 @@ jobs:
       - name: 单元测试（离线，不访问网络/数仓）
         run: python -m unittest discover -s tests -v
 
+      - name: Linux 跨用户锁测试（不同 UID、严格 umask）
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: sudo "$(command -v python)" -m unittest discover -s tests -p test_shared_runtime.py -v
+
       - name: wheel 独立安装检查
         run: |
           python -m pip wheel --no-deps --wheel-dir dist .

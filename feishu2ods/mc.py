@@ -88,8 +88,8 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
 # =============================================================================
 # MaxCompute：建表 / 结构校验 / 独立暂存与原子发布/ 写后校验
 # =============================================================================
-def build_ddl(project: str, table: str, column: str, comment: str) -> str:
-    """目标表 DDL：单列 string + pt 分区 + 表注释（标识符入口再校验，不依赖调用方）。"""
+def build_ddl(project: str, table: str, column: str, comment: str, *, staging: bool = False) -> str:
+    """单列 string + pt 分区；暂存表额外设置分区与表元数据的生命周期回收。"""
     project = _require_identifier(project, "target.project")
     table = _require_identifier(table, "target.table")
     column = _require_identifier(column, "target.column")
@@ -102,7 +102,8 @@ def build_ddl(project: str, table: str, column: str, comment: str) -> str:
         f"    {column} string comment '多维表格记录 JSON（英文键，值原样）'\n"
         f")\n"
         f"partitioned by ({PARTITION_COLUMN} string comment '业务日期 yyyyMMdd（该分区 = 当天抽取的全量快照）')\n"
-        f"tblproperties ('comment' = '{table_comment}')"
+        f"tblproperties ('comment' = '{table_comment}'"
+        + (", 'lifecycle.deletemeta'='true')\nlifecycle 1" if staging else ")")
     )
 
 
@@ -258,7 +259,7 @@ def write_partition(
         stage_name = f"tmp_feishu2ods_{uuid.uuid4().hex}"
         run_sql_with_timeout(
             o,
-            build_ddl(project, stage_name, column, "feishu2ods 暂存数据，校验后发布") + "\nlifecycle 1",
+            build_ddl(project, stage_name, column, "feishu2ods 暂存数据，校验后发布", staging=True),
             timeout=timeout,
             desc=f"建暂存表 {stage_name}",
         )

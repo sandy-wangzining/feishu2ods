@@ -14,7 +14,7 @@ python3 -m venv venv
 ./venv/bin/pip install -e ".[dev]"        # Windows: .\venv\Scripts\pip install -e ".[dev]"
 ```
 
-只需要 Python 3.10+，核心依赖只有 `requests` + `pyodps`，没有系统级依赖。
+只需要 Python 3.10+，核心依赖为 `requests` + `pyodps` + `simplejson`，没有系统级依赖。
 
 ## 跑测试与代码检查
 

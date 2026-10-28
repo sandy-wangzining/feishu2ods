@@ -79,6 +79,28 @@ def target_lock_path(project: str, table: str, root: Path | None = None) -> Path
     return base / f"target-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]}.lock"
 
 
+def open_run_lock(path: Path):
+    """打开运行锁；POSIX 的 setgid 目录显式启用组共享，其余目录保持 0600。"""
+
+    def opener(name, flags):
+        shared = bool(Path(name).parent.stat().st_mode & stat.S_ISGID)
+        mode = 0o660 if shared else 0o600
+        fd = os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise PermissionError(f"运行锁不是普通文件：{name}")
+            if shared and info.st_uid == os.geteuid():
+                # 不改全局 umask；兼容严格 umask，并由属主迁移遗留的 0600 锁。
+                os.fchmod(fd, mode)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    return open(path, "a+", encoding="utf-8", errors="replace", opener=opener if os.name == "posix" else None)
+
+
 def safe_label(value, limit: int = 80) -> str:
     """外部文本展示前去控制字符、转义反引号/Markdown 结构符并限长；不改变入库数据。"""
     text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("`", "'")

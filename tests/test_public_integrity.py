@@ -70,6 +70,19 @@ class TestPublicIntegrity(OfflineTestCase):
                     tz = ZoneInfo(zone)
                     self.assertEqual(dates.normalize_date_value(text, tz), dates.normalize_date_value(epoch, tz))
 
+    def test_freshness_placeholder_dates_cannot_overflow_timezone_conversion(self):
+        for text, zone in (
+            ("9999-12-31T23:59:59Z", "Asia/Shanghai"),
+            ("9999-12-31T23:59:59-12:00", "UTC"),
+            ("0001-01-01T00:00:00+14:00", "America/New_York"),
+        ):
+            with self.subTest(text=text, zone=zone):
+                tz = ZoneInfo(zone)
+                self.assertIsNone(dates.normalize_date_value(text, tz))
+                stats = spool.FetchStats(date_field="day", date_tz=tz)
+                stats.update([{"record_id": "r1", "day": text}, {"record_id": "r2", "day": "2026-10-26"}])
+                self.assertEqual(stats.date_values, {"2026-10-26"})
+
     def test_configured_freshness_zone_applies_to_stats(self):
         tz = dates.freshness_zone({"timezone": "America/New_York"})
         stats = spool.FetchStats(date_field="day", date_tz=tz)
@@ -120,6 +133,9 @@ class TestPublicIntegrity(OfflineTestCase):
         )
         self.assertFalse(any("alter table p.t " in sql for sql in odps.sqls))
         self.assertTrue(any("lifecycle 1" in sql for sql in odps.sqls))
+        ddl = next(sql for sql in odps.sqls if sql.startswith("create table"))
+        self.assertIn("'lifecycle.deletemeta'='true'", ddl)
+        self.assertNotIn("lifecycle", mc.build_ddl("p", "t", "json", "正式数据"))
         self.assertTrue(any("drop table if exists p.tmp_feishu2ods_" in sql for sql in odps.sqls))
 
     def test_verification_failure_preserves_old_target(self):

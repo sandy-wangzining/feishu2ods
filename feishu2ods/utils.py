@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, quote_plus, unquote
 
 from ._common import leaf_strings as _leaf_strings
-from ._common import private_lock_dir, target_lock_path
+from ._common import open_run_lock, private_lock_dir, target_lock_path
 from ._common import safe_label as safe_label
 from ._common import webhook_targets as webhook_targets
 
@@ -583,16 +583,7 @@ class RunLock:
                 return self
             raise SystemExit("当前平台不支持运行锁，拒绝无锁执行；仅确认无并发时可设 FEISHU2ODS_ALLOW_NO_LOCK=1")
         try:
-            # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
-            # encoding + errors=replace：locale 非 UTF-8 时读写中文主机名不会抛 UnicodeError
-            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接，拒绝跟随（避免锁到别人的文件上）
-            open_kwargs = {"encoding": "utf-8", "errors": "replace"}
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                # 显式传 mode：io.open 的 opener 约定只有 (path, flags)，os.open 缺省 mode=0o777
-                # （umask 决定最终权限，umask=0 时锁文件 0777）；锁文件按 0600 创建
-                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
-            self.fh = open(self.path, "a+", **open_kwargs)
+            self.fh = open_run_lock(self.path)
         except (OSError, UnicodeError) as exc:
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
