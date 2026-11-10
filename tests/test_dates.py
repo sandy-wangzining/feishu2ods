@@ -221,6 +221,22 @@ class TestNormalizeDateMore(OfflineTestCase):
     def test_iso_with_millis_and_tz(self):
         self.assertEqual(dates_mod.normalize_date_value("2026-09-27T15:30:00.123+08:00"), "2026-09-27")
 
+    def test_invalid_time_cannot_satisfy_freshness(self):
+        for value in (
+            "2026-09-27T25:61:00",
+            "2026-09-27 99:99:99",
+            "2026-09-27T12:60:00",
+            "2026-09-27T12:30:60",
+            "2026/9/27 25:00:00",
+            "2026-09-27\tgarbage",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(dates_mod.normalize_date_value(value))
+                self.assertEqual(
+                    dates_mod.freshness_problem([{"d": value}], "d", "2026-09-27"),
+                    ("2026-09-27", None),
+                )
+
     def test_iso_date_only(self):
         self.assertEqual(dates_mod.normalize_date_value("2026-09-27"), "2026-09-27")
 

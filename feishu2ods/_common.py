@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -174,23 +175,107 @@ def feishu_card(title: str, lines, footer: str = "") -> dict:
     return card
 
 
-def run_sql_with_timeout(o, sql: str, timeout, desc: str, *, clock, log, heartbeat):
-    """提交前计时；SQL 成功才返回，其余退出路径尽力取消云端实例。
+class UnresolvedSqlError(SystemExit):
+    """云端写操作尚未确认结束；不能被普通重试捕获。"""
 
-    调用方传入自身的时钟与脱敏日志函数，保留现有接口、测试替身和日志策略。
-    同步的提交/轮询请求仍由 SDK 的 HTTP 超时兜底，不能在 Python 内强制中断。
-    """
-    started = clock.monotonic()
-    instance = o.run_sql(sql)
-    last_log = started
+
+def ensure_no_pending_publication(o, project: str, table: str) -> Path:
+    """调用方持有目标表锁；只有确认旧实例已终止，才能清除持久化标记。"""
+    path = target_lock_path(project, table).with_suffix(".pending.json")
+    if not os.path.lexists(path):
+        return path
     try:
+        with open_run_lock(path) as handle:
+            handle.seek(0)
+            state = json.load(handle)
+        instance_id = state.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError("未取得实例 ID，请按标记中的提交时间和 SQL 核对云端作业")
+        if str(state.get("project", "")).lower() != project.lower():
+            raise ValueError("标记中的项目与当前目标不一致")
+        instance = o.get_instance(instance_id, project=state.get("instance_project") or project)
+        if instance.is_terminated() is not True:
+            raise ValueError(f"实例 {instance_id} 尚未确认终止")
+        path.unlink()
+    except Exception as exc:
+        raise UnresolvedSqlError(
+            f"{project}.{table} 有未决发布，已阻止覆盖：{exc}；标记 {path}。"
+            "请先确认该目标的旧发布全部终止；无法自动查询时，人工核对后才可删除此标记并重跑"
+        ) from exc
+    return path
+
+
+def _write_pending_publication(path: Path, state: dict, *, create: bool = False) -> None:
+    """提交前独占创建并刷盘；实例 ID 更新采用原子替换，崩溃时仍保留阻断标记。"""
+    mode = 0o660 if path.parent.stat().st_mode & stat.S_ISGID else 0o600
+    temporary = None
+    if create:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    else:
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), mode)
+            json.dump(state, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if temporary is not None:
+            os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _clear_pending_publication(path: Path | None, log) -> None:
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log(f"    已确认发布实例结束，但标记清理失败：{path}（{exc}）；下次运行会重新核对")
+
+
+def run_sql_with_timeout(o, sql: str, timeout, desc: str, *, clock, log, heartbeat, publication=None):
+    """写操作失败需确认实例终止；正式发布还持久化未决状态，阻止跨运行迟到覆盖。"""
+    pending = state = None
+    if publication is not None:
+        project, table = publication
+        pending = ensure_no_pending_publication(o, project, table)
+        execution_project = getattr(o, "project", None)
+        state = {
+            "project": project,
+            "instance_project": execution_project
+            if isinstance(execution_project, str) and execution_project
+            else project,
+            "table": table,
+            "instance_id": None,
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "statement": sql,
+        }
+        _write_pending_publication(pending, state, create=True)
+    started = clock.monotonic()
+    instance = None
+    mutation = publication is not None or re.match(r"\s*(create|alter|drop|insert|truncate)\b", sql, re.I) is not None
+    try:
+        instance = o.run_sql(sql)
+        if pending is not None:
+            instance_id = getattr(instance, "id", None)
+            state["instance_id"] = instance_id if isinstance(instance_id, str) else None
+            instance_project = getattr(getattr(instance, "project", None), "name", None)
+            if isinstance(instance_project, str) and instance_project:
+                state["instance_project"] = instance_project
+            _write_pending_publication(pending, state)
+        last_log = started
         while True:
             if instance.is_successful():
+                _clear_pending_publication(pending, log)
                 return instance
             if instance.is_terminated():
                 instance.wait_for_success(timeout=1)
                 if not instance.is_successful():
                     raise RuntimeError(f"{desc} 已终止但未成功（实例 {getattr(instance, 'id', '?')}）")
+                _clear_pending_publication(pending, log)
                 return instance
             now = clock.monotonic()
             if timeout and timeout > 0 and now - started > timeout:
@@ -200,10 +285,33 @@ def run_sql_with_timeout(o, sql: str, timeout, desc: str, *, clock, log, heartbe
                 log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {limit}）...")
                 last_log = now
             clock.sleep(1)
-    except BaseException:
-        # 轮询失败或用户中断也要取消，避免旧 SQL 在调度重跑后继续修改同一分区。
-        try:
-            instance.stop()
-        except Exception as exc:
-            log(f"    {desc} 取消失败（{type(exc).__name__}: {exc}），云端实例可能仍在运行")
-        raise
+    except BaseException as original:
+        if instance is not None:
+            try:
+                instance.stop()
+            except Exception as exc:
+                log(f"    {desc} 取消失败（{type(exc).__name__}: {exc}），云端实例可能仍在运行")
+        if not mutation:
+            raise
+        # stop() 只表示请求已受理；有限轮询确认终止后才允许上层重试。
+        if instance is not None:
+            for attempt in range(6):
+                try:
+                    terminated = instance.is_terminated() is True
+                except Exception:
+                    break
+                if terminated:
+                    _clear_pending_publication(pending, log)
+                    raise
+                if attempt < 5:
+                    clock.sleep(1)
+        instance_id = getattr(instance, "id", None) if instance is not None else None
+        message = (
+            f"{desc} 的写入状态未确认（实例 {instance_id or '未知'}），已停止自动重试；"
+            + (f"未决发布标记 {pending}，后续发布将被阻止；" if pending is not None else "")
+            + f"请先核对云端实例是否已结束后再重跑；原始错误：{original}"
+        )
+        if isinstance(original, (KeyboardInterrupt, SystemExit)):
+            log(message)
+            raise
+        raise UnresolvedSqlError(message) from original

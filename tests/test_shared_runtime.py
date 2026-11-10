@@ -331,6 +331,201 @@ class TestSharedRuntime(unittest.TestCase):
         self.assertIn("取消失败", str(log.call_args))
 
 
+class TestPublicationRecovery(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.dict(os.environ, {"ODS_TARGET_LOCK_DIR": temporary.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.clock = SimpleNamespace(now=0)
+        self.clock.monotonic = lambda: self.clock.now
+        self.clock.sleep = lambda seconds: setattr(self.clock, "now", self.clock.now + seconds)
+        self.log = mock.Mock()
+        self.path = common.target_lock_path("p", "t").with_suffix(".pending.json")
+        self.sql = "insert overwrite table p.t partition (pt='20260920') select value from p.stage"
+
+    @staticmethod
+    def instance():
+        instance = mock.Mock()
+        instance.id = "pending-instance"
+        instance.is_successful.return_value = True
+        instance.is_terminated.return_value = True
+        return instance
+
+    def run_sql(self, client, *, sql=None, publication=("p", "t")):
+        return common.run_sql_with_timeout(
+            client,
+            sql or self.sql,
+            1,
+            "发布分区",
+            clock=self.clock,
+            log=self.log,
+            heartbeat=0,
+            publication=publication,
+        )
+
+    def test_submission_is_journaled_before_network_and_success_clears_it(self):
+        instance = self.instance()
+
+        def submit(sql):
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+            self.assertIsNone(state["instance_id"])
+            self.assertEqual(state["statement"], sql)
+            return instance
+
+        self.run_sql(SimpleNamespace(run_sql=submit))
+        self.assertFalse(self.path.exists())
+
+    def test_acknowledged_cancel_must_finish_before_retry_or_next_client(self):
+        old = self.instance()
+        old.is_successful.side_effect = ConnectionError("poll failed")
+        old.is_terminated.return_value = False
+        first = mock.Mock()
+        first.run_sql.return_value = old
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(first)
+        old.stop.assert_called_once()
+        first.run_sql.assert_called_once()
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["instance_id"], old.id)
+        second = mock.Mock()
+        second.get_instance.return_value = old
+        second.run_sql.return_value = self.instance()
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(second)
+        second.run_sql.assert_not_called()
+        old.is_terminated.return_value = True
+        self.run_sql(second)
+        second.get_instance.assert_called_with(old.id, project="p")
+        second.run_sql.assert_called_once()
+        self.assertFalse(self.path.exists())
+
+    def test_cross_project_recovery_queries_the_execution_project(self):
+        old = self.instance()
+        old.is_successful.side_effect = ConnectionError("poll failed")
+        old.is_terminated.return_value = False
+        first = mock.Mock()
+        first.project = "execution_project"
+        first.run_sql.return_value = old
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(first)
+        state = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(state["project"], "p")
+        self.assertEqual(state["instance_project"], "execution_project")
+        old.is_terminated.return_value = True
+        second = mock.Mock()
+        second.get_instance.return_value = old
+        second.run_sql.return_value = self.instance()
+        self.run_sql(second)
+        second.get_instance.assert_called_once_with(old.id, project="execution_project")
+        self.assertFalse(self.path.exists())
+
+    def test_cancel_failure_but_confirmed_terminal_can_retry_safely(self):
+        instance = self.instance()
+        original = ConnectionError("completion response lost")
+        instance.is_successful.side_effect = original
+        instance.stop.side_effect = ConnectionError("cancel response lost")
+        with self.assertRaises(ConnectionError) as raised:
+            self.run_sql(SimpleNamespace(run_sql=lambda sql: instance))
+        self.assertIs(raised.exception, original)
+        self.assertFalse(self.path.exists())
+
+    def test_delayed_cancellation_is_polled_until_terminal(self):
+        instance = self.instance()
+        instance.is_successful.side_effect = TimeoutError("poll timeout")
+        instance.is_terminated.side_effect = [False, False, True]
+        with self.assertRaises(TimeoutError):
+            self.run_sql(SimpleNamespace(run_sql=lambda sql: instance))
+        self.assertEqual(self.clock.now, 2)
+        self.assertFalse(self.path.exists())
+
+    def test_lost_submission_without_instance_id_blocks_all_new_submissions(self):
+        first = mock.Mock()
+        first.run_sql.side_effect = ConnectionError("submission response lost")
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(first)
+        self.assertIsNone(json.loads(self.path.read_text(encoding="utf-8"))["instance_id"])
+        second = mock.Mock()
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(second)
+        second.get_instance.assert_not_called()
+        second.run_sql.assert_not_called()
+
+    def test_interrupt_preserves_exit_semantics_and_pending_marker(self):
+        instance = self.instance()
+        instance.is_successful.side_effect = KeyboardInterrupt()
+        instance.is_terminated.return_value = False
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_sql(SimpleNamespace(run_sql=lambda sql: instance))
+        self.assertTrue(self.path.exists())
+
+    def test_broken_or_unqueryable_state_cannot_be_silently_cleared(self):
+        for contents in ("", "[]", "{}", "invalid", json.dumps({"project": "p", "instance_id": "old"})):
+            with self.subTest(contents=contents):
+                self.path.write_text(contents, encoding="utf-8")
+                client = mock.Mock()
+                client.get_instance.side_effect = ConnectionError("offline")
+                with self.assertRaises(common.UnresolvedSqlError):
+                    self.run_sql(client)
+                client.run_sql.assert_not_called()
+                self.assertEqual(self.path.read_text(encoding="utf-8"), contents)
+
+    def test_unconfirmed_staging_ddl_also_stops_automatic_retry(self):
+        instance = self.instance()
+        instance.is_successful.side_effect = ConnectionError("poll failed")
+        instance.is_terminated.return_value = False
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(
+                SimpleNamespace(run_sql=lambda sql: instance),
+                sql="alter table p.stage drop if exists partition (pt='20260920')",
+                publication=None,
+            )
+
+    def test_unwritable_journal_prevents_submission(self):
+        client = mock.Mock()
+        with mock.patch.object(common, "_write_pending_publication", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.run_sql(client)
+        client.run_sql.assert_not_called()
+
+    def test_process_exit_leaves_instance_id_for_next_process(self):
+        script = f"""
+import os
+from types import SimpleNamespace
+from {PACKAGE} import _common as common
+class Instance:
+    id = 'orphaned-publish'
+    def is_successful(self):
+        os._exit(17)
+client = SimpleNamespace(run_sql=lambda sql: Instance())
+clock = SimpleNamespace(monotonic=lambda: 0, sleep=lambda seconds: None)
+common.run_sql_with_timeout(client, {self.sql!r}, 1, 'publish', clock=clock,
+                            log=lambda message: None, heartbeat=0, publication=('p','t'))
+"""
+        result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 17, result.stderr.decode(errors="replace"))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["instance_id"], "orphaned-publish")
+        client = mock.Mock()
+        client.get_instance.return_value.is_terminated.return_value = False
+        with self.assertRaises(common.UnresolvedSqlError):
+            self.run_sql(client)
+        client.run_sql.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX 未决标记权限")
+    def test_pending_permissions_follow_private_or_setgid_directory(self):
+        for mode, expected in ((0o700, 0o600), (0o2770, 0o660)):
+            with self.subTest(mode=mode):
+                self.path.parent.chmod(mode)
+                previous = os.umask(0o077)
+                try:
+                    common._write_pending_publication(self.path, {"instance_id": None}, create=True)
+                    common._write_pending_publication(self.path, {"instance_id": "old"})
+                    self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), expected)
+                finally:
+                    os.umask(previous)
+                    self.path.unlink(missing_ok=True)
+
+
 class TestSharedSync(unittest.TestCase):
     def test_interrupted_replace_keeps_old_file_and_cleans_temp(self):
         tool = self._tool()

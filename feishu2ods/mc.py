@@ -78,10 +78,17 @@ def _partition_clause(pt) -> str:
 # =============================================================================
 # SQL 执行（带超时：pyodps 默认不限时，云端卡住会一直干等、占着运行锁不放）
 # =============================================================================
-def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
+def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL", *, publication=None):
     """通过公共实现等待 SQL，保留项目自身的时钟、脱敏日志与超时配置。"""
     return _common.run_sql_with_timeout(
-        o, sql, timeout, desc, clock=time, log=lambda message: log(redact(message)), heartbeat=SQL_HEARTBEAT_SECONDS
+        o,
+        sql,
+        timeout,
+        desc,
+        clock=time,
+        log=lambda message: log(redact(message)),
+        heartbeat=SQL_HEARTBEAT_SECONDS,
+        publication=publication,
     )
 
 
@@ -221,6 +228,7 @@ def write_partition(
     """
     project = _require_identifier(project, "target.project")
     table_name = _require_identifier(table_name, "target.table")
+    _common.ensure_no_pending_publication(o, project, table_name)
     column = _require_identifier(column, "target.column")
     pt = _require_pt(pt)
     _temp_spool = None
@@ -296,6 +304,7 @@ def write_partition(
                         f"where {_partition_clause(f'{pt}{TMP_PARTITION_SUFFIX}')}",
                         timeout=timeout,
                         desc=f"发布分区 {table_name} pt={pt}",
+                        publication=(project, table_name),
                     )
                     published = True
                     _drop_stale_keep(o, table, project, table_name, pt, timeout)
@@ -315,7 +324,7 @@ def write_partition(
                     run_sql_with_timeout(
                         o, f"drop table if exists {project}.{stage_name}", timeout=timeout, desc="清理暂存表"
                     )
-                except Exception as exc:
+                except (Exception, _common.UnresolvedSqlError) as exc:
                     log(f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact(exc)}")
             else:
                 log(f"  提示：暂存表 {project}.{stage_name} 已保留（生命周期 1 天）；正式表未创建临时分区")
@@ -380,7 +389,7 @@ def _drop_stale_keep(o, table, project: str, table_name: str, pt: str, timeout: 
         return
     try:
         drop_partition(o, project, table_name, keep_spec, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001 - 正式分区已写入成功，清理旧副本失败只告警，不能把成功报成失败
+    except (Exception, _common.UnresolvedSqlError) as exc:  # 清理旧副本失败不能改变正式发布结果
         log(f"  警告：清理旧保留分区 {keep_spec} 失败（{redact(exc)}）；下游 max_pt() 可能读到旧快照，请手工删除")
         return
     log(f"  已清理同 pt 的保留分区 {keep_spec}（正式分区已恢复，避免 max_pt() 读到旧快照）")

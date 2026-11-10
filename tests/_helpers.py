@@ -50,6 +50,7 @@ class OfflineTestCase(unittest.TestCase):
         # 只改测试侧的锁根路径，生产行为不变。
         lock_dir = tempfile.mkdtemp(prefix="feishu2ods-test-locks-")
         self.addCleanup(shutil.rmtree, lock_dir, ignore_errors=True)
+        os.environ["ODS_TARGET_LOCK_DIR"] = str(pathlib.Path(lock_dir) / "targets")
         file_patcher = mock.patch.object(utils_mod, "__file__", str(pathlib.Path(lock_dir) / "utils.py"))
         file_patcher.start()
         self.addCleanup(file_patcher.stop)

@@ -134,3 +134,6 @@ ruff format --check .
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
+
+
+未决发布会阻止后续覆盖：请将 `ODS_TARGET_LOCK_DIR` 配为固定持久目录，恢复步骤见[未决发布恢复](docs/shared-runtime.md#未决发布恢复)。提交响应完全丢失且没有实例 ID 时，需要先人工核对云端作业，不能盲目重试或删除标记。

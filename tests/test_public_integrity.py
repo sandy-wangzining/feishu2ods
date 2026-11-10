@@ -33,11 +33,23 @@ class PublishingOdps(_FakeOdps):
             self.sqls.append(sql)
             self.publish_attempts += 1
             if self.publish_error:
+                if isinstance(self.publish_error, Exception):
+                    result = mock.Mock()
+                    result.id = "rejected-publish"
+                    result.is_successful.return_value = False
+                    result.is_terminated.return_value = True
+                    result.wait_for_success.side_effect = self.publish_error
+                    return result
                 raise self.publish_error
             self.target.rows = list(self.stage.rows)
             self.target.partitions = [_Part("pt='20261026'")]
             if self.fail_after_commit and self.publish_attempts == 1:
-                raise TimeoutError("response lost after commit")
+                result = _FakeInstance([])
+                result.id = "completed-publish"
+                result.is_successful = mock.Mock(side_effect=TimeoutError("response lost after commit"))
+                result.is_terminated = mock.Mock(return_value=True)
+                result.stop = mock.Mock()
+                return result
             return _FakeInstance([])
         if sql.startswith("drop table") and self.cleanup_error:
             raise RuntimeError("cleanup unavailable")
@@ -154,6 +166,35 @@ class TestPublicIntegrity(OfflineTestCase):
         self.assertEqual(odps.stage.write_attempts, 1)
         self.assertEqual(odps.publish_attempts, mc.WRITE_ATTEMPTS)
         self.assertFalse(any(sql.startswith("drop table") for sql in odps.sqls))
+
+    def test_pending_publish_blocks_retries_and_later_writers(self):
+        from feishu2ods import _common
+
+        odps = PublishingOdps(self.target())
+        original = odps.run_sql
+        pending = mock.Mock()
+        pending.id = "pending-publish"
+        pending.is_successful.side_effect = ConnectionError("poll failed")
+        pending.is_terminated.return_value = False
+        pending.stop.side_effect = ConnectionError("cancel failed")
+        publications = []
+
+        def run_sql(sql):
+            if sql.startswith("insert overwrite"):
+                publications.append(sql)
+                return pending
+            return original(sql)
+
+        odps.get_instance = mock.Mock(return_value=pending)
+        with mock.patch.object(odps, "run_sql", side_effect=run_sql):
+            for _ in range(2):
+                with self.assertRaises(_common.UnresolvedSqlError):
+                    self.write(odps)
+        self.assertEqual(len(publications), 1)
+        self.assertEqual(odps.target.rows, [['{"record_id":"old"}']])
+        pending.is_terminated.return_value = True
+        self.write(odps)
+        self.assertEqual(odps.target.rows, [['{"record_id":"r1"}']])
 
     def test_lost_publish_response_is_retried_idempotently(self):
         odps = PublishingOdps(self.target(), fail_after_commit=True)
